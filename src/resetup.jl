@@ -66,8 +66,8 @@ end
     _recompute_coarsest_dense!(hierarchy, last_level; backend=CPU())
 
 Recompute the coarsest dense matrix from the last AMG level in-place,
-writing directly into hierarchy.coarse_A. Avoids allocating a temporary
-coarse CSR matrix.
+writing directly into `hierarchy.coarse_A`. Avoids allocating a temporary
+coarse CSR matrix. Modifies `hierarchy.coarse_A` as a side effect.
 """
 function _recompute_coarsest_dense!(hierarchy::AMGHierarchy{Tv, Ti},
                                     level::AMGLevel{Tv, Ti};

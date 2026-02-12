@@ -51,18 +51,13 @@ end
                                 @Const(invdiag), ω)
     i = @index(Global)
     @inbounds begin
-        # Compute (b - A*x) for row i, excluding diagonal
+        # Compute residual r_i = b[i] - A[i,:]*x
         r_i = b[i]
         start = rowptr[i]
         stop = rowptr[i+1] - 1
-        diag_val = zero(eltype(x))
         for nz in start:stop
             j = colval[nz]
-            a_ij = nzval[nz]
-            if j == i
-                diag_val = a_ij
-            end
-            r_i -= a_ij * x[j]
+            r_i -= nzval[nz] * x[j]
         end
         # Jacobi update: x_new = x + ω * D^{-1} * (b - A*x)
         x_new[i] = x[i] + ω * invdiag[i] * r_i

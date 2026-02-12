@@ -9,6 +9,7 @@ The sparsity structure computed here is reused by `amg_resetup!` when matrix
 coefficients change but the pattern remains the same.
 """
 function amg_setup(A::StaticSparsityMatrixCSR{Tv, Ti}, config::AMGConfig=AMGConfig()) where {Tv, Ti}
+    t_setup = time()
     levels = AMGLevel{Tv, Ti}[]
     A_current = A
     n_finest = size(A, 1)
@@ -23,7 +24,7 @@ function amg_setup(A::StaticSparsityMatrixCSR{Tv, Ti}, config::AMGConfig=AMGConf
         # Compute coarse operator via Galerkin product
         A_coarse, r_map = compute_coarse_sparsity(A_current, P, n_coarse)
         # Build smoother
-        smoother = build_jacobi_smoother(A_current, config.jacobi_omega)
+        smoother = build_smoother(A_current, config.smoother, config.jacobi_omega)
         # Workspace
         r = zeros(Tv, n)
         xc = zeros(Tv, n_coarse)
@@ -41,8 +42,60 @@ function amg_setup(A::StaticSparsityMatrixCSR{Tv, Ti}, config::AMGConfig=AMGConf
     coarse_b = zeros(Tv, n_coarse)
     # Pre-allocate residual buffer for amg_solve! at finest level size
     solve_r = zeros(Tv, n_finest)
-    return AMGHierarchy{Tv, Ti}(levels, coarse_dense, coarse_factor, coarse_x, coarse_b, solve_r)
+    hierarchy = AMGHierarchy{Tv, Ti}(levels, coarse_dense, coarse_factor, coarse_x, coarse_b, solve_r)
+    t_setup = time() - t_setup
+    if config.verbose
+        _print_hierarchy_info(hierarchy, n_finest, t_setup)
+    end
+    return hierarchy
 end
+
+"""
+    _print_hierarchy_info(hierarchy, n_finest, t_setup)
+
+Print AMG hierarchy complexity information.
+"""
+function _print_hierarchy_info(hierarchy::AMGHierarchy, n_finest::Int, t_setup::Float64)
+    nlevels = length(hierarchy.levels)
+    total_nnz = 0
+    total_rows = 0
+    println("╔══════════════════════════════════════════════════════════╗")
+    println("║            AMG Hierarchy Summary                       ║")
+    println("╠══════════════════════════════════════════════════════════╣")
+    Printf.@printf("║  Setup time: %.4f s                                   \n", t_setup)
+    println("║  Levels: $(nlevels + 1) ($(nlevels) AMG + 1 coarse direct)")
+    println("╠══════════════════════════════════════════════════════════╣")
+    println("║  Level │    Rows │      NNZ │ Smoother                  ")
+    println("╠────────┼─────────┼──────────┼───────────────────────────╣")
+    for (i, lvl) in enumerate(hierarchy.levels)
+        n = size(lvl.A, 1)
+        nz = nnz(lvl.A)
+        total_nnz += nz
+        total_rows += n
+        sname = _smoother_name(lvl.smoother)
+        Printf.@printf("║  %5d │ %7d │ %8d │ %s\n", i, n, nz, sname)
+    end
+    # Coarsest level
+    nc = size(hierarchy.coarse_A, 1)
+    nc_nnz = count(!iszero, hierarchy.coarse_A)
+    total_nnz += nc_nnz
+    total_rows += nc
+    Printf.@printf("║  %5d │ %7d │ %8d │ %s\n", nlevels + 1, nc, nc_nnz, "Direct (LU)")
+    println("╠══════════════════════════════════════════════════════════╣")
+    if nlevels > 0
+        finest_nnz = nnz(hierarchy.levels[1].A)
+        oc = total_nnz / finest_nnz
+        gc = total_rows / n_finest
+        Printf.@printf("║  Operator complexity: %.3f                            \n", oc)
+        Printf.@printf("║  Grid complexity:     %.3f                            \n", gc)
+    end
+    println("╚══════════════════════════════════════════════════════════╝")
+end
+
+_smoother_name(::JacobiSmoother) = "Jacobi"
+_smoother_name(::ColoredGaussSeidelSmoother) = "Colored GS"
+_smoother_name(::SPAI0Smoother) = "SPAI(0)"
+_smoother_name(::SPAI1Smoother) = "SPAI(1)"
 
 """
     _csr_to_dense!(M, A; backend=CPU())

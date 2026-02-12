@@ -104,6 +104,7 @@ function amg_solve!(x::AbstractVector{Tv}, b::AbstractVector{Tv},
                     config::AMGConfig=AMGConfig();
                     tol::Real=1e-10, maxiter::Int=100,
                     backend=CPU()) where {Tv, Ti}
+    t_solve = config.verbose ? time() : 0.0
     bnorm = norm(b)
     if bnorm == 0
         fill!(x, zero(Tv))
@@ -127,8 +128,19 @@ function amg_solve!(x::AbstractVector{Tv}, b::AbstractVector{Tv},
         compute_residual!(r, A, x, b; backend=backend)
         rnorm = norm(r)
         if rnorm / bnorm < tol
+            if config.verbose
+                t_solve = time() - t_solve
+                Printf.@printf("AMG solve converged: %d iterations, %.4f s, final residual %.2e\n",
+                                iter, t_solve, rnorm / bnorm)
+            end
             return x, iter
         end
+    end
+    if config.verbose
+        t_solve = time() - t_solve
+        rnorm = norm(r)
+        Printf.@printf("AMG solve did NOT converge: %d iterations, %.4f s, final residual %.2e\n",
+                        maxiter, t_solve, rnorm / bnorm)
     end
     return x, maxiter
 end

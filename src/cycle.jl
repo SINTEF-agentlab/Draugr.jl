@@ -122,6 +122,7 @@ function amg_solve!(x::AbstractVector{Tv}, b::AbstractVector{Tv},
     end
     # Use pre-allocated residual buffer (no allocations!)
     r = hierarchy.solve_r
+    rnorm = bnorm
     for iter in 1:maxiter
         amg_cycle!(x, b, hierarchy, config; backend=backend)
         # Check convergence using parallelized residual computation
@@ -138,7 +139,6 @@ function amg_solve!(x::AbstractVector{Tv}, b::AbstractVector{Tv},
     end
     if config.verbose
         t_solve = time() - t_solve
-        rnorm = norm(r)
         Printf.@printf("AMG solve did NOT converge: %d iterations, %.4f s, final residual %.2e\n",
                         maxiter, t_solve, rnorm / bnorm)
     end

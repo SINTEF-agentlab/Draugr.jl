@@ -4,116 +4,108 @@
 Re-setup the AMG hierarchy for new matrix coefficients, reusing the existing
 sparsity pattern and prolongation structure. This updates:
 1. The fine-grid matrix at the first level
-2. Galerkin products at all levels (in-place)
+2. Galerkin products at all levels (in-place, parallelized with KA kernels)
 3. Smoothers at all levels
 4. The direct solver at the coarsest level
 """
 function amg_resetup!(hierarchy::AMGHierarchy{Tv, Ti},
                       A_new::StaticSparsityMatrixCSR{Tv, Ti},
-                      config::AMGConfig=AMGConfig()) where {Tv, Ti}
+                      config::AMGConfig=AMGConfig();
+                      backend=CPU()) where {Tv, Ti}
     nlevels = length(hierarchy.levels)
     if nlevels == 0
         # Only one level (coarsest), update direct solver
-        _update_coarse_solver!(hierarchy, A_new)
+        _update_coarse_solver!(hierarchy, A_new; backend=backend)
         return hierarchy
     end
     # Update first level's matrix (copy values from A_new into existing structure)
     level1 = hierarchy.levels[1]
-    _copy_nzvals!(level1.A, A_new)
-    update_smoother!(level1.smoother, level1.A)
+    _copy_nzvals!(level1.A, A_new; backend=backend)
+    update_smoother!(level1.smoother, level1.A; backend=backend)
     # Update subsequent levels via Galerkin products
     for lvl in 1:(nlevels - 1)
         level = hierarchy.levels[lvl]
         next_level = hierarchy.levels[lvl + 1]
         # Recompute A_coarse in-place
-        galerkin_product!(next_level.A, level.A, level.P, level.R_map)
+        galerkin_product!(next_level.A, level.A, level.P, level.R_map; backend=backend)
         # Update smoother
-        update_smoother!(next_level.smoother, next_level.A)
+        update_smoother!(next_level.smoother, next_level.A; backend=backend)
     end
     # Recompute Galerkin product for the last level to get the coarsest matrix
     last_level = hierarchy.levels[nlevels]
     # The coarsest matrix (for direct solve) is one level below the last AMG level
     # We need to recompute it using the last level's P and R_map
-    A_coarsest = _compute_coarsest_matrix(last_level)
-    _csr_to_dense!(hierarchy.coarse_A, A_coarsest)
+    _recompute_coarsest_dense!(hierarchy, last_level; backend=backend)
     hierarchy.coarse_factor = lu(hierarchy.coarse_A)
     return hierarchy
 end
 
 """
-    _copy_nzvals!(dest, src)
+    _copy_nzvals!(dest, src; backend=CPU())
 
-Copy nonzero values from `src` into `dest` (same sparsity pattern).
+Copy nonzero values from `src` into `dest` (same sparsity pattern),
+using a KA kernel for parallelism.
 """
-function _copy_nzvals!(dest::StaticSparsityMatrixCSR, src::StaticSparsityMatrixCSR)
-    copyto!(nonzeros(dest), nonzeros(src))
+function _copy_nzvals!(dest::StaticSparsityMatrixCSR, src::StaticSparsityMatrixCSR;
+                       backend=CPU())
+    nzv_d = nonzeros(dest)
+    nzv_s = nonzeros(src)
+    n = length(nzv_d)
+    kernel! = copy_kernel!(backend, 64)
+    kernel!(nzv_d, nzv_s; ndrange=n)
+    KernelAbstractions.synchronize(backend)
     return dest
 end
 
-"""
-    _compute_coarsest_matrix(last_level)
+@kernel function copy_kernel!(dst, @Const(src))
+    i = @index(Global)
+    @inbounds dst[i] = src[i]
+end
 
-Compute the coarsest matrix from the last AMG level's data.
-Uses the Galerkin product through the stored maps.
 """
-function _compute_coarsest_matrix(level::AMGLevel{Tv, Ti}) where {Tv, Ti}
-    # Build a temporary coarse matrix with proper sparsity
+    _recompute_coarsest_dense!(hierarchy, last_level; backend=CPU())
+
+Recompute the coarsest dense matrix from the last AMG level in-place,
+writing directly into hierarchy.coarse_A. Avoids allocating a temporary
+coarse CSR matrix.
+"""
+function _recompute_coarsest_dense!(hierarchy::AMGHierarchy{Tv, Ti},
+                                    level::AMGLevel{Tv, Ti};
+                                    backend=CPU()) where {Tv, Ti}
+    M = hierarchy.coarse_A
+    fill!(M, zero(Tv))
     n_fine = size(level.A, 1)
-    n_coarse = level.P.ncol
     cv_a = colvals(level.A)
     nzv_a = nonzeros(level.A)
     P = level.P
-    coarse_entries = Dict{Tuple{Int,Int}, Tv}()
+    rp_a = rowptr(level.A)
+    # Write directly into dense matrix - iterate over fine rows
     @inbounds for i in 1:n_fine
         for pnz_i in P.rowptr[i]:(P.rowptr[i+1]-1)
             I = P.colval[pnz_i]
             p_i = P.nzval[pnz_i]
-            for anz in nzrange(level.A, i)
+            for anz in rp_a[i]:(rp_a[i+1]-1)
                 j = cv_a[anz]
                 a_ij = nzv_a[anz]
                 for pnz_j in P.rowptr[j]:(P.rowptr[j+1]-1)
                     J = P.colval[pnz_j]
                     p_j = P.nzval[pnz_j]
-                    key = (I, J)
-                    coarse_entries[key] = get(coarse_entries, key, zero(Tv)) + p_i * a_ij * p_j
+                    M[I, J] += p_i * a_ij * p_j
                 end
             end
         end
     end
-    # Build CSR
-    sorted_keys = sort!(collect(keys(coarse_entries)))
-    nnz_c = length(sorted_keys)
-    rowptr_c = Vector{Ti}(undef, n_coarse + 1)
-    colval_c = Vector{Ti}(undef, nnz_c)
-    nzval_c = Vector{Tv}(undef, nnz_c)
-    fill!(rowptr_c, Ti(0))
-    for (I, _) in sorted_keys
-        rowptr_c[I] += 1
-    end
-    cumsum_val = Ti(1)
-    for i in 1:n_coarse
-        count = rowptr_c[i]
-        rowptr_c[i] = cumsum_val
-        cumsum_val += count
-    end
-    rowptr_c[n_coarse + 1] = cumsum_val
-    pos = copy(rowptr_c[1:n_coarse])
-    for (I, J) in sorted_keys
-        idx = pos[I]
-        colval_c[idx] = Ti(J)
-        nzval_c[idx] = coarse_entries[(I, J)]
-        pos[I] += 1
-    end
-    return StaticSparsityMatrixCSR(n_coarse, n_coarse, rowptr_c, colval_c, nzval_c)
+    return M
 end
 
 """
-    _update_coarse_solver!(hierarchy, A)
+    _update_coarse_solver!(hierarchy, A; backend=CPU())
 
 Update the direct solver at the coarsest level.
 """
-function _update_coarse_solver!(hierarchy::AMGHierarchy{Tv}, A::StaticSparsityMatrixCSR{Tv}) where {Tv}
-    _csr_to_dense!(hierarchy.coarse_A, A)
+function _update_coarse_solver!(hierarchy::AMGHierarchy{Tv}, A::StaticSparsityMatrixCSR{Tv};
+                                backend=CPU()) where {Tv}
+    _csr_to_dense!(hierarchy.coarse_A, A; backend=backend)
     hierarchy.coarse_factor = lu(hierarchy.coarse_A)
     return hierarchy
 end

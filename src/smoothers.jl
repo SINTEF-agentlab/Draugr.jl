@@ -14,24 +14,33 @@ end
 """
     compute_inverse_diagonal!(invdiag, A)
 
-Compute inverse of diagonal entries of A.
+Compute inverse of diagonal entries of A using a KA kernel.
 """
 function compute_inverse_diagonal!(invdiag::AbstractVector{Tv},
-                                   A::StaticSparsityMatrixCSR{Tv, Ti}) where {Tv, Ti}
+                                   A::StaticSparsityMatrixCSR{Tv, Ti};
+                                   backend=CPU()) where {Tv, Ti}
     n = size(A, 1)
     cv = colvals(A)
     nzv = nonzeros(A)
-    @inbounds for i in 1:n
-        diag_val = zero(Tv)
-        for nz in nzrange(A, i)
-            if cv[nz] == i
-                diag_val = nzv[nz]
+    rp = rowptr(A)
+    kernel! = invdiag_kernel!(backend, 64)
+    kernel!(invdiag, nzv, cv, rp; ndrange=n)
+    KernelAbstractions.synchronize(backend)
+    return invdiag
+end
+
+@kernel function invdiag_kernel!(invdiag, @Const(nzval), @Const(colval), @Const(rp))
+    i = @index(Global)
+    @inbounds begin
+        diag_val = zero(eltype(invdiag))
+        for nz in rp[i]:(rp[i+1]-1)
+            if colval[nz] == i
+                diag_val = nzval[nz]
                 break
             end
         end
         invdiag[i] = inv(diag_val)
     end
-    return invdiag
 end
 
 """
@@ -39,8 +48,9 @@ end
 
 Update the smoother for new matrix values (same sparsity pattern).
 """
-function update_smoother!(smoother::JacobiSmoother, A::StaticSparsityMatrixCSR)
-    compute_inverse_diagonal!(smoother.invdiag, A)
+function update_smoother!(smoother::JacobiSmoother, A::StaticSparsityMatrixCSR;
+                          backend=CPU())
+    compute_inverse_diagonal!(smoother.invdiag, A; backend=backend)
     return smoother
 end
 

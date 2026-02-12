@@ -85,6 +85,7 @@ mutable struct AMGHierarchy{Tv, Ti<:Integer}
     coarse_factor::Any         # LU factorization of coarse_A
     coarse_x::Vector{Tv}       # workspace for coarsest level
     coarse_b::Vector{Tv}       # workspace for coarsest level
+    solve_r::Vector{Tv}        # residual buffer for amg_solve! (finest level size)
 end
 
 # ── AMG Configuration ─────────────────────────────────────────────────────────

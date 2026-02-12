@@ -11,6 +11,7 @@ coefficients change but the pattern remains the same.
 function amg_setup(A::StaticSparsityMatrixCSR{Tv, Ti}, config::AMGConfig=AMGConfig()) where {Tv, Ti}
     levels = AMGLevel{Tv, Ti}[]
     A_current = A
+    n_finest = size(A, 1)
     for lvl in 1:(config.max_levels - 1)
         n = size(A_current, 1)
         n <= config.max_coarse_size && break
@@ -38,23 +39,35 @@ function amg_setup(A::StaticSparsityMatrixCSR{Tv, Ti}, config::AMGConfig=AMGConf
     coarse_factor = lu(coarse_dense)
     coarse_x = zeros(Tv, n_coarse)
     coarse_b = zeros(Tv, n_coarse)
-    return AMGHierarchy{Tv, Ti}(levels, coarse_dense, coarse_factor, coarse_x, coarse_b)
+    # Pre-allocate residual buffer for amg_solve! at finest level size
+    solve_r = zeros(Tv, n_finest)
+    return AMGHierarchy{Tv, Ti}(levels, coarse_dense, coarse_factor, coarse_x, coarse_b, solve_r)
 end
 
 """
-    _csr_to_dense!(M, A)
+    _csr_to_dense!(M, A; backend=CPU())
 
-Convert a StaticSparsityMatrixCSR to a dense matrix.
+Convert a StaticSparsityMatrixCSR to a dense matrix using a KA kernel.
 """
-function _csr_to_dense!(M::Matrix{Tv}, A::StaticSparsityMatrixCSR{Tv, Ti}) where {Tv, Ti}
+function _csr_to_dense!(M::Matrix{Tv}, A::StaticSparsityMatrixCSR{Tv, Ti};
+                        backend=CPU()) where {Tv, Ti}
     fill!(M, zero(Tv))
+    n = size(A, 1)
     cv = colvals(A)
     nzv = nonzeros(A)
-    @inbounds for i in 1:size(A, 1)
-        for nz in nzrange(A, i)
-            j = cv[nz]
-            M[i, j] = nzv[nz]
+    rp = rowptr(A)
+    kernel! = csr_to_dense_kernel!(backend, 64)
+    kernel!(M, nzv, cv, rp; ndrange=n)
+    KernelAbstractions.synchronize(backend)
+    return M
+end
+
+@kernel function csr_to_dense_kernel!(M, @Const(nzval), @Const(colval), @Const(rp))
+    i = @index(Global)
+    @inbounds begin
+        for nz in rp[i]:(rp[i+1]-1)
+            j = colval[nz]
+            M[i, j] = nzval[nz]
         end
     end
-    return M
 end

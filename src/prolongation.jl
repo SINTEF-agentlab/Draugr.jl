@@ -24,30 +24,51 @@ end
 """
     prolongate!(x_fine, P, x_coarse)
 
-Apply prolongation: x_fine += P * x_coarse
+Apply prolongation: x_fine += P * x_coarse.
+Uses KernelAbstractions for parallel execution over fine rows.
 """
-function prolongate!(x_fine::AbstractVector, P::ProlongationOp, x_coarse::AbstractVector)
-    @inbounds for i in 1:P.nrow
-        for nz in P.rowptr[i]:(P.rowptr[i+1]-1)
-            j = P.colval[nz]
-            x_fine[i] += P.nzval[nz] * x_coarse[j]
+function prolongate!(x_fine::AbstractVector, P::ProlongationOp, x_coarse::AbstractVector;
+                     backend=CPU())
+    kernel! = prolongate_kernel!(backend, 64)
+    kernel!(x_fine, P.rowptr, P.colval, P.nzval, x_coarse; ndrange=P.nrow)
+    KernelAbstractions.synchronize(backend)
+    return x_fine
+end
+
+@kernel function prolongate_kernel!(x_fine, @Const(P_rowptr), @Const(P_colval),
+                                    @Const(P_nzval), @Const(x_coarse))
+    i = @index(Global)
+    @inbounds begin
+        for nz in P_rowptr[i]:(P_rowptr[i+1]-1)
+            j = P_colval[nz]
+            x_fine[i] += P_nzval[nz] * x_coarse[j]
         end
     end
-    return x_fine
 end
 
 """
     restrict!(b_coarse, P, r_fine)
 
-Apply restriction (P^T): b_coarse = P^T * r_fine
+Apply restriction (P^T): b_coarse = P^T * r_fine.
+For aggregation-based P (one nonzero per row), this is race-free when
+parallelized over fine rows using atomics.
 """
-function restrict!(b_coarse::AbstractVector, P::ProlongationOp, r_fine::AbstractVector)
+function restrict!(b_coarse::AbstractVector, P::ProlongationOp, r_fine::AbstractVector;
+                   backend=CPU())
     fill!(b_coarse, zero(eltype(b_coarse)))
-    @inbounds for i in 1:P.nrow
-        for nz in P.rowptr[i]:(P.rowptr[i+1]-1)
-            j = P.colval[nz]
-            b_coarse[j] += P.nzval[nz] * r_fine[i]
+    kernel! = restrict_kernel!(backend, 64)
+    kernel!(b_coarse, P.rowptr, P.colval, P.nzval, r_fine; ndrange=P.nrow)
+    KernelAbstractions.synchronize(backend)
+    return b_coarse
+end
+
+@kernel function restrict_kernel!(b_coarse, @Const(P_rowptr), @Const(P_colval),
+                                  @Const(P_nzval), @Const(r_fine))
+    i = @index(Global)
+    @inbounds begin
+        for nz in P_rowptr[i]:(P_rowptr[i+1]-1)
+            j = P_colval[nz]
+            Atomix.@atomic b_coarse[j] += P_nzval[nz] * r_fine[i]
         end
     end
-    return b_coarse
 end

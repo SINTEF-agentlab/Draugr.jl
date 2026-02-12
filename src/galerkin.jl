@@ -88,31 +88,45 @@ end
 
 In-place Galerkin product: recompute A_coarse values from A_fine and P,
 using the precomputed restriction map. This is used during resetup.
+Uses KernelAbstractions for parallel execution.
 """
 function galerkin_product!(A_coarse::StaticSparsityMatrixCSR{Tv, Ti},
                            A_fine::StaticSparsityMatrixCSR{Tv, Ti},
                            P::ProlongationOp{Ti, Tv},
-                           r_map::RestrictionMap{Ti}) where {Tv, Ti}
+                           r_map::RestrictionMap{Ti};
+                           backend=CPU()) where {Tv, Ti}
     nzv_c = nonzeros(A_coarse)
     nzv_f = nonzeros(A_fine)
-    cv_f = colvals(A_fine)
     n_fine = size(A_fine, 1)
     # Zero out coarse matrix values
     fill!(nzv_c, zero(Tv))
-    # Accumulate: for each nonzero in A_fine, add contribution to A_coarse
-    @inbounds for i in 1:n_fine
-        for pnz_i in P.rowptr[i]:(P.rowptr[i+1]-1)
-            p_i = P.nzval[pnz_i]
-            for anz in nzrange(A_fine, i)
-                j = cv_f[anz]
+    # Accumulate: use kernel over fine-grid rows
+    rp_a = rowptr(A_fine)
+    cv_a = colvals(A_fine)
+    kernel! = galerkin_row_kernel!(backend, 64)
+    kernel!(nzv_c, nzv_f, cv_a, rp_a,
+            P.rowptr, P.colval, P.nzval,
+            r_map.fine_to_coarse_nz; ndrange=n_fine)
+    KernelAbstractions.synchronize(backend)
+    return A_coarse
+end
+
+@kernel function galerkin_row_kernel!(nzv_c, @Const(nzv_f), @Const(cv_a), @Const(rp_a),
+                                      @Const(P_rowptr), @Const(P_colval), @Const(P_nzval),
+                                      @Const(fine_to_coarse_nz))
+    i = @index(Global)
+    @inbounds begin
+        for pnz_i in P_rowptr[i]:(P_rowptr[i+1]-1)
+            p_i = P_nzval[pnz_i]
+            for anz in rp_a[i]:(rp_a[i+1]-1)
+                j = cv_a[anz]
                 a_ij = nzv_f[anz]
-                for pnz_j in P.rowptr[j]:(P.rowptr[j+1]-1)
-                    p_j = P.nzval[pnz_j]
-                    c_idx = r_map.fine_to_coarse_nz[anz]
-                    nzv_c[c_idx] += p_i * a_ij * p_j
+                for pnz_j in P_rowptr[j]:(P_rowptr[j+1]-1)
+                    p_j = P_nzval[pnz_j]
+                    c_idx = fine_to_coarse_nz[anz]
+                    Atomix.@atomic nzv_c[c_idx] += p_i * a_ij * p_j
                 end
             end
         end
     end
-    return A_coarse
 end

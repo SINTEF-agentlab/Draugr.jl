@@ -4,9 +4,14 @@ using SparseArrays
 using LinearAlgebra
 using Random
 using KernelAbstractions
+using Atomix
 
-# StaticCSR matrix format (compatible with Jutul's StaticSparsityMatrixCSR)
-include("static_csr.jl")
+# Import StaticCSR types from Jutul
+using Jutul.StaticCSR: StaticSparsityMatrixCSR, colvals, static_sparsity_sparse,
+                       nthreads, minbatch
+
+# Local helpers for StaticCSR (not provided by Jutul)
+include("static_csr_helpers.jl")
 
 # Type definitions
 include("types.jl")

@@ -2,6 +2,7 @@ using Test
 using ParallelAMG
 using SparseArrays
 using LinearAlgebra
+import Jutul
 
 # ── Helper: 1D Poisson matrix ────────────────────────────────────────────────
 function poisson1d_csr(n)
@@ -338,6 +339,233 @@ end
         x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-10)
         r = b - sparse(A.At') * x
         @test norm(r) < 1e-10
+    end
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Colored Gauss-Seidel Smoother
+    # ══════════════════════════════════════════════════════════════════════════
+
+    @testset "Graph Coloring" begin
+        A = poisson1d_csr(10)
+        colors, nc = ParallelAMG.greedy_coloring(A)
+        @test length(colors) == 10
+        @test all(colors .> 0)
+        @test nc >= 2  # tridiagonal needs at least 2 colors
+        # Verify no two adjacent nodes have the same color
+        cv = colvals(A)
+        for i in 1:10
+            for nz in nzrange(A, i)
+                j = cv[nz]
+                if j != i
+                    @test colors[i] != colors[j]
+                end
+            end
+        end
+    end
+
+    @testset "Colored GS Smoother - Build" begin
+        A = poisson1d_csr(10)
+        smoother = ParallelAMG.build_colored_gs_smoother(A)
+        @test smoother.num_colors >= 2
+        @test length(smoother.invdiag) == 10
+        @test all(smoother.invdiag .≈ 0.5)  # 1/2.0
+        @test length(smoother.color_order) == 10
+    end
+
+    @testset "Colored GS Smoother - Smoothing" begin
+        A = poisson1d_csr(10)
+        smoother = ParallelAMG.build_colored_gs_smoother(A)
+        b = ones(10)
+        x = zeros(10)
+        smooth!(x, A, b, smoother; steps=10)
+        r = b - sparse(A.At') * x
+        @test norm(r) < norm(b)
+    end
+
+    @testset "AMG Solve - Colored GS" begin
+        n = 10
+        A = poisson2d_csr(n)
+        N = n*n
+        b = rand(N)
+        x = zeros(N)
+        config = AMGConfig(smoother=ColoredGaussSeidelType())
+        hierarchy = amg_setup(A, config)
+        x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r = b - sparse(A.At') * x
+        @test norm(r) / norm(b) < 1e-8
+        @test niter < 200
+    end
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SPAI(0) Smoother
+    # ══════════════════════════════════════════════════════════════════════════
+
+    @testset "SPAI0 Smoother - Build" begin
+        A = poisson1d_csr(10)
+        smoother = ParallelAMG.build_spai0_smoother(A)
+        @test length(smoother.m_diag) == 10
+        # For tridiagonal with diag=2, off-diag=-1:
+        # interior row: [−1 2 −1], row_norm_sq = 1+4+1 = 6, diag = 2, m = 2/6 = 1/3
+        @test smoother.m_diag[5] ≈ 2.0/6.0
+    end
+
+    @testset "SPAI0 Smoother - Smoothing" begin
+        A = poisson1d_csr(10)
+        smoother = ParallelAMG.build_spai0_smoother(A)
+        b = ones(10)
+        x = zeros(10)
+        smooth!(x, A, b, smoother; steps=10)
+        r = b - sparse(A.At') * x
+        @test norm(r) < norm(b)
+    end
+
+    @testset "AMG Solve - SPAI0" begin
+        n = 10
+        A = poisson2d_csr(n)
+        N = n*n
+        b = rand(N)
+        x = zeros(N)
+        config = AMGConfig(smoother=SPAI0SmootherType())
+        hierarchy = amg_setup(A, config)
+        x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r = b - sparse(A.At') * x
+        @test norm(r) / norm(b) < 1e-8
+        @test niter < 200
+    end
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SPAI(1) Smoother
+    # ══════════════════════════════════════════════════════════════════════════
+
+    @testset "SPAI1 Smoother - Build" begin
+        A = poisson1d_csr(5)
+        smoother = ParallelAMG.build_spai1_smoother(A)
+        @test length(smoother.nzval) == nnz(A)
+    end
+
+    @testset "SPAI1 Smoother - Smoothing" begin
+        A = poisson1d_csr(10)
+        smoother = ParallelAMG.build_spai1_smoother(A)
+        b = ones(10)
+        x = zeros(10)
+        smooth!(x, A, b, smoother; steps=10)
+        r = b - sparse(A.At') * x
+        @test norm(r) < norm(b)
+    end
+
+    @testset "AMG Solve - SPAI1" begin
+        n = 10
+        A = poisson2d_csr(n)
+        N = n*n
+        b = rand(N)
+        x = zeros(N)
+        config = AMGConfig(smoother=SPAI1SmootherType(),
+                           pre_smoothing_steps=2, post_smoothing_steps=2)
+        hierarchy = amg_setup(A, config)
+        x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=300)
+        r = b - sparse(A.At') * x
+        @test norm(r) / norm(b) < 1e-8
+        @test niter < 300
+    end
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Verbose output
+    # ══════════════════════════════════════════════════════════════════════════
+
+    @testset "Verbose Output" begin
+        A = poisson2d_csr(8)
+        N = 64
+        b = rand(N)
+        x = zeros(N)
+        config = AMGConfig(verbose=true)
+        # Capture stdout using mktemp
+        output = mktempdir() do dir
+            path = joinpath(dir, "out.txt")
+            open(path, "w") do f
+                redirect_stdout(f) do
+                    hierarchy = amg_setup(A, config)
+                    x, _ = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=100)
+                end
+            end
+            read(path, String)
+        end
+        @test contains(output, "AMG Hierarchy Summary")
+        @test contains(output, "Operator complexity")
+        @test contains(output, "AMG solve converged")
+    end
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Jutul Preconditioner Interface
+    # ══════════════════════════════════════════════════════════════════════════
+
+    @testset "Jutul Interface - ParallelAMGPreconditioner" begin
+        n = 10
+        A = poisson2d_csr(n)
+        N = n*n
+        b = rand(N)
+
+        # Create preconditioner
+        prec = ParallelAMGPreconditioner()
+        @test prec isa Jutul.JutulPreconditioner
+        @test isnothing(prec.hierarchy)
+        @test Jutul.operator_nrows(prec) == 0
+
+        # Update preconditioner (first call = setup)
+        ctx = Jutul.DefaultContext()
+        Jutul.update_preconditioner!(prec, A, b, ctx, nothing)
+        @test !isnothing(prec.hierarchy)
+        @test Jutul.operator_nrows(prec) == N
+
+        # Apply preconditioner (one V-cycle)
+        x = zeros(N)
+        Jutul.apply!(x, prec, b)
+        @test norm(x) > 0  # not zero
+
+        # Update again (resetup)
+        nonzeros(A) .*= 2.0
+        Jutul.update_preconditioner!(prec, A, b, ctx, nothing)
+        @test Jutul.operator_nrows(prec) == N
+    end
+
+    @testset "Jutul Interface - Convergence" begin
+        n = 10
+        A = poisson2d_csr(n)
+        N = n*n
+        b = rand(N)
+
+        prec = ParallelAMGPreconditioner()
+        ctx = Jutul.DefaultContext()
+        Jutul.update_preconditioner!(prec, A, b, ctx, nothing)
+
+        # Use the preconditioner iteratively (manual Krylov-like iteration)
+        x = zeros(N)
+        for _ in 1:100
+            r = b - sparse(A.At') * x
+            dx = zeros(N)
+            Jutul.apply!(dx, prec, r)
+            x .+= dx
+        end
+        r = b - sparse(A.At') * x
+        @test norm(r) / norm(b) < 1e-6
+    end
+
+    @testset "Jutul Interface - Custom Config" begin
+        prec = ParallelAMGPreconditioner(
+            smoother=ColoredGaussSeidelType(),
+            coarsening=PMISCoarsening(),
+            pre_smoothing_steps=2,
+            post_smoothing_steps=2
+        )
+        @test prec.config.smoother isa ColoredGaussSeidelType
+        @test prec.config.coarsening isa PMISCoarsening
+        @test prec.config.pre_smoothing_steps == 2
+
+        A = poisson2d_csr(10)
+        N = 100
+        b = rand(N)
+        ctx = Jutul.DefaultContext()
+        Jutul.update_preconditioner!(prec, A, b, ctx, nothing)
+        @test Jutul.operator_nrows(prec) == N
     end
 
 end

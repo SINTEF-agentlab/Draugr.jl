@@ -47,13 +47,13 @@ function compute_coarse_sparsity(A_fine::StaticSparsityMatrixCSR{Tv, Ti},
         rowptr_c[I] += 1
     end
     # Cumulative sum
-    cumsum = Ti(1)
+    running_sum = Ti(1)
     for i in 1:n_coarse
         count = rowptr_c[i]
-        rowptr_c[i] = cumsum
-        cumsum += count
+        rowptr_c[i] = running_sum
+        running_sum += count
     end
-    rowptr_c[n_coarse + 1] = cumsum
+    rowptr_c[n_coarse + 1] = running_sum
     # Fill column indices and values
     pos = copy(rowptr_c[1:n_coarse])
     for (I, J) in sorted_keys

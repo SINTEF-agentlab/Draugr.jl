@@ -60,6 +60,7 @@ export DirectInterpolation, StandardInterpolation, ExtendedIInterpolation
 export AbsoluteStrength, SignedStrength
 export AMGConfig, AMGHierarchy, AMGLevel
 export amg_setup, amg_resetup!, amg_cycle!, amg_solve!
+export hypre_default_config
 export JacobiSmoother, ColoredGaussSeidelSmoother, SPAI0Smoother, SPAI1Smoother
 export L1JacobiSmoother, ChebyshevSmoother, ILU0Smoother
 export JacobiSmootherType, ColoredGaussSeidelType, SPAI0SmootherType, SPAI1SmootherType

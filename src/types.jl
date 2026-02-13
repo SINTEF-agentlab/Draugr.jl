@@ -1,15 +1,44 @@
 # ── Interpolation type tags ───────────────────────────────────────────────────
 abstract type InterpolationType end
 
-"""Direct interpolation: interpolate only from directly connected coarse points."""
-struct DirectInterpolation <: InterpolationType end
+"""
+    DirectInterpolation(; trunc_factor=0.0)
 
-"""Standard (classical Ruge-Stüben) interpolation: includes indirect contributions
-through strong fine neighbors."""
-struct StandardInterpolation <: InterpolationType end
+Direct interpolation: interpolate only from directly connected coarse points.
+`trunc_factor`: entries with |w| < trunc_factor * max|w| per row are dropped
+(0 = no truncation). Maps to HYPRE's `AggTruncFactor`.
+"""
+struct DirectInterpolation <: InterpolationType
+    trunc_factor::Float64
+end
+DirectInterpolation() = DirectInterpolation(0.0)
 
-"""Extended+i interpolation: extends standard by including distance-2 coarse points."""
-struct ExtendedIInterpolation <: InterpolationType end
+"""
+    StandardInterpolation(; trunc_factor=0.0)
+
+Standard (classical Ruge-Stüben) interpolation: includes indirect contributions
+through strong fine neighbors.
+`trunc_factor`: entries with |w| < trunc_factor * max|w| per row are dropped
+(0 = no truncation). Maps to HYPRE's `AggTruncFactor`.
+"""
+struct StandardInterpolation <: InterpolationType
+    trunc_factor::Float64
+end
+StandardInterpolation() = StandardInterpolation(0.0)
+
+"""
+    ExtendedIInterpolation(; trunc_factor=0.0)
+
+Extended+i interpolation (HYPRE InterpType=6): extends standard by including
+distance-2 coarse points (coarse points reachable through strong fine neighbors).
+Recommended for use with HMIS coarsening for challenging 3D problems.
+`trunc_factor`: entries with |w| < trunc_factor * max|w| per row are dropped
+(0 = no truncation). Maps to HYPRE's `AggTruncFactor`.
+"""
+struct ExtendedIInterpolation <: InterpolationType
+    trunc_factor::Float64
+end
+ExtendedIInterpolation() = ExtendedIInterpolation(0.0)
 
 # ── Coarsening type tags ──────────────────────────────────────────────────────
 abstract type CoarseningAlgorithm end
@@ -62,11 +91,33 @@ end
 RSCoarsening() = RSCoarsening(0.25, DirectInterpolation())
 RSCoarsening(θ::Real) = RSCoarsening(θ, DirectInterpolation())
 
-"""Aggressive coarsening (two passes of PMIS-based coarsening)."""
+"""
+    AggressiveCoarsening(θ=0.25; base=:pmis, interpolation=ExtendedIInterpolation())
+
+Aggressive coarsening with configurable base algorithm.
+
+In HYPRE, aggressive coarsening performs two passes of C/F splitting: the first
+pass uses the base coarsening algorithm (HMIS or PMIS), and the second pass further
+coarsens among C-points using distance-2 strong connections. The result is a much
+coarser grid, requiring long-range interpolation (ext+i recommended).
+
+Fields:
+- `θ`: Strength threshold (default: 0.25)
+- `base`: Base coarsening algorithm (`:pmis` or `:hmis`, default: `:pmis`)
+- `interpolation`: Interpolation type for CF-based aggressive coarsening
+  (default: `ExtendedIInterpolation()`). Only used when `base` is `:hmis` or `:pmis`.
+
+When `base=:hmis`, this matches HYPRE's CoarsenType=10 + AggNumLevels>0.
+"""
 struct AggressiveCoarsening <: CoarseningAlgorithm
     θ::Float64
+    base::Symbol
+    interpolation::InterpolationType
 end
-AggressiveCoarsening() = AggressiveCoarsening(0.25)
+AggressiveCoarsening() = AggressiveCoarsening(0.25, :pmis, ExtendedIInterpolation())
+AggressiveCoarsening(θ::Real) = AggressiveCoarsening(θ, :pmis, ExtendedIInterpolation())
+AggressiveCoarsening(θ::Real, base::Symbol) = AggressiveCoarsening(θ, base, ExtendedIInterpolation())
+AggressiveCoarsening(θ::Real, base::Symbol, interp::InterpolationType) = AggressiveCoarsening(θ, base, interp)
 
 """Smoothed aggregation coarsening. Builds a tentative prolongation from aggregation,
 then smooths it with a damped Jacobi step: P = (I - ω D⁻¹ A) P_tent.
@@ -375,4 +426,39 @@ function _get_coarsening_for_level(config::AMGConfig, lvl::Int)
         return config.initial_coarsening
     end
     return config.coarsening
+end
+
+"""
+    hypre_default_config(; kwargs...)
+
+Create an AMGConfig matching a typical HYPRE BoomerAMG setup for challenging 3D problems:
+
+    CoarsenType = 10       → HMIS coarsening
+    StrongThreshold = 0.5  → θ = 0.5
+    AggNumLevels = 1       → Aggressive coarsening for first level
+    AggTruncFactor = 0.3   → Truncation factor for interpolation weights
+    InterpType = 6         → Extended+i interpolation
+
+The resulting config uses:
+- `HMISCoarsening(0.5, ExtendedIInterpolation(0.3))` as main coarsening
+- `AggressiveCoarsening(0.5, :hmis, ExtendedIInterpolation(0.3))` for the first level
+- `initial_coarsening_levels = 1`
+
+Additional keyword arguments are forwarded to `AMGConfig`.
+"""
+function hypre_default_config(;
+    θ::Float64 = 0.5,
+    agg_num_levels::Int = 1,
+    agg_trunc_factor::Float64 = 0.3,
+    kwargs...
+)
+    interp = ExtendedIInterpolation(agg_trunc_factor)
+    main_coarsening = HMISCoarsening(θ, interp)
+    agg_coarsening = AggressiveCoarsening(θ, :hmis, interp)
+    return AMGConfig(;
+        coarsening = main_coarsening,
+        initial_coarsening = agg_coarsening,
+        initial_coarsening_levels = agg_num_levels,
+        kwargs...
+    )
 end

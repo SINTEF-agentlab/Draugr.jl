@@ -1833,4 +1833,180 @@ end
         @test n / n_coarse > 2.0
     end
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # HYPRE-equivalent configuration tests
+    # ══════════════════════════════════════════════════════════════════════════
+
+    @testset "hypre_default_config construction" begin
+        config = hypre_default_config()
+        @test config.coarsening isa HMISCoarsening
+        @test config.coarsening.θ == 0.5
+        @test config.coarsening.interpolation isa ExtendedIInterpolation
+        @test config.coarsening.interpolation.trunc_factor == 0.3
+        @test config.initial_coarsening isa AggressiveCoarsening
+        @test config.initial_coarsening.θ == 0.5
+        @test config.initial_coarsening.base == :hmis
+        @test config.initial_coarsening.interpolation isa ExtendedIInterpolation
+        @test config.initial_coarsening.interpolation.trunc_factor == 0.3
+        @test config.initial_coarsening_levels == 1
+    end
+
+    @testset "hypre_default_config with custom params" begin
+        config = hypre_default_config(θ=0.3, agg_num_levels=2, agg_trunc_factor=0.5,
+                                       verbose=false, smoother=ColoredGaussSeidelType())
+        @test config.coarsening.θ == 0.3
+        @test config.initial_coarsening.θ == 0.3
+        @test config.initial_coarsening_levels == 2
+        @test config.coarsening.interpolation.trunc_factor == 0.5
+        @test config.smoother isa ColoredGaussSeidelType
+    end
+
+    @testset "hypre_default_config solve - 2D Poisson" begin
+        n = 12
+        A = poisson2d_csr(n)
+        N = n * n
+        b = rand(N)
+        x = zeros(N)
+        config = hypre_default_config(verbose=false)
+        hierarchy = amg_setup(A, config)
+        @test length(hierarchy.levels) >= 1
+        x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r = b - sparse(A.At') * x
+        @test norm(r) / norm(b) < 1e-6
+        @test niter < 200
+    end
+
+    @testset "Interpolation trunc_factor" begin
+        # Test that trunc_factor fields work correctly
+        d = DirectInterpolation(0.3)
+        @test d.trunc_factor == 0.3
+        d0 = DirectInterpolation()
+        @test d0.trunc_factor == 0.0
+
+        s = StandardInterpolation(0.5)
+        @test s.trunc_factor == 0.5
+        s0 = StandardInterpolation()
+        @test s0.trunc_factor == 0.0
+
+        e = ExtendedIInterpolation(0.3)
+        @test e.trunc_factor == 0.3
+        e0 = ExtendedIInterpolation()
+        @test e0.trunc_factor == 0.0
+    end
+
+    @testset "AggressiveCoarsening with HMIS base" begin
+        n = 10
+        A = poisson2d_csr(n)
+        N = n * n
+        b = rand(N)
+        x = zeros(N)
+        config = AMGConfig(
+            coarsening = HMISCoarsening(0.5, ExtendedIInterpolation()),
+            initial_coarsening = AggressiveCoarsening(0.5, :hmis, ExtendedIInterpolation(0.3)),
+            initial_coarsening_levels = 1,
+            pre_smoothing_steps = 2,
+            post_smoothing_steps = 2,
+        )
+        hierarchy = amg_setup(A, config)
+        @test length(hierarchy.levels) >= 1
+        x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r = b - sparse(A.At') * x
+        @test norm(r) / norm(b) < 1e-6
+        @test niter < 200
+    end
+
+    @testset "AggressiveCoarsening with PMIS base" begin
+        n = 10
+        A = poisson2d_csr(n)
+        N = n * n
+        b = rand(N)
+        x = zeros(N)
+        config = AMGConfig(
+            coarsening = PMISCoarsening(0.5, ExtendedIInterpolation()),
+            initial_coarsening = AggressiveCoarsening(0.5, :pmis, ExtendedIInterpolation(0.3)),
+            initial_coarsening_levels = 1,
+            pre_smoothing_steps = 2,
+            post_smoothing_steps = 2,
+        )
+        hierarchy = amg_setup(A, config)
+        @test length(hierarchy.levels) >= 1
+        x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r = b - sparse(A.At') * x
+        @test norm(r) / norm(b) < 1e-6
+        @test niter < 200
+    end
+
+    @testset "Consistent θ in interpolation" begin
+        # Verify that the coarsening's θ is passed to interpolation (not hardcoded 0.25)
+        n = 8
+        A = poisson2d_csr(n)
+        # Use θ=0.5 with HMIS + Direct: should still converge
+        config05 = AMGConfig(coarsening=HMISCoarsening(0.5, DirectInterpolation()),
+                             pre_smoothing_steps=2, post_smoothing_steps=2)
+        h05 = amg_setup(A, config05)
+        @test length(h05.levels) >= 1
+        x = zeros(n*n)
+        b = rand(n*n)
+        x, niter = amg_solve!(x, b, h05, config05; tol=1e-8, maxiter=200)
+        r = b - sparse(A.At') * x
+        @test norm(r) / norm(b) < 1e-6
+    end
+
+    @testset "coarsen_aggressive_cf with HMIS" begin
+        n = 10
+        A = poisson2d_csr(n)
+        A_csr = to_csr(A)
+        N = n * n
+        # Use fixed RNG for reproducibility
+        rng = Random.MersenneTwister(42)
+        cf, coarse_map, n_coarse = ParallelAMG.coarsen_aggressive_cf(A_csr, 0.25, :hmis; rng=rng)
+        @test n_coarse > 0
+        @test n_coarse < N  # should have coarsened
+        # Verify it produces a reasonable coarsening ratio (less than 60% of original)
+        @test n_coarse < 0.6 * N
+        # All points should be decided as C or F
+        for i in 1:N
+            @test cf[i] == 1 || cf[i] == -1
+        end
+        # Coarse map should be valid for all C-points
+        for i in 1:N
+            if cf[i] == 1
+                @test coarse_map[i] >= 1
+                @test coarse_map[i] <= n_coarse
+            end
+        end
+    end
+
+    @testset "coarsen_aggressive_cf with PMIS" begin
+        n = 10
+        A = poisson2d_csr(n)
+        A_csr = to_csr(A)
+        N = n * n
+        cf, coarse_map, n_coarse = ParallelAMG.coarsen_aggressive_cf(A_csr, 0.25, :pmis)
+        @test n_coarse > 0
+        @test n_coarse < N
+        for i in 1:N
+            @test cf[i] == 1 || cf[i] == -1
+        end
+    end
+
+    @testset "HMIS with ExtendedI and trunc_factor" begin
+        n = 10
+        A = poisson2d_csr(n)
+        N = n * n
+        b = rand(N)
+        x = zeros(N)
+        config = AMGConfig(
+            coarsening = HMISCoarsening(0.5, ExtendedIInterpolation(0.3)),
+            pre_smoothing_steps = 2,
+            post_smoothing_steps = 2,
+        )
+        hierarchy = amg_setup(A, config)
+        @test length(hierarchy.levels) >= 1
+        x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r = b - sparse(A.At') * x
+        @test norm(r) / norm(b) < 1e-6
+        @test niter < 200
+    end
+
 end

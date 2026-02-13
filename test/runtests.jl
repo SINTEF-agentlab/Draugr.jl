@@ -2,6 +2,7 @@ using Test
 using ParallelAMG
 using SparseArrays
 using LinearAlgebra
+using Random
 import Jutul
 
 # Helper: convert StaticSparsityMatrixCSR to internal CSRMatrix for unit tests
@@ -1711,6 +1712,72 @@ end
         x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
         r = b - sparse(A.At') * x
         @test norm(r) / norm(b) < 1e-8
+    end
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Coarsening stalling fix
+    # ══════════════════════════════════════════════════════════════════════════
+
+    @testset "Aggregation - no stalling on sparse irregular matrix" begin
+        # Build a sparse irregular matrix that previously caused stalling
+        # (many levels with barely decreasing row count)
+        Random.seed!(42)
+        n = 500
+        I = Int[]; J = Int[]; V = Float64[]
+        for i in 1:n
+            push!(I, i); push!(J, i); push!(V, 10.0 + 90.0*rand())
+            n_neigh = rand(2:min(5, n-1))
+            for _ in 1:n_neigh
+                j = rand(1:n)
+                j == i && continue
+                push!(I, i); push!(J, j); push!(V, -(1.0 + 9.0*rand()))
+            end
+        end
+        A = static_sparsity_sparse(I, J, V, n, n)
+        config = AMGConfig(coarsening=AggregationCoarsening(0.25), max_levels=20)
+        hierarchy = amg_setup(A, config)
+        # Must produce a hierarchy with fewer than 8 levels (previously > 12 stalling levels)
+        @test length(hierarchy.levels) < 8
+        # Each level should coarsen meaningfully (no consecutive near-stall levels)
+        for i in 1:length(hierarchy.levels)-1
+            n_current = size(hierarchy.levels[i].A, 1)
+            n_next = size(hierarchy.levels[i+1].A, 1)
+            @test n_next < n_current  # strictly decreasing
+        end
+    end
+
+    @testset "Aggregation - θ auto-reduction fallback" begin
+        # Matrix where default θ=0.25 might create poor coarsening
+        Random.seed!(123)
+        n = 200
+        I = Int[]; J = Int[]; V = Float64[]
+        for i in 1:n
+            push!(I, i); push!(J, i); push!(V, 100.0)
+            # Very sparse connectivity: only 1-2 neighbors
+            for k in 1:rand(1:2)
+                j = rand(1:n)
+                j == i && continue
+                push!(I, i); push!(J, j); push!(V, -(0.1 + rand()))
+            end
+        end
+        A = static_sparsity_sparse(I, J, V, n, n)
+        config = AMGConfig(coarsening=AggregationCoarsening(0.25))
+        hierarchy = amg_setup(A, config)
+        # Should still produce a reasonable hierarchy
+        @test length(hierarchy.levels) >= 1
+        @test length(hierarchy.levels) < 15
+    end
+
+    @testset "MIS-based aggregation produces larger aggregates" begin
+        # 2D Poisson: the MIS-based aggregation should create fewer, larger aggregates
+        A = poisson2d_csr(20)
+        A_csr = to_csr(A)
+        agg, n_coarse = ParallelAMG.coarsen_aggregation(A_csr, 0.25)
+        n = size(A, 1)
+        # The coarsening ratio should be aggressive (not more than 50% of original)
+        @test n_coarse < 0.5 * n
+        # Average aggregate size should be > 2
+        @test n / n_coarse > 2.0
     end
 
 end

@@ -3,9 +3,13 @@
 """
     coarsen_aggregation(A, θ)
 
-Greedy aggregation coarsening. Returns `agg::Vector{Int}` where `agg[i]` is the
-aggregate index (1-based) that node `i` belongs to, and `n_coarse` the number of
-aggregates.
+Multi-pass aggregation coarsening inspired by MueLu/PyAMG. Uses a distance-2
+MIS (maximal independent set) for seed selection to ensure well-separated seeds,
+then assigns remaining nodes to neighboring aggregates, and finally merges small
+aggregates to prevent singleton-dominated coarsening at deeper levels.
+
+Returns `agg::Vector{Int}` where `agg[i]` is the aggregate index (1-based) that
+node `i` belongs to, and `n_coarse` the number of aggregates.
 """
 function coarsen_aggregation(A::CSRMatrix{Tv, Ti}, θ::Real) where {Tv, Ti}
     n = size(A, 1)
@@ -15,42 +19,145 @@ function coarsen_aggregation(A::CSRMatrix{Tv, Ti}, θ::Real) where {Tv, Ti}
     end
     is_strong = strength_graph(A, θ)
     cv = colvals(A)
+    nzv = nonzeros(A)
     agg = zeros(Int, n)  # 0 = unassigned
     n_coarse = 0
-    # Phase 1: form aggregates around seed nodes
+
+    # Compute number of strong neighbors for each node (used for seed priority)
+    strong_count = zeros(Int, n)
     @inbounds for i in 1:n
-        agg[i] != 0 && continue
-        # i becomes a seed
-        n_coarse += 1
-        agg[i] = n_coarse
         for nz in nzrange(A, i)
             j = cv[nz]
-            if is_strong[nz] && agg[j] == 0
-                agg[j] = n_coarse
+            if j != i && is_strong[nz]
+                strong_count[i] += 1
             end
         end
     end
-    # Phase 2: assign any remaining unaggregated nodes to strongest neighbor's aggregate
-    @inbounds for i in 1:n
-        agg[i] != 0 && continue
-        nzv = nonzeros(A)
-        best_agg = 0
-        best_val = zero(real(Tv))
+
+    # Phase 1: distance-2 MIS seed selection
+    # A node can be a seed only if no node within distance 2 in the strong
+    # graph is already a seed. Process nodes in decreasing strong-count order
+    # so high-connectivity nodes seed first, creating larger aggregates.
+    state = zeros(Int8, n)  # 0=available, 1=seed, -1=neighbor-of-seed, -2=dist-2-of-seed
+    order = sortperm(strong_count; rev=true)
+    @inbounds for idx in 1:n
+        i = order[idx]
+        state[i] != 0 && continue
+        # Check if any strong neighbor is already a seed or neighbor-of-seed
+        can_seed = true
         for nz in nzrange(A, i)
             j = cv[nz]
-            if j != i && agg[j] != 0 && abs(nzv[nz]) > best_val
+            if j != i && is_strong[nz] && (state[j] == 1 || state[j] == -1)
+                can_seed = false
+                break
+            end
+        end
+        if !can_seed
+            continue
+        end
+        # Make i a seed
+        state[i] = 1
+        n_coarse += 1
+        agg[i] = n_coarse
+        # Mark all strong neighbors of i: they join aggregate and are
+        # marked as "neighbor-of-seed" so they won't become seeds
+        for nz in nzrange(A, i)
+            j = cv[nz]
+            if j != i && is_strong[nz] && state[j] == 0
+                state[j] = -1
+                agg[j] = n_coarse
+                # Mark distance-2 neighbors (neighbors of j) to prevent
+                # them from becoming seeds too close
+                for nz2 in nzrange(A, j)
+                    k = cv[nz2]
+                    if k != j && is_strong[nz2] && state[k] == 0
+                        state[k] = -2
+                    end
+                end
+            end
+        end
+    end
+
+    # Phase 2: assign unaggregated nodes to strongest neighbor's aggregate
+    @inbounds for i in 1:n
+        agg[i] != 0 && continue
+        best_agg = 0
+        best_val = zero(real(Tv))
+        # Prefer strong connections
+        for nz in nzrange(A, i)
+            j = cv[nz]
+            if j != i && is_strong[nz] && agg[j] != 0 && abs(nzv[nz]) > best_val
                 best_val = abs(nzv[nz])
                 best_agg = agg[j]
+            end
+        end
+        # Fall back to any connection
+        if best_agg == 0
+            for nz in nzrange(A, i)
+                j = cv[nz]
+                if j != i && agg[j] != 0 && abs(nzv[nz]) > best_val
+                    best_val = abs(nzv[nz])
+                    best_agg = agg[j]
+                end
             end
         end
         if best_agg != 0
             agg[i] = best_agg
         else
-            # Isolated node: create singleton aggregate
+            # Truly isolated node: create singleton aggregate
             n_coarse += 1
             agg[i] = n_coarse
         end
     end
+
+    # Phase 3: merge small aggregates (size ≤ 1) into neighboring aggregates
+    # This prevents the pathological case of many singleton aggregates at
+    # coarser levels where the strong graph becomes sparse.
+    agg_sizes = zeros(Int, n_coarse)
+    @inbounds for i in 1:n
+        agg_sizes[agg[i]] += 1
+    end
+    # Build merge map using union-find
+    merge_map = collect(1:n_coarse)
+    @inbounds for i in 1:n
+        my_agg = find_root!(merge_map, agg[i])
+        agg_sizes[my_agg] > 1 && continue
+        # Find the best neighboring aggregate to merge into
+        best_target = 0
+        best_val = zero(real(Tv))
+        for nz in nzrange(A, i)
+            j = cv[nz]
+            j == i && continue
+            j_agg = find_root!(merge_map, agg[j])
+            if j_agg != my_agg && abs(nzv[nz]) > best_val
+                best_val = abs(nzv[nz])
+                best_target = j_agg
+            end
+        end
+        if best_target != 0
+            # Merge my_agg into best_target
+            union_roots!(merge_map, best_target, my_agg)
+            # Update size tracking
+            root = find_root!(merge_map, best_target)
+            agg_sizes[root] = agg_sizes[my_agg] + agg_sizes[best_target]
+        end
+    end
+    # Compact aggregate numbering after merges
+    new_id = zeros(Int, n_coarse)
+    new_count = 0
+    for i in 1:n_coarse
+        root = find_root!(merge_map, i)
+        if new_id[root] == 0
+            new_count += 1
+            new_id[root] = new_count
+        end
+        new_id[i] = new_id[root]
+    end
+    @inbounds for i in 1:n
+        agg[i] = new_id[find_root!(merge_map, agg[i])]
+    end
+    n_coarse = new_count
+
     return agg, n_coarse
 end
 

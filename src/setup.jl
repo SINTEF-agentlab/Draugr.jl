@@ -30,8 +30,8 @@ function amg_setup(A_csr::CSRMatrix{Tv, Ti}, config::AMGConfig=AMGConfig();
         n <= config.max_coarse_size && break
         # Select coarsening algorithm for this level
         coarsening_alg = _get_coarsening_for_level(config, lvl)
-        # Coarsen and build prolongation
-        P, n_coarse = _coarsen_and_build_P(A_current, coarsening_alg, config)
+        # Coarsen and build prolongation, with automatic θ reduction on stall
+        P, n_coarse = _coarsen_with_fallback(A_current, coarsening_alg, config)
         n_coarse >= n && break  # no coarsening progress
         n_coarse == 0 && break  # degenerate case
         # Compute coarse operator via Galerkin product
@@ -66,6 +66,43 @@ function amg_setup(A_csr::CSRMatrix{Tv, Ti}, config::AMGConfig=AMGConfig();
     end
     return hierarchy
 end
+
+"""
+    _coarsen_with_fallback(A, alg, config)
+
+Attempt coarsening. If the result is poor (n_coarse/n > 0.8), retry with
+progressively lower θ (halving each time, up to 3 attempts). This handles
+the common case where coarser-level matrices have sparser strong connectivity
+and the original θ is too aggressive.
+"""
+function _coarsen_with_fallback(A::CSRMatrix, alg::CoarseningAlgorithm,
+                                config::AMGConfig)
+    n = size(A, 1)
+    P, n_coarse = _coarsen_and_build_P(A, alg, config)
+    # If coarsening is adequate, return
+    (n_coarse < 0.8 * n || n <= config.max_coarse_size) && return P, n_coarse
+    # Try reducing θ
+    for attempt in 1:3
+        reduced_alg = _reduce_theta(alg, 0.5^attempt)
+        reduced_alg === nothing && return P, n_coarse  # no θ to reduce
+        P2, nc2 = _coarsen_and_build_P(A, reduced_alg, config)
+        if nc2 < n_coarse
+            P, n_coarse = P2, nc2
+        end
+        (n_coarse < 0.8 * n) && break
+    end
+    return P, n_coarse
+end
+
+"""Reduce the θ parameter of a coarsening algorithm by a factor. Returns nothing
+if the algorithm has no θ parameter."""
+_reduce_theta(a::AggregationCoarsening, f) = AggregationCoarsening(a.θ * f, a.filtering, a.filter_tol)
+_reduce_theta(a::SmoothedAggregationCoarsening, f) = SmoothedAggregationCoarsening(a.θ * f, a.ω, a.filtering, a.filter_tol)
+_reduce_theta(a::PMISCoarsening, f) = PMISCoarsening(a.θ * f, a.interpolation)
+_reduce_theta(a::HMISCoarsening, f) = HMISCoarsening(a.θ * f, a.interpolation)
+_reduce_theta(a::RSCoarsening, f) = RSCoarsening(a.θ * f, a.interpolation)
+_reduce_theta(a::AggressiveCoarsening, f) = AggressiveCoarsening(a.θ * f)
+_reduce_theta(::CoarseningAlgorithm, _) = nothing
 
 """
     _coarsen_and_build_P(A, alg, config)

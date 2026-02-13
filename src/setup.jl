@@ -121,11 +121,11 @@ _has_filtering(::CoarseningAlgorithm) = false
 
 Return a human-readable string describing the coarsening algorithm and its parameters.
 """
-_coarsening_name(a::AggregationCoarsening) = "Aggregation(θ=$(a.θ)$(a.filtering ? ", filtered" : ""))"
+_coarsening_name(a::AggregationCoarsening) = a.filtering ? "Aggregation(θ=$(a.θ), filtered)" : "Aggregation(θ=$(a.θ))"
 _coarsening_name(a::PMISCoarsening) = "PMIS(θ=$(a.θ), $(typeof(a.interpolation).name.name))"
 _coarsening_name(a::HMISCoarsening) = "HMIS(θ=$(a.θ), $(typeof(a.interpolation).name.name))"
 _coarsening_name(a::AggressiveCoarsening) = "Aggressive(θ=$(a.θ))"
-_coarsening_name(a::SmoothedAggregationCoarsening) = "SmoothedAgg(θ=$(a.θ), ω=$(round(a.ω; digits=3))$(a.filtering ? ", filtered" : ""))"
+_coarsening_name(a::SmoothedAggregationCoarsening) = a.filtering ? "SmoothedAgg(θ=$(a.θ), ω=$(round(a.ω; digits=3)), filtered)" : "SmoothedAgg(θ=$(a.θ), ω=$(round(a.ω; digits=3)))"
 
 """
     _print_hierarchy_info(hierarchy, config, n_finest, t_setup)

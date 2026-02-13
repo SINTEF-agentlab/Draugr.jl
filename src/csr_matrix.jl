@@ -45,6 +45,8 @@ Convert a Jutul `StaticSparsityMatrixCSR` to the internal `CSRMatrix`
 representation by extracting its raw CSR vectors.
 """
 function csr_from_static(A::StaticSparsityMatrixCSR{Tv, Ti}) where {Tv, Ti}
+    # collect() creates owned copies so the CSRMatrix is independent of the
+    # StaticSparsityMatrixCSR and can be safely mutated (e.g., nzval updates).
     rp = collect(rowptr(A))
     cv = collect(colvals(A))
     nzv = collect(nonzeros(A))

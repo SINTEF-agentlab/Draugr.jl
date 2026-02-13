@@ -43,6 +43,7 @@ _smooth_prolongation(A::StaticSparsityMatrixCSR, P_tent::ProlongationOp, ω::Rea
 # ── Galerkin product ─────────────────────────────────────────────────────────
 compute_coarse_sparsity(A::StaticSparsityMatrixCSR, P::ProlongationOp, n_coarse::Int) =
     compute_coarse_sparsity(_auto_convert(A), P, n_coarse)
+# Ac must be CSRMatrix (the internal coarse matrix), Af may be StaticSparsityMatrixCSR
 galerkin_product!(Ac::CSRMatrix, Af::StaticSparsityMatrixCSR, P::ProlongationOp,
                   r_map::RestrictionMap; kwargs...) =
     galerkin_product!(Ac, _auto_convert(Af), P, r_map; kwargs...)

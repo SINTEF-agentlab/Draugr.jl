@@ -7,7 +7,7 @@ Greedy aggregation coarsening. Returns `agg::Vector{Int}` where `agg[i]` is the
 aggregate index (1-based) that node `i` belongs to, and `n_coarse` the number of
 aggregates.
 """
-function coarsen_aggregation(A::StaticSparsityMatrixCSR{Tv, Ti}, θ::Real) where {Tv, Ti}
+function coarsen_aggregation(A::CSRMatrix{Tv, Ti}, θ::Real) where {Tv, Ti}
     n = size(A, 1)
     # Edge case: trivial system
     if n <= 1
@@ -62,7 +62,7 @@ Parallel Modified Independent Set (PMIS) coarsening. Returns `cf::Vector{Int}`
 where `cf[i] = 1` for coarse points and `cf[i] = 0` for fine points,
 `coarse_map::Vector{Int}` mapping coarse-point indices to 1:n_coarse, and `n_coarse`.
 """
-function coarsen_pmis(A::StaticSparsityMatrixCSR{Tv, Ti}, θ::Real;
+function coarsen_pmis(A::CSRMatrix{Tv, Ti}, θ::Real;
                       rng=Random.default_rng()) where {Tv, Ti}
     n = size(A, 1)
     # Edge case: trivial system
@@ -147,7 +147,7 @@ symmetrized strength graph (intersection of S and S^T) for the independent set
 selection, producing generally less aggressive coarsening. Returns same format
 as `coarsen_pmis`.
 """
-function coarsen_hmis(A::StaticSparsityMatrixCSR{Tv, Ti}, θ::Real;
+function coarsen_hmis(A::CSRMatrix{Tv, Ti}, θ::Real;
                       rng=Random.default_rng()) where {Tv, Ti}
     n = size(A, 1)
     # Edge case: trivial system
@@ -228,7 +228,7 @@ end
 Build a symmetrized strength indicator: is_strong_sym[nz] = true iff the
 connection (i,j) is strong AND (j,i) is also strong in the CSR structure.
 """
-function _symmetrize_strength(A::StaticSparsityMatrixCSR{Tv, Ti}, is_strong::Vector{Bool}) where {Tv, Ti}
+function _symmetrize_strength(A::CSRMatrix{Tv, Ti}, is_strong::Vector{Bool}) where {Tv, Ti}
     n = size(A, 1)
     cv = colvals(A)
     is_strong_sym = copy(is_strong)
@@ -262,7 +262,7 @@ Aggressive coarsening: applies PMIS twice. First pass produces an intermediate C
 splitting, then the coarse grid's strength-of-connection graph is used for a second
 PMIS pass, merging the results. Returns `agg, n_coarse` like aggregation.
 """
-function coarsen_aggressive(A::StaticSparsityMatrixCSR{Tv, Ti}, θ::Real;
+function coarsen_aggressive(A::CSRMatrix{Tv, Ti}, θ::Real;
                             rng=Random.default_rng()) where {Tv, Ti}
     n = size(A, 1)
     # First pass: standard PMIS
@@ -383,7 +383,7 @@ end
 
 # ── Dispatch coarsening by type ──────────────────────────────────────────────
 
-function coarsen(A::StaticSparsityMatrixCSR, alg::AggregationCoarsening,
+function coarsen(A::CSRMatrix, alg::AggregationCoarsening,
                 config::AMGConfig=AMGConfig())
     if config.max_row_sum > 0
         A_weak = _apply_max_row_sum(A, config.max_row_sum)
@@ -392,7 +392,7 @@ function coarsen(A::StaticSparsityMatrixCSR, alg::AggregationCoarsening,
     return coarsen_aggregation(A, alg.θ)
 end
 
-function coarsen(A::StaticSparsityMatrixCSR, alg::AggressiveCoarsening,
+function coarsen(A::CSRMatrix, alg::AggressiveCoarsening,
                 config::AMGConfig=AMGConfig())
     if config.max_row_sum > 0
         A_weak = _apply_max_row_sum(A, config.max_row_sum)
@@ -418,7 +418,7 @@ uses_cf_splitting(::HMISCoarsening) = true
 Perform CF-splitting coarsening. Returns `(cf, coarse_map, n_coarse)`.
 When max_row_sum is configured, strength is computed on a weakened matrix.
 """
-function coarsen_cf(A::StaticSparsityMatrixCSR, alg::PMISCoarsening,
+function coarsen_cf(A::CSRMatrix, alg::PMISCoarsening,
                     config::AMGConfig=AMGConfig())
     if config.max_row_sum > 0
         A_weak = _apply_max_row_sum(A, config.max_row_sum)
@@ -427,7 +427,7 @@ function coarsen_cf(A::StaticSparsityMatrixCSR, alg::PMISCoarsening,
     return coarsen_pmis(A, alg.θ)
 end
 
-function coarsen_cf(A::StaticSparsityMatrixCSR, alg::HMISCoarsening,
+function coarsen_cf(A::CSRMatrix, alg::HMISCoarsening,
                     config::AMGConfig=AMGConfig())
     if config.max_row_sum > 0
         A_weak = _apply_max_row_sum(A, config.max_row_sum)
@@ -439,7 +439,7 @@ end
 """
 Convert a CF splitting to an aggregation vector (legacy fallback).
 """
-function _cf_to_aggregation(A::StaticSparsityMatrixCSR{Tv, Ti}, cf, coarse_map, n_coarse) where {Tv, Ti}
+function _cf_to_aggregation(A::CSRMatrix{Tv, Ti}, cf, coarse_map, n_coarse) where {Tv, Ti}
     n = size(A, 1)
     agg = zeros(Int, n)
     cv = colvals(A)

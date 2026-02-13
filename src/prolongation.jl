@@ -5,7 +5,7 @@ Build a piecewise-constant prolongation operator from the aggregation map.
 Each fine node i is interpolated from aggregate `agg[i]` with weight 1.
 Returns a `ProlongationOp`.
 """
-function build_prolongation(A::StaticSparsityMatrixCSR{Tv, Ti}, agg::Vector{Int},
+function build_prolongation(A::CSRMatrix{Tv, Ti}, agg::Vector{Int},
                             n_coarse::Int) where {Tv, Ti}
     n_fine = size(A, 1)
     # P is n_fine × n_coarse, with exactly one nonzero per row (aggregation-based)
@@ -34,7 +34,7 @@ Jacobi step: P = (I - ω D⁻¹ A) P_tent.
 The result has the sparsity pattern of A * P_tent (union of P_tent sparsity and
 one ring of neighbors through A).
 """
-function _smooth_prolongation(A::StaticSparsityMatrixCSR{Tv, Ti},
+function _smooth_prolongation(A::CSRMatrix{Tv, Ti},
                               P_tent::ProlongationOp{Ti, Tv},
                               ω::Real) where {Tv, Ti}
     n_fine = P_tent.nrow
@@ -167,7 +167,7 @@ Build a prolongation operator from a CF-splitting using the specified interpolat
 - `cf[i] == 1` → coarse point, `cf[i] == -1` → fine point
 - `coarse_map[i]` → coarse-grid index for coarse points
 """
-function build_cf_prolongation(A::StaticSparsityMatrixCSR{Tv, Ti}, cf::Vector{Int},
+function build_cf_prolongation(A::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                                coarse_map::Vector{Int}, n_coarse::Int,
                                interp::InterpolationType) where {Tv, Ti}
     return _build_interpolation(A, cf, coarse_map, n_coarse, interp)
@@ -189,7 +189,7 @@ P[i, coarse_map[i]] = 1 for coarse points.
 P[i, coarse_map[j]] = -a_{i,j} / d_i for fine points, where j ∈ C_i^s and
 d_i = a_{i,i} + Σ_{k ∈ weak ∪ F_i^s ∪ same_sign} a_{i,k}.
 """
-function _build_interpolation(A::StaticSparsityMatrixCSR{Tv, Ti}, cf::Vector{Int},
+function _build_interpolation(A::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                               coarse_map::Vector{Int}, n_coarse::Int,
                               ::DirectInterpolation) where {Tv, Ti}
     n_fine = size(A, 1)
@@ -315,7 +315,7 @@ Standard (classical Ruge-Stüben) interpolation. For each fine point i:
 w_j = -(a_{i,j} + Σ_{k∈F_i^s} a_{i,k} * a_{k,j} / Σ_{m∈C_i} a_{k,m}) / d_i
 where d_i = a_{i,i} + Σ_{k∈weak} a_{i,k}
 """
-function _build_interpolation(A::StaticSparsityMatrixCSR{Tv, Ti}, cf::Vector{Int},
+function _build_interpolation(A::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                               coarse_map::Vector{Int}, n_coarse::Int,
                               ::StandardInterpolation) where {Tv, Ti}
     n_fine = size(A, 1)
@@ -410,7 +410,7 @@ Extended+i interpolation. Extends standard interpolation by including distance-2
 coarse points (coarse points connected through fine neighbors) as direct
 interpolation targets, resulting in a larger but more accurate interpolation stencil.
 """
-function _build_interpolation(A::StaticSparsityMatrixCSR{Tv, Ti}, cf::Vector{Int},
+function _build_interpolation(A::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                               coarse_map::Vector{Int}, n_coarse::Int,
                               ::ExtendedIInterpolation) where {Tv, Ti}
     n_fine = size(A, 1)
@@ -517,7 +517,7 @@ end
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 """Find nearest coarse point for fallback interpolation."""
-function _find_nearest_coarse(A::StaticSparsityMatrixCSR{Tv, Ti}, i::Int,
+function _find_nearest_coarse(A::CSRMatrix{Tv, Ti}, i::Int,
                               cf::Vector{Int}, coarse_map::Vector{Int}) where {Tv, Ti}
     cv = colvals(A)
     nzv = nonzeros(A)
@@ -565,7 +565,7 @@ Apply prolongation: x_fine += P * x_coarse.
 Uses KernelAbstractions for parallel execution over fine rows.
 """
 function prolongate!(x_fine::AbstractVector, P::ProlongationOp, x_coarse::AbstractVector;
-                     backend=CPU())
+                     backend=DEFAULT_BACKEND)
     kernel! = prolongate_kernel!(backend, 64)
     kernel!(x_fine, P.rowptr, P.colval, P.nzval, x_coarse; ndrange=P.nrow)
     KernelAbstractions.synchronize(backend)
@@ -591,7 +591,7 @@ For aggregation-based P (one nonzero per row), this is race-free when
 parallelized over fine rows using atomics.
 """
 function restrict!(b_coarse::AbstractVector, P::ProlongationOp, r_fine::AbstractVector;
-                   backend=CPU())
+                   backend=DEFAULT_BACKEND)
     fill!(b_coarse, zero(eltype(b_coarse)))
     kernel! = restrict_kernel!(backend, 64)
     kernel!(b_coarse, P.rowptr, P.colval, P.nzval, r_fine; ndrange=P.nrow)

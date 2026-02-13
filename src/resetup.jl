@@ -11,16 +11,17 @@ sparsity pattern and prolongation structure. This updates:
 function amg_resetup!(hierarchy::AMGHierarchy{Tv, Ti},
                       A_new::StaticSparsityMatrixCSR{Tv, Ti},
                       config::AMGConfig=AMGConfig();
-                      backend=CPU()) where {Tv, Ti}
+                      backend=DEFAULT_BACKEND) where {Tv, Ti}
     nlevels = length(hierarchy.levels)
     if nlevels == 0
         # Only one level (coarsest), update direct solver
-        _update_coarse_solver!(hierarchy, A_new; backend=backend)
+        A_csr = csr_from_static(A_new)
+        _update_coarse_solver!(hierarchy, A_csr; backend=backend)
         return hierarchy
     end
-    # Update first level's matrix (copy values from A_new into existing structure)
+    # Update first level's matrix (copy values from A_new into existing CSRMatrix)
     level1 = hierarchy.levels[1]
-    _copy_nzvals!(level1.A, A_new; backend=backend)
+    csr_copy_nzvals!(level1.A, A_new; backend=backend)
     update_smoother!(level1.smoother, level1.A; backend=backend)
     # Update subsequent levels via Galerkin products
     for lvl in 1:(nlevels - 1)
@@ -33,8 +34,6 @@ function amg_resetup!(hierarchy::AMGHierarchy{Tv, Ti},
     end
     # Recompute Galerkin product for the last level to get the coarsest matrix
     last_level = hierarchy.levels[nlevels]
-    # The coarsest matrix (for direct solve) is one level below the last AMG level
-    # We need to recompute it using the last level's P and R_map
     _recompute_coarsest_dense!(hierarchy, last_level; backend=backend)
     # In-place LU refactorization: copy dense values to LU buffer, then factorize
     copyto!(hierarchy.coarse_lu, hierarchy.coarse_A)
@@ -44,13 +43,13 @@ function amg_resetup!(hierarchy::AMGHierarchy{Tv, Ti},
 end
 
 """
-    _copy_nzvals!(dest, src; backend=CPU())
+    _copy_nzvals!(dest, src; backend=DEFAULT_BACKEND)
 
-Copy nonzero values from `src` into `dest` (same sparsity pattern),
+Copy nonzero values from `src` CSRMatrix into `dest` (same sparsity pattern),
 using a KA kernel for parallelism.
 """
-function _copy_nzvals!(dest::StaticSparsityMatrixCSR, src::StaticSparsityMatrixCSR;
-                       backend=CPU())
+function _copy_nzvals!(dest::CSRMatrix, src::CSRMatrix;
+                       backend=DEFAULT_BACKEND)
     nzv_d = nonzeros(dest)
     nzv_s = nonzeros(src)
     n = length(nzv_d)
@@ -60,13 +59,8 @@ function _copy_nzvals!(dest::StaticSparsityMatrixCSR, src::StaticSparsityMatrixC
     return dest
 end
 
-@kernel function copy_kernel!(dst, @Const(src))
-    i = @index(Global)
-    @inbounds dst[i] = src[i]
-end
-
 """
-    _recompute_coarsest_dense!(hierarchy, last_level; backend=CPU())
+    _recompute_coarsest_dense!(hierarchy, last_level; backend=DEFAULT_BACKEND)
 
 Recompute the coarsest dense matrix from the last AMG level in-place,
 writing directly into `hierarchy.coarse_A`. Avoids allocating a temporary
@@ -74,7 +68,7 @@ coarse CSR matrix. Modifies `hierarchy.coarse_A` as a side effect.
 """
 function _recompute_coarsest_dense!(hierarchy::AMGHierarchy{Tv, Ti},
                                     level::AMGLevel{Tv, Ti};
-                                    backend=CPU()) where {Tv, Ti}
+                                    backend=DEFAULT_BACKEND) where {Tv, Ti}
     M = hierarchy.coarse_A
     fill!(M, zero(Tv))
     n_fine = size(level.A, 1)
@@ -102,12 +96,12 @@ function _recompute_coarsest_dense!(hierarchy::AMGHierarchy{Tv, Ti},
 end
 
 """
-    _update_coarse_solver!(hierarchy, A; backend=CPU())
+    _update_coarse_solver!(hierarchy, A; backend=DEFAULT_BACKEND)
 
 Update the direct solver at the coarsest level using in-place LU refactorization.
 """
-function _update_coarse_solver!(hierarchy::AMGHierarchy{Tv}, A::StaticSparsityMatrixCSR{Tv};
-                                backend=CPU()) where {Tv}
+function _update_coarse_solver!(hierarchy::AMGHierarchy{Tv}, A::CSRMatrix{Tv};
+                                backend=DEFAULT_BACKEND) where {Tv}
     _csr_to_dense!(hierarchy.coarse_A, A; backend=backend)
     copyto!(hierarchy.coarse_lu, hierarchy.coarse_A)
     LinearAlgebra.LAPACK.getrf!(hierarchy.coarse_lu, hierarchy.coarse_ipiv)

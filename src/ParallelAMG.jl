@@ -8,11 +8,18 @@ using Atomix
 using Printf
 
 # Import StaticCSR types from Jutul
-using Jutul.StaticCSR: StaticSparsityMatrixCSR, colvals, static_sparsity_sparse,
+using Jutul.StaticCSR: StaticSparsityMatrixCSR, static_sparsity_sparse,
                        nthreads, minbatch
+import Jutul.StaticCSR: colvals
+
+# Default backend for KernelAbstractions
+const DEFAULT_BACKEND = CPU(; static = true)
 
 # Local helpers for StaticCSR (not provided by Jutul)
 include("static_csr_helpers.jl")
+
+# Internal CSR matrix type (decoupled from Jutul)
+include("csr_matrix.jl")
 
 # Type definitions
 include("types.jl")
@@ -44,9 +51,13 @@ include("cycle.jl")
 # Jutul preconditioner interface
 include("jutul_interface.jl")
 
+# Auto-conversion wrappers (StaticSparsityMatrixCSR → CSRMatrix)
+include("auto_convert.jl")
+
 # Public API
 export StaticSparsityMatrixCSR, static_sparsity_sparse, static_csr_from_csc
 export colvals, rowptr
+export CSRMatrix
 export AggregationCoarsening, PMISCoarsening, HMISCoarsening, AggressiveCoarsening, SmoothedAggregationCoarsening
 export DirectInterpolation, StandardInterpolation, ExtendedIInterpolation
 export AbsoluteStrength, SignedStrength

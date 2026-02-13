@@ -1,5 +1,16 @@
 """
-    amg_setup(A, config) -> AMGHierarchy
+    amg_setup(A::StaticSparsityMatrixCSR, config; backend) -> AMGHierarchy
+
+External API entry point: convert `StaticSparsityMatrixCSR` to `CSRMatrix` once
+and forward to the general CSRMatrix-based setup.
+"""
+function amg_setup(A::StaticSparsityMatrixCSR{Tv, Ti}, config::AMGConfig=AMGConfig();
+                   backend=DEFAULT_BACKEND) where {Tv, Ti}
+    return amg_setup(csr_from_static(A), config; backend=backend)
+end
+
+"""
+    amg_setup(A::CSRMatrix, config) -> AMGHierarchy
 
 Perform the full AMG setup (analysis phase). This determines the coarsening at each
 level, constructs prolongation operators, computes Galerkin products, and sets up
@@ -7,18 +18,13 @@ smoothers.
 
 The sparsity structure computed here is reused by `amg_resetup!` when matrix
 coefficients change but the pattern remains the same.
-
-The external API accepts `StaticSparsityMatrixCSR`; internally the hierarchy stores
-lightweight `CSRMatrix` objects (raw CSR vectors).
 """
-function amg_setup(A::StaticSparsityMatrixCSR{Tv, Ti}, config::AMGConfig=AMGConfig();
+function amg_setup(A_csr::CSRMatrix{Tv, Ti}, config::AMGConfig=AMGConfig();
                    backend=DEFAULT_BACKEND) where {Tv, Ti}
     t_setup = time()
     levels = AMGLevel{Tv, Ti}[]
-    A_csr = csr_from_static(A)
     A_current = A_csr
-    n_finest = size(A, 1)
-    consecutive_stalls = 0
+    n_finest = size(A_csr, 1)
     for lvl in 1:(config.max_levels - 1)
         n = size(A_current, 1)
         n <= config.max_coarse_size && break
@@ -27,19 +33,7 @@ function amg_setup(A::StaticSparsityMatrixCSR{Tv, Ti}, config::AMGConfig=AMGConf
         # Coarsen and build prolongation
         P, n_coarse = _coarsen_and_build_P(A_current, coarsening_alg, config)
         n_coarse >= n && break  # no coarsening progress
-        # Check minimum coarsening ratio to avoid stalling
-        coarse_ratio = n_coarse / n
-        if coarse_ratio > config.min_coarse_ratio && n_coarse > config.max_coarse_size
-            consecutive_stalls += 1
-            if consecutive_stalls >= config.max_stall_levels
-                config.verbose && println("Coarsening stalled at level $lvl: ratio=$(round(coarse_ratio, digits=3)), $consecutive_stalls consecutive stalls, stopping.")
-                break
-            else
-                config.verbose && println("Warning: poor coarsening at level $lvl (ratio=$(round(coarse_ratio, digits=3))), stall $(consecutive_stalls)/$(config.max_stall_levels).")
-            end
-        else
-            consecutive_stalls = 0
-        end
+        n_coarse == 0 && break  # degenerate case
         # Compute coarse operator via Galerkin product
         A_coarse, r_map = compute_coarse_sparsity(A_current, P, n_coarse)
         # Build smoother
@@ -125,6 +119,7 @@ _coarsening_name(a::AggregationCoarsening) = a.filtering ? "Aggregation(θ=$(a.�
 _coarsening_name(a::PMISCoarsening) = "PMIS(θ=$(a.θ), $(typeof(a.interpolation).name.name))"
 _coarsening_name(a::HMISCoarsening) = "HMIS(θ=$(a.θ), $(typeof(a.interpolation).name.name))"
 _coarsening_name(a::AggressiveCoarsening) = "Aggressive(θ=$(a.θ))"
+_coarsening_name(a::RSCoarsening) = "RS(θ=$(a.θ), $(typeof(a.interpolation).name.name))"
 _coarsening_name(a::SmoothedAggregationCoarsening) = a.filtering ? "SmoothedAgg(θ=$(a.θ), ω=$(round(a.ω; digits=3)), filtered)" : "SmoothedAgg(θ=$(a.θ), ω=$(round(a.ω; digits=3)))"
 
 """
@@ -212,8 +207,8 @@ _smoother_name(::ILU0Smoother) = "ILU(0)"
 
 Convert a CSRMatrix to a dense matrix using a KA kernel.
 """
-function _csr_to_dense!(M::Matrix{Tv}, A::CSRMatrix{Tv, Ti};
-                        backend=DEFAULT_BACKEND) where {Tv, Ti}
+function _csr_to_dense!(M::Matrix{Tv}, A::CSRMatrix{Tv};
+                        backend=DEFAULT_BACKEND) where {Tv}
     fill!(M, zero(Tv))
     n = size(A, 1)
     cv = colvals(A)

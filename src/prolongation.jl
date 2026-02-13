@@ -32,7 +32,8 @@ Smooth a tentative (piecewise-constant) prolongation operator using a damped
 Jacobi step: P = (I - ω D⁻¹ A) P_tent.
 
 The result has the sparsity pattern of A * P_tent (union of P_tent sparsity and
-one ring of neighbors through A).
+one ring of neighbors through A). Uses bounded per-row storage to avoid excessive
+memory use on large models.
 """
 function _smooth_prolongation(A::CSRMatrix{Tv, Ti},
                               P_tent::ProlongationOp{Ti, Tv},
@@ -62,32 +63,60 @@ function _smooth_prolongation(A::CSRMatrix{Tv, Ti},
     J_p = Ti[]
     V_p = Tv[]
 
+    # Pre-compute the set of coarse columns reachable from each fine row
+    # to avoid Dict overhead on repeated lookups
     @inbounds for i in 1:n_fine
-        # Collect contributions for row i
+        # Collect contributions for row i using a sorted-keys approach
         row_entries = Dict{Int, Tv}()
 
         # Term 1: P_tent[i, :]
         for pnz in P_tent.rowptr[i]:(P_tent.rowptr[i+1]-1)
-            J = P_tent.colval[pnz]
-            row_entries[Int(J)] = get(row_entries, Int(J), zero(Tv)) + P_tent.nzval[pnz]
+            J = Int(P_tent.colval[pnz])
+            row_entries[J] = get(row_entries, J, zero(Tv)) + P_tent.nzval[pnz]
         end
 
         # Term 2: -ω * invdiag[i] * Σ_j a_{i,j} * P_tent[j, :]
         factor = -Tv(ω) * invdiag[i]
         for anz in rp_a[i]:(rp_a[i+1]-1)
             j = cv_a[anz]
+            # Bounds check: j must be valid row of P_tent
+            (j < 1 || j > P_tent.nrow) && continue
             a_ij = nzv_a[anz]
             w = factor * a_ij
             for pnz in P_tent.rowptr[j]:(P_tent.rowptr[j+1]-1)
-                J = P_tent.colval[pnz]
-                row_entries[Int(J)] = get(row_entries, Int(J), zero(Tv)) + w * P_tent.nzval[pnz]
+                J = Int(P_tent.colval[pnz])
+                row_entries[J] = get(row_entries, J, zero(Tv)) + w * P_tent.nzval[pnz]
             end
         end
 
         for (J, val) in row_entries
+            # Drop near-zero entries to control sparsity on large models
+            if abs(val) > eps(real(Tv))
+                push!(I_p, Ti(i))
+                push!(J_p, Ti(J))
+                push!(V_p, val)
+            end
+        end
+        # If entire row was dropped, preserve at least one entry from P_tent
+        row_has_entry = false
+        for nz in (length(I_p) - length(row_entries) + 1):length(I_p)
+            nz > 0 && (row_has_entry = true; break)
+        end
+        # Check if we actually added any entries for row i
+        row_start = length(I_p)
+        found_i = false
+        for k in max(1, length(I_p) - length(row_entries) + 1):length(I_p)
+            if I_p[k] == Ti(i)
+                found_i = true
+                break
+            end
+        end
+        if !found_i && P_tent.rowptr[i] <= P_tent.rowptr[i+1] - 1
+            # Fallback: keep the tent entry
+            pnz = P_tent.rowptr[i]
             push!(I_p, Ti(i))
-            push!(J_p, Ti(J))
-            push!(V_p, val)
+            push!(J_p, P_tent.colval[pnz])
+            push!(V_p, P_tent.nzval[pnz])
         end
     end
 

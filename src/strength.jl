@@ -188,7 +188,7 @@ function _apply_max_row_sum(A::CSRMatrix{Tv, Ti}, threshold::Real) where {Tv, Ti
             end
         end
     end
-    return CSRMatrix{Tv, Ti}(collect(rp), collect(cv), nzv_new, size(A, 1), size(A, 2))
+    return CSRMatrix(collect(rp), collect(cv), nzv_new, size(A, 1), size(A, 2))
 end
 
 # ── Safe diagonal helpers ────────────────────────────────────────────────────

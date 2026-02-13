@@ -3,19 +3,29 @@
 # ══════════════════════════════════════════════════════════════════════════════
 
 """
-    CSRMatrix{Tv, Ti}
+    CSRMatrix{Tv, Ti, Vr, Vc, Vv}
 
 Lightweight CSR matrix holding raw row-pointer, column-index, and value vectors.
 This is the internal representation used throughout the AMG hierarchy, decoupled
 from Jutul's `StaticSparsityMatrixCSR`.  External API entry points accept
-`StaticSparsityMatrixCSR` and convert to `CSRMatrix` at the boundary.
+`StaticSparsityMatrixCSR` and convert to `CSRMatrix` once at the boundary.
+
+The vector types are parameterized as `AbstractVector` subtypes so the format
+works with GPU arrays or other custom vector implementations.
 """
-struct CSRMatrix{Tv, Ti<:Integer}
-    rowptr::Vector{Ti}
-    colval::Vector{Ti}
-    nzval::Vector{Tv}
+struct CSRMatrix{Tv, Ti<:Integer, Vr<:AbstractVector{Ti}, Vc<:AbstractVector{Ti}, Vv<:AbstractVector{Tv}}
+    rowptr::Vr
+    colval::Vc
+    nzval::Vv
     nrow::Int
     ncol::Int
+end
+
+# Convenience constructor that infers vector types
+function CSRMatrix(rowptr::AbstractVector{Ti}, colval::AbstractVector{Ti},
+                   nzval::AbstractVector{Tv}, nrow::Int, ncol::Int) where {Tv, Ti<:Integer}
+    return CSRMatrix{Tv, Ti, typeof(rowptr), typeof(colval), typeof(nzval)}(
+        rowptr, colval, nzval, nrow, ncol)
 end
 
 Base.size(A::CSRMatrix) = (A.nrow, A.ncol)
@@ -42,15 +52,14 @@ rowptr(A::CSRMatrix) = A.rowptr
     csr_from_static(A::StaticSparsityMatrixCSR) -> CSRMatrix
 
 Convert a Jutul `StaticSparsityMatrixCSR` to the internal `CSRMatrix`
-representation by extracting its raw CSR vectors.
+representation by extracting its raw CSR vectors. This is the single
+conversion point; all internal functions work only with `CSRMatrix`.
 """
 function csr_from_static(A::StaticSparsityMatrixCSR{Tv, Ti}) where {Tv, Ti}
-    # collect() creates owned copies so the CSRMatrix is independent of the
-    # StaticSparsityMatrixCSR and can be safely mutated (e.g., nzval updates).
     rp = collect(rowptr(A))
     cv = collect(colvals(A))
     nzv = collect(nonzeros(A))
-    return CSRMatrix{Tv, Ti}(rp, cv, nzv, size(A, 1), size(A, 2))
+    return CSRMatrix(rp, cv, nzv, size(A, 1), size(A, 2))
 end
 
 """
@@ -90,10 +99,3 @@ function LinearAlgebra.mul!(y::AbstractVector, A::CSRMatrix, x::AbstractVector)
     end
     return y
 end
-
-# ── Auto-conversion wrappers ─────────────────────────────────────────────────
-# These allow internal functions to be called with StaticSparsityMatrixCSR
-# arguments for convenience (e.g., in tests). They convert and forward.
-
-_auto_convert(A::CSRMatrix) = A
-_auto_convert(A::StaticSparsityMatrixCSR) = csr_from_static(A)

@@ -48,6 +48,20 @@ end
 HMISCoarsening() = HMISCoarsening(0.25, DirectInterpolation())
 HMISCoarsening(θ::Real) = HMISCoarsening(θ, DirectInterpolation())
 
+"""Classical Ruge-Stüben (RS) coarsening with first/second pass to guarantee
+good coarsening ratios and the strong-connection property.
+
+Fields:
+- `θ`: Strength threshold (default: 0.25)
+- `interpolation`: Interpolation type (default: DirectInterpolation())
+"""
+struct RSCoarsening <: CoarseningAlgorithm
+    θ::Float64
+    interpolation::InterpolationType
+end
+RSCoarsening() = RSCoarsening(0.25, DirectInterpolation())
+RSCoarsening(θ::Real) = RSCoarsening(θ, DirectInterpolation())
+
 """Aggressive coarsening (two passes of PMIS-based coarsening)."""
 struct AggressiveCoarsening <: CoarseningAlgorithm
     θ::Float64
@@ -279,11 +293,6 @@ Fields:
 - `verbose`: Print hierarchy information and solve diagnostics
 - `initial_coarsening`: Optional alternative coarsening for the first N levels (defaults to `coarsening`)
 - `initial_coarsening_levels`: Number of levels to use `initial_coarsening` for (default: 0)
-- `min_coarse_ratio`: Minimum ratio n_coarse/n_fine to accept a coarsening level (default: 0.5).
-  If coarsening produces a ratio above this (i.e. too little reduction), coarsening stops.
-- `max_stall_levels`: Maximum number of consecutive levels with coarsening ratio > `min_coarse_ratio`
-  before terminating (default: 2). Prevents premature termination after a single poor level,
-  such as one following aggressive coarsening.
 - `max_row_sum`: Maximum row sum threshold for dependency weakening (default: 0, disabled).
   When > 0, rows where |row_sum|/|a_ii| > max_row_sum have their off-diagonal entries scaled
   down to enforce the threshold, improving AMG robustness for indefinite or nearly singular systems.
@@ -302,8 +311,6 @@ struct AMGConfig
     verbose::Bool
     initial_coarsening::CoarseningAlgorithm
     initial_coarsening_levels::Int
-    min_coarse_ratio::Float64
-    max_stall_levels::Int
     max_row_sum::Float64
     cycle_type::Symbol
     strength_type::StrengthType
@@ -320,17 +327,18 @@ function AMGConfig(;
     verbose::Bool = false,
     initial_coarsening::CoarseningAlgorithm = coarsening,
     initial_coarsening_levels::Int = 0,
-    min_coarse_ratio::Float64 = 0.5,
-    max_stall_levels::Int = 2,
     max_row_sum::Float64 = 0.0,
     cycle_type::Symbol = :V,
     strength_type::StrengthType = AbsoluteStrength(),
+    # Deprecated: accepted but ignored for backward compatibility
+    min_coarse_ratio::Float64 = 0.5,
+    max_stall_levels::Int = 2,
 )
     @assert cycle_type in (:V, :W) "cycle_type must be :V or :W"
     return AMGConfig(coarsening, smoother, max_levels, max_coarse_size,
                      pre_smoothing_steps, post_smoothing_steps, jacobi_omega, verbose,
                      initial_coarsening, initial_coarsening_levels,
-                     min_coarse_ratio, max_stall_levels, max_row_sum, cycle_type, strength_type)
+                     max_row_sum, cycle_type, strength_type)
 end
 
 """

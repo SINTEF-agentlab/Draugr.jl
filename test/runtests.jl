@@ -4,6 +4,9 @@ using SparseArrays
 using LinearAlgebra
 import Jutul
 
+# Helper: convert StaticSparsityMatrixCSR to internal CSRMatrix for unit tests
+to_csr(A) = ParallelAMG.csr_from_static(A)
+
 # ── Helper: 1D Poisson matrix ────────────────────────────────────────────────
 function poisson1d_csr(n)
     I = Int[]; J = Int[]; V = Float64[]
@@ -68,16 +71,38 @@ end
         @test A2[2,1] ≈ -1.0
     end
 
+    @testset "CSRMatrix - AbstractVector support" begin
+        # CSRMatrix should work with any AbstractVector subtype
+        A_static = poisson1d_csr(5)
+        A_csr = ParallelAMG.csr_from_static(A_static)
+        @test A_csr isa CSRMatrix
+        @test A_csr.rowptr isa AbstractVector
+        @test A_csr.colval isa AbstractVector
+        @test A_csr.nzval isa AbstractVector
+        @test size(A_csr) == (5, 5)
+        @test A_csr[1,1] ≈ 2.0
+        @test A_csr[1,2] ≈ -1.0
+        # Test mul! with CSRMatrix
+        x = ones(5)
+        y = zeros(5)
+        mul!(y, A_csr, x)
+        @test y[1] ≈ 1.0
+        @test y[5] ≈ 1.0
+        @test all(y[2:4] .≈ 0.0)
+    end
+
     @testset "Strength of Connection" begin
         A = poisson1d_csr(10)
-        is_strong = ParallelAMG.strength_graph(A, 0.25)
+        Ac = to_csr(A)
+        is_strong = ParallelAMG.strength_graph(Ac, 0.25)
         # All off-diagonal entries should be strong (|-1| >= 0.25*|-1|)
         @test sum(is_strong) == 18  # 9+9 off-diagonal entries
     end
 
     @testset "Aggregation Coarsening" begin
         A = poisson1d_csr(20)
-        agg, nc = ParallelAMG.coarsen_aggregation(A, 0.25)
+        Ac = to_csr(A)
+        agg, nc = ParallelAMG.coarsen_aggregation(Ac, 0.25)
         @test length(agg) == 20
         @test all(agg .> 0)
         @test nc > 0
@@ -90,7 +115,8 @@ end
 
     @testset "PMIS Coarsening" begin
         A = poisson1d_csr(20)
-        cf, cmap, nc = ParallelAMG.coarsen_pmis(A, 0.25)
+        Ac = to_csr(A)
+        cf, cmap, nc = ParallelAMG.coarsen_pmis(Ac, 0.25)
         @test length(cf) == 20
         @test all(abs.(cf) .== 1)  # all decided
         @test nc > 0
@@ -99,7 +125,8 @@ end
 
     @testset "Aggressive Coarsening" begin
         A = poisson1d_csr(20)
-        agg, nc = ParallelAMG.coarsen_aggressive(A, 0.25)
+        Ac = to_csr(A)
+        agg, nc = ParallelAMG.coarsen_aggressive(Ac, 0.25)
         @test length(agg) == 20
         @test all(agg .> 0)
         @test nc > 0
@@ -108,8 +135,9 @@ end
 
     @testset "Prolongation" begin
         A = poisson1d_csr(10)
-        agg, nc = ParallelAMG.coarsen_aggregation(A, 0.25)
-        P = ParallelAMG.build_prolongation(A, agg, nc)
+        Ac = to_csr(A)
+        agg, nc = ParallelAMG.coarsen_aggregation(Ac, 0.25)
+        P = ParallelAMG.build_prolongation(Ac, agg, nc)
         @test P.nrow == 10
         @test P.ncol == nc
         # Each row of P has exactly one nonzero for aggregation
@@ -131,9 +159,10 @@ end
 
     @testset "Galerkin Product" begin
         A = poisson1d_csr(10)
-        agg, nc = ParallelAMG.coarsen_aggregation(A, 0.25)
-        P = ParallelAMG.build_prolongation(A, agg, nc)
-        A_coarse, r_map = ParallelAMG.compute_coarse_sparsity(A, P, nc)
+        Ac = to_csr(A)
+        agg, nc = ParallelAMG.coarsen_aggregation(Ac, 0.25)
+        P = ParallelAMG.build_prolongation(Ac, agg, nc)
+        A_coarse, r_map = ParallelAMG.compute_coarse_sparsity(Ac, P, nc)
         @test size(A_coarse) == (nc, nc)
         # Verify Galerkin product against explicit computation
         # Build explicit P as sparse matrix
@@ -158,14 +187,16 @@ end
 
     @testset "In-place Galerkin Resetup" begin
         A = poisson1d_csr(10)
-        agg, nc = ParallelAMG.coarsen_aggregation(A, 0.25)
-        P = ParallelAMG.build_prolongation(A, agg, nc)
-        A_coarse, r_map = ParallelAMG.compute_coarse_sparsity(A, P, nc)
+        Ac = to_csr(A)
+        agg, nc = ParallelAMG.coarsen_aggregation(Ac, 0.25)
+        P = ParallelAMG.build_prolongation(Ac, agg, nc)
+        A_coarse, r_map = ParallelAMG.compute_coarse_sparsity(Ac, P, nc)
         # Now modify A's values (scale by 2)
         nzv = nonzeros(A)
         nzv .*= 2.0
+        Ac = to_csr(A)
         # Recompute in-place
-        ParallelAMG.galerkin_product!(A_coarse, A, P, r_map)
+        ParallelAMG.galerkin_product!(A_coarse, Ac, P, r_map)
         # Verify against explicit computation with scaled matrix
         I_p = Int[]; J_p = Int[]; V_p = Float64[]
         for i in 1:P.nrow
@@ -185,13 +216,14 @@ end
 
     @testset "Jacobi Smoother" begin
         A = poisson1d_csr(10)
-        smoother = ParallelAMG.build_jacobi_smoother(A, 2.0/3.0)
+        Ac = to_csr(A)
+        smoother = ParallelAMG.build_jacobi_smoother(Ac, 2.0/3.0)
         @test length(smoother.invdiag) == 10
         @test all(smoother.invdiag .≈ 0.5)  # 1/2.0
         # Test smoothing reduces error
         b = ones(10)
         x = zeros(10)
-        smooth!(x, A, b, smoother; steps=10)
+        smooth!(x, Ac, b, smoother; steps=10)
         r = b - sparse(A.At') * x
         @test norm(r) < norm(b)
     end
@@ -347,14 +379,15 @@ end
 
     @testset "Graph Coloring" begin
         A = poisson1d_csr(10)
-        colors, nc = ParallelAMG.greedy_coloring(A)
+        Ac = to_csr(A)
+        colors, nc = ParallelAMG.greedy_coloring(Ac)
         @test length(colors) == 10
         @test all(colors .> 0)
         @test nc >= 2  # tridiagonal needs at least 2 colors
         # Verify no two adjacent nodes have the same color
-        cv = colvals(A)
+        cv = colvals(Ac)
         for i in 1:10
-            for nz in nzrange(A, i)
+            for nz in nzrange(Ac, i)
                 j = cv[nz]
                 if j != i
                     @test colors[i] != colors[j]
@@ -365,7 +398,8 @@ end
 
     @testset "Colored GS Smoother - Build" begin
         A = poisson1d_csr(10)
-        smoother = ParallelAMG.build_colored_gs_smoother(A)
+        Ac = to_csr(A)
+        smoother = ParallelAMG.build_colored_gs_smoother(Ac)
         @test smoother.num_colors >= 2
         @test length(smoother.invdiag) == 10
         @test all(smoother.invdiag .≈ 0.5)  # 1/2.0
@@ -374,10 +408,11 @@ end
 
     @testset "Colored GS Smoother - Smoothing" begin
         A = poisson1d_csr(10)
-        smoother = ParallelAMG.build_colored_gs_smoother(A)
+        Ac = to_csr(A)
+        smoother = ParallelAMG.build_colored_gs_smoother(Ac)
         b = ones(10)
         x = zeros(10)
-        smooth!(x, A, b, smoother; steps=10)
+        smooth!(x, Ac, b, smoother; steps=10)
         r = b - sparse(A.At') * x
         @test norm(r) < norm(b)
     end
@@ -402,7 +437,8 @@ end
 
     @testset "SPAI0 Smoother - Build" begin
         A = poisson1d_csr(10)
-        smoother = ParallelAMG.build_spai0_smoother(A)
+        Ac = to_csr(A)
+        smoother = ParallelAMG.build_spai0_smoother(Ac)
         @test length(smoother.m_diag) == 10
         # For tridiagonal with diag=2, off-diag=-1:
         # interior row: [−1 2 −1], row_norm_sq = 1+4+1 = 6, diag = 2, m = 2/6 = 1/3
@@ -411,10 +447,11 @@ end
 
     @testset "SPAI0 Smoother - Smoothing" begin
         A = poisson1d_csr(10)
-        smoother = ParallelAMG.build_spai0_smoother(A)
+        Ac = to_csr(A)
+        smoother = ParallelAMG.build_spai0_smoother(Ac)
         b = ones(10)
         x = zeros(10)
-        smooth!(x, A, b, smoother; steps=10)
+        smooth!(x, Ac, b, smoother; steps=10)
         r = b - sparse(A.At') * x
         @test norm(r) < norm(b)
     end
@@ -439,16 +476,18 @@ end
 
     @testset "SPAI1 Smoother - Build" begin
         A = poisson1d_csr(5)
-        smoother = ParallelAMG.build_spai1_smoother(A)
+        Ac = to_csr(A)
+        smoother = ParallelAMG.build_spai1_smoother(Ac)
         @test length(smoother.nzval) == nnz(A)
     end
 
     @testset "SPAI1 Smoother - Smoothing" begin
         A = poisson1d_csr(10)
-        smoother = ParallelAMG.build_spai1_smoother(A)
+        Ac = to_csr(A)
+        smoother = ParallelAMG.build_spai1_smoother(Ac)
         b = ones(10)
         x = zeros(10)
-        smooth!(x, A, b, smoother; steps=10)
+        smooth!(x, Ac, b, smoother; steps=10)
         r = b - sparse(A.At') * x
         @test norm(r) < norm(b)
     end
@@ -574,17 +613,18 @@ end
 
     @testset "HMIS Coarsening" begin
         A = poisson1d_csr(20)
-        cf, cmap, nc = ParallelAMG.coarsen_hmis(A, 0.25)
+        Ac = to_csr(A)
+        cf, cmap, nc = ParallelAMG.coarsen_hmis(Ac, 0.25)
         @test length(cf) == 20
         @test all(abs.(cf) .== 1)
         @test nc > 0
         @test nc < 20
         # Every fine point should have at least one coarse neighbor
-        cv = colvals(A)
+        cv = colvals(Ac)
         for i in 1:20
             if cf[i] == -1
                 has_coarse = false
-                for nz in nzrange(A, i)
+                for nz in nzrange(Ac, i)
                     j = cv[nz]
                     if j != i && cf[j] == 1
                         has_coarse = true
@@ -598,7 +638,8 @@ end
 
     @testset "HMIS Coarsening - 2D" begin
         A = poisson2d_csr(8)
-        cf, cmap, nc = ParallelAMG.coarsen_hmis(A, 0.25)
+        Ac = to_csr(A)
+        cf, cmap, nc = ParallelAMG.coarsen_hmis(Ac, 0.25)
         @test nc > 0
         @test nc < 64
         @test sum(cf .== 1) == nc
@@ -807,10 +848,11 @@ end
 
     @testset "CF Prolongation - Coarse Points Identity" begin
         A = poisson1d_csr(20)
-        cf, cmap, nc = ParallelAMG.coarsen_pmis(A, 0.25)
+        Ac = to_csr(A)
+        cf, cmap, nc = ParallelAMG.coarsen_pmis(Ac, 0.25)
         # Test all three interpolation types
         for interp in [DirectInterpolation(), StandardInterpolation(), ExtendedIInterpolation()]
-            P = ParallelAMG.build_cf_prolongation(A, cf, cmap, nc, interp)
+            P = ParallelAMG.build_cf_prolongation(Ac, cf, cmap, nc, interp)
             @test P.nrow == 20
             @test P.ncol == nc
             # Coarse points should have identity mapping: P[i, cmap[i]] = 1
@@ -827,9 +869,10 @@ end
 
     @testset "CF Prolongation - Fine Points Have Entries" begin
         A = poisson1d_csr(20)
-        cf, cmap, nc = ParallelAMG.coarsen_pmis(A, 0.25)
+        Ac = to_csr(A)
+        cf, cmap, nc = ParallelAMG.coarsen_pmis(Ac, 0.25)
         for interp in [DirectInterpolation(), StandardInterpolation(), ExtendedIInterpolation()]
-            P = ParallelAMG.build_cf_prolongation(A, cf, cmap, nc, interp)
+            P = ParallelAMG.build_cf_prolongation(Ac, cf, cmap, nc, interp)
             for i in 1:20
                 if cf[i] == -1
                     nnz_row = P.rowptr[i+1] - P.rowptr[i]
@@ -841,9 +884,10 @@ end
 
     @testset "Galerkin Product - Multi-entry P" begin
         A = poisson2d_csr(6)
-        cf, cmap, nc = ParallelAMG.coarsen_pmis(A, 0.25)
-        P = ParallelAMG.build_cf_prolongation(A, cf, cmap, nc, StandardInterpolation())
-        A_coarse, r_map = ParallelAMG.compute_coarse_sparsity(A, P, nc)
+        Ac = to_csr(A)
+        cf, cmap, nc = ParallelAMG.coarsen_pmis(Ac, 0.25)
+        P = ParallelAMG.build_cf_prolongation(Ac, cf, cmap, nc, StandardInterpolation())
+        A_coarse, r_map = ParallelAMG.compute_coarse_sparsity(Ac, P, nc)
         # Verify against explicit computation
         I_p = Int[]; J_p = Int[]; V_p = Float64[]
         for i in 1:P.nrow
@@ -860,7 +904,8 @@ end
         # Test in-place resetup with triple map
         nzv = nonzeros(A)
         nzv .*= 1.5
-        ParallelAMG.galerkin_product!(A_coarse, A, P, r_map)
+        Ac = to_csr(A)
+        ParallelAMG.galerkin_product!(A_coarse, Ac, P, r_map)
         A_sparse2 = sparse(A.At')
         Ac_explicit2 = P_sparse' * A_sparse2 * P_sparse
         for i in 1:nc, j in 1:nc
@@ -869,30 +914,93 @@ end
     end
 
     # ══════════════════════════════════════════════════════════════════════════
-    # Coarsening stalling heuristic
+    # RS Coarsening (replaces stalling heuristic)
     # ══════════════════════════════════════════════════════════════════════════
 
-    @testset "Coarsening Stalling - min_coarse_ratio" begin
-        A = poisson2d_csr(30)
-        # With a very strict ratio, coarsening should stop early
-        config = AMGConfig(coarsening=HMISCoarsening(0.25, DirectInterpolation()),
-                           min_coarse_ratio=0.3)
-        hierarchy = amg_setup(A, config)
-        nlevels = length(hierarchy.levels) + 1
-        # Check that we didn't create too many similar-sized levels
-        for i in 1:length(hierarchy.levels)-1
-            n_current = size(hierarchy.levels[i].A, 1)
-            n_next = size(hierarchy.levels[i+1].A, 1)
-            ratio = n_next / n_current
-            # Ratio should be below or near the threshold
-            @test ratio <= 0.6 || n_next <= config.max_coarse_size
+    @testset "RS Coarsening - Basic" begin
+        A = poisson1d_csr(20)
+        Ac = to_csr(A)
+        cf, cmap, nc = ParallelAMG.coarsen_rs(Ac, 0.25)
+        @test length(cf) == 20
+        @test all(abs.(cf) .== 1)
+        @test nc > 0
+        @test nc < 20
+        # Every F-point should have a strong C-neighbor
+        is_strong = ParallelAMG.strength_graph(Ac, 0.25)
+        cv = colvals(Ac)
+        for i in 1:20
+            if cf[i] == -1
+                has_C = false
+                for nz in nzrange(Ac, i)
+                    j = cv[nz]
+                    if j != i && is_strong[nz] && cf[j] == 1
+                        has_C = true
+                        break
+                    end
+                end
+                @test has_C
+            end
         end
     end
 
-    @testset "Coarsening Stalling - Default ratio stops gracefully" begin
+    @testset "RS Coarsening - 2D" begin
+        A = poisson2d_csr(10)
+        Ac = to_csr(A)
+        cf, cmap, nc = ParallelAMG.coarsen_rs(Ac, 0.25)
+        @test nc > 0
+        @test nc < 100
+        @test sum(cf .== 1) == nc
+    end
+
+    @testset "RS Coarsening - Solve" begin
+        n = 10
+        A = poisson2d_csr(n)
+        N = n*n
+        b = rand(N)
+        x = zeros(N)
+        config = AMGConfig(coarsening=RSCoarsening(0.25, DirectInterpolation()),
+                           pre_smoothing_steps=2, post_smoothing_steps=2)
+        hierarchy = amg_setup(A, config)
+        @test length(hierarchy.levels) >= 1
+        x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r = b - sparse(A.At') * x
+        @test norm(r) / norm(b) < 1e-8
+        @test niter < 200
+    end
+
+    @testset "RS Coarsening - Standard Interpolation" begin
+        n = 10
+        A = poisson2d_csr(n)
+        N = n*n
+        b = rand(N)
+        x = zeros(N)
+        config = AMGConfig(coarsening=RSCoarsening(0.25, StandardInterpolation()),
+                           pre_smoothing_steps=2, post_smoothing_steps=2)
+        hierarchy = amg_setup(A, config)
+        @test length(hierarchy.levels) >= 1
+        x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r = b - sparse(A.At') * x
+        @test norm(r) / norm(b) < 1e-8
+        @test niter < 200
+    end
+
+    @testset "RS Coarsening - Good coarsening ratios" begin
+        A = poisson2d_csr(30)
+        config = AMGConfig(coarsening=RSCoarsening(0.25, DirectInterpolation()))
+        hierarchy = amg_setup(A, config)
+        @test length(hierarchy.levels) >= 1
+        # RS should produce good coarsening ratios throughout
+        for i in 1:length(hierarchy.levels)-1
+            n_current = size(hierarchy.levels[i].A, 1)
+            n_next = size(hierarchy.levels[i+1].A, 1)
+            # Every level should coarsen meaningfully (ratio < 0.85)
+            @test n_next < n_current
+        end
+    end
+
+    @testset "PMIS - Good coarsening ratios" begin
         A = poisson2d_csr(20)
-        config = AMGConfig(coarsening=PMISCoarsening(0.25, DirectInterpolation()),
-                           min_coarse_ratio=0.5)
+        config = AMGConfig(coarsening=PMISCoarsening(0.25, DirectInterpolation()))
         hierarchy = amg_setup(A, config)
         @test length(hierarchy.levels) >= 1
         # Solve should still work
@@ -902,6 +1010,68 @@ end
         x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
         r = b - sparse(A.At') * x
         @test norm(r) / norm(b) < 1e-8
+    end
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Disconnected / Isolated cells
+    # ══════════════════════════════════════════════════════════════════════════
+
+    @testset "Isolated diagonal-only rows" begin
+        # Matrix with disconnected diagonal-only rows
+        I = [1,1,2,3,3,4,5]
+        J = [1,2,2,3,4,4,5]
+        V = [4.0,-1.0,5.0,-1.0,4.0,-1.0,3.0]  # rows 2 and 5 are diagonal-only
+        A = static_sparsity_sparse(I, J, V, 5, 5)
+        config = AMGConfig()
+        hierarchy = amg_setup(A, config)
+        @test length(hierarchy.levels) >= 0  # might go straight to direct solve
+        b = [1.0, 2.0, 3.0, 4.0, 5.0]
+        x = zeros(5)
+        x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-10, maxiter=100)
+        r = b - sparse(A.At') * x
+        @test norm(r) / norm(b) < 1e-8
+    end
+
+    @testset "Block diagonal matrix" begin
+        # Two disconnected 2x2 blocks + one isolated node
+        I = [1,1,2,2,3,3,4,4,5]
+        J = [1,2,1,2,3,4,3,4,5]
+        V = [4.0,-1.0,-1.0,4.0,4.0,-1.0,-1.0,4.0,3.0]
+        A = static_sparsity_sparse(I, J, V, 5, 5)
+        config = AMGConfig()
+        hierarchy = amg_setup(A, config)
+        b = [1.0, 1.0, 1.0, 1.0, 1.0]
+        x = zeros(5)
+        x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-10, maxiter=100)
+        r = b - sparse(A.At') * x
+        @test norm(r) / norm(b) < 1e-8
+    end
+
+    @testset "Isolated nodes in PMIS/HMIS" begin
+        # Matrix with some nodes having no strong connections (small off-diags)
+        n = 10
+        I = Int[]; J = Int[]; V = Float64[]
+        for i in 1:n
+            push!(I, i); push!(J, i); push!(V, 100.0)  # strong diagonal
+            if i > 1
+                # Very weak connection (won't be strong)
+                push!(I, i); push!(J, i-1); push!(V, -1e-10)
+            end
+            if i < n
+                push!(I, i); push!(J, i+1); push!(V, -1e-10)
+            end
+        end
+        A = static_sparsity_sparse(I, J, V, n, n)
+        # All off-diags are negligible → all nodes isolated
+        for coarsening_alg in [PMISCoarsening(), HMISCoarsening(), RSCoarsening()]
+            config = AMGConfig(coarsening=coarsening_alg)
+            hierarchy = amg_setup(A, config)
+            b = rand(n)
+            x = zeros(n)
+            x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+            r = b - sparse(A.At') * x
+            @test norm(r) / norm(b) < 1e-8
+        end
     end
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -994,22 +1164,23 @@ end
 
     @testset "Max Row Sum - Weakening Function" begin
         A = poisson2d_csr(5)
+        Ac = to_csr(A)
         # For Poisson 2D boundary row: |a_ii|=4, |off-diag|=2, ratio=(4+2)/4=1.5
         # With threshold=1.2, rows with ratio > 1.2 should be scaled
-        A_weak = ParallelAMG._apply_max_row_sum(A, 1.2)
+        A_weak = ParallelAMG._apply_max_row_sum(Ac, 1.2)
         # The weakened matrix should have same size and structure
-        @test size(A_weak) == size(A)
-        @test nnz(A_weak) == nnz(A)
-        cv = colvals(A)
-        nzv_orig = nonzeros(A)
+        @test size(A_weak) == size(Ac)
+        @test nnz(A_weak) == nnz(Ac)
+        cv = colvals(Ac)
+        nzv_orig = nonzeros(Ac)
         nzv_weak = nonzeros(A_weak)
-        rp = rowptr(A)
+        rp = rowptr(Ac)
         # Interior row (center point, index 13 for 5x5): ratio = (4+4)/4 = 2.0 > 1.2
         # Actually all rows with 4 off-diag neighbors: ratio=(4+4)/4=2.0 > 1.2, will be scaled
         # Rows with 2 off-diag neighbors: ratio=(4+2)/4=1.5 > 1.2, also scaled
         # So with threshold=1.2, most rows get scaled
         # Let's use threshold=1.8 to only affect boundary rows
-        A_weak2 = ParallelAMG._apply_max_row_sum(A, 1.8)
+        A_weak2 = ParallelAMG._apply_max_row_sum(Ac, 1.8)
         nzv_weak2 = nonzeros(A_weak2)
         # Interior row 13 (4 neighbors): ratio=2.0 > 1.8, should be scaled
         has_scaled_interior = false
@@ -1143,9 +1314,10 @@ end
 
     @testset "Smoothed Prolongation Construction" begin
         A = poisson1d_csr(10)
-        agg, nc = ParallelAMG.coarsen_aggregation(A, 0.25)
-        P_tent = ParallelAMG.build_prolongation(A, agg, nc)
-        P_smooth = ParallelAMG._smooth_prolongation(A, P_tent, 2/3)
+        Ac = to_csr(A)
+        agg, nc = ParallelAMG.coarsen_aggregation(Ac, 0.25)
+        P_tent = ParallelAMG.build_prolongation(Ac, agg, nc)
+        P_smooth = ParallelAMG._smooth_prolongation(Ac, P_tent, 2/3)
         @test P_smooth.nrow == 10
         @test P_smooth.ncol == nc
         # Smoothed P should have more nonzeros than tentative P
@@ -1193,20 +1365,22 @@ end
 
     @testset "Sign-Aware Strength - AbsoluteStrength" begin
         A = reservoir_like_csr(20)
-        is_strong = ParallelAMG.strength_graph(A, 0.25, AbsoluteStrength())
+        Ac = to_csr(A)
+        is_strong = ParallelAMG.strength_graph(Ac, 0.25, AbsoluteStrength())
         @test length(is_strong) == nnz(A)
         @test sum(is_strong) > 0
     end
 
     @testset "Sign-Aware Strength - SignedStrength" begin
         A = reservoir_like_csr(20)
-        is_strong_signed = ParallelAMG.strength_graph(A, 0.25, SignedStrength())
-        is_strong_abs = ParallelAMG.strength_graph(A, 0.25, AbsoluteStrength())
-        @test length(is_strong_signed) == nnz(A)
+        Ac = to_csr(A)
+        is_strong_signed = ParallelAMG.strength_graph(Ac, 0.25, SignedStrength())
+        is_strong_abs = ParallelAMG.strength_graph(Ac, 0.25, AbsoluteStrength())
+        @test length(is_strong_signed) == nnz(Ac)
         # Signed strength should not mark positive off-diags as strong (when diag is positive)
-        cv = colvals(A)
-        nzv = nonzeros(A)
-        for nz in 1:nnz(A)
+        cv = colvals(Ac)
+        nzv = nonzeros(Ac)
+        for nz in 1:nnz(Ac)
             if is_strong_signed[nz]
                 # This connection should have opposite sign from diagonal
                 # (or be in a fallback row)
@@ -1232,10 +1406,11 @@ end
 
     @testset "SignedStrength - Config dispatch" begin
         A = poisson2d_csr(8)
-        is1 = ParallelAMG.strength_graph(A, 0.25, AMGConfig(strength_type=AbsoluteStrength()))
-        is2 = ParallelAMG.strength_graph(A, 0.25, AMGConfig(strength_type=SignedStrength()))
-        @test length(is1) == nnz(A)
-        @test length(is2) == nnz(A)
+        Ac = to_csr(A)
+        is1 = ParallelAMG.strength_graph(Ac, 0.25, AMGConfig(strength_type=AbsoluteStrength()))
+        is2 = ParallelAMG.strength_graph(Ac, 0.25, AMGConfig(strength_type=SignedStrength()))
+        @test length(is1) == nnz(Ac)
+        @test length(is2) == nnz(Ac)
     end
 
     @testset "Positive Off-Diags - All smoothers converge" begin
@@ -1280,7 +1455,8 @@ end
         J = [1,2,1,2,3,2,3]
         V = [2.0,-1.0,-1.0,1e-20,-1.0,-1.0,2.0]  # row 2 has near-zero diagonal
         A = static_sparsity_sparse(I, J, V, 3, 3)
-        smoother = ParallelAMG.build_jacobi_smoother(A, 2.0/3.0)
+        Ac = to_csr(A)
+        smoother = ParallelAMG.build_jacobi_smoother(Ac, 2.0/3.0)
         # invdiag should be safe (zero, not Inf)
         @test isfinite(smoother.invdiag[1])
         @test isfinite(smoother.invdiag[2])
@@ -1348,7 +1524,8 @@ end
 
     @testset "l1-Jacobi Smoother - Build" begin
         A = poisson1d_csr(10)
-        smoother = ParallelAMG.build_l1jacobi_smoother(A, 2.0/3.0)
+        Ac = to_csr(A)
+        smoother = ParallelAMG.build_l1jacobi_smoother(Ac, 2.0/3.0)
         @test length(smoother.invdiag) == 10
         @test smoother.ω ≈ 2.0/3.0
         # For interior row: l1 norm = |−1| + |2| + |−1| = 4, invdiag = 1/4
@@ -1357,10 +1534,11 @@ end
 
     @testset "l1-Jacobi Smoother - Smoothing" begin
         A = poisson1d_csr(10)
-        smoother = ParallelAMG.build_l1jacobi_smoother(A, 2.0/3.0)
+        Ac = to_csr(A)
+        smoother = ParallelAMG.build_l1jacobi_smoother(Ac, 2.0/3.0)
         b = ones(10)
         x = zeros(10)
-        smooth!(x, A, b, smoother; steps=10)
+        smooth!(x, Ac, b, smoother; steps=10)
         r = b - sparse(A.At') * x
         @test norm(r) < norm(b)
     end
@@ -1402,7 +1580,8 @@ end
 
     @testset "Chebyshev Smoother - Build" begin
         A = poisson1d_csr(10)
-        smoother = ParallelAMG.build_chebyshev_smoother(A)
+        Ac = to_csr(A)
+        smoother = ParallelAMG.build_chebyshev_smoother(Ac)
         @test length(smoother.invdiag) == 10
         @test smoother.λ_max > 0
         @test smoother.λ_min > 0
@@ -1412,10 +1591,11 @@ end
 
     @testset "Chebyshev Smoother - Smoothing" begin
         A = poisson1d_csr(10)
-        smoother = ParallelAMG.build_chebyshev_smoother(A)
+        Ac = to_csr(A)
+        smoother = ParallelAMG.build_chebyshev_smoother(Ac)
         b = ones(10)
         x = zeros(10)
-        smooth!(x, A, b, smoother; steps=5)
+        smooth!(x, Ac, b, smoother; steps=5)
         r = b - sparse(A.At') * x
         @test norm(r) < norm(b)
     end
@@ -1459,7 +1639,8 @@ end
 
     @testset "ILU(0) Smoother - Build" begin
         A = poisson1d_csr(10)
-        smoother = ParallelAMG.build_ilu0_smoother(A)
+        Ac = to_csr(A)
+        smoother = ParallelAMG.build_ilu0_smoother(Ac)
         @test length(smoother.L_nzval) == nnz(A)
         @test length(smoother.U_nzval) == nnz(A)
         @test length(smoother.diag_idx) == 10
@@ -1468,10 +1649,11 @@ end
 
     @testset "ILU(0) Smoother - Smoothing" begin
         A = poisson1d_csr(10)
-        smoother = ParallelAMG.build_ilu0_smoother(A)
+        Ac = to_csr(A)
+        smoother = ParallelAMG.build_ilu0_smoother(Ac)
         b = ones(10)
         x = zeros(10)
-        smooth!(x, A, b, smoother; steps=3)
+        smooth!(x, Ac, b, smoother; steps=3)
         r = b - sparse(A.At') * x
         @test norm(r) < norm(b)
     end

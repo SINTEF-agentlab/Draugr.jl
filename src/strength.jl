@@ -6,7 +6,7 @@ Returns a boolean CSR matrix `S` where `S[i,j] = true` if j is a strong connecti
 
 A connection (i,j) is strong if |A[i,j]| ≥ θ * max_{k≠i} |A[i,k]|
 """
-function strength_graph(A::StaticSparsityMatrixCSR{Tv, Ti}, θ::Real) where {Tv, Ti}
+function strength_graph(A::CSRMatrix{Tv, Ti}, θ::Real) where {Tv, Ti}
     return strength_graph(A, θ, AbsoluteStrength())
 end
 
@@ -15,7 +15,7 @@ end
 
 Absolute-value strength: |a_{i,j}| ≥ θ * max_{k≠i} |a_{i,k}|.
 """
-function strength_graph(A::StaticSparsityMatrixCSR{Tv, Ti}, θ::Real, ::AbsoluteStrength) where {Tv, Ti}
+function strength_graph(A::CSRMatrix{Tv, Ti}, θ::Real, ::AbsoluteStrength) where {Tv, Ti}
     n = size(A, 1)
     nzv = nonzeros(A)
     cv = colvals(A)
@@ -58,7 +58,7 @@ A connection (i,j) is strong if:
 If all off-diagonals have the same sign as the diagonal (no "proper" connections),
 falls back to absolute-value strength for that row.
 """
-function strength_graph(A::StaticSparsityMatrixCSR{Tv, Ti}, θ::Real, ::SignedStrength) where {Tv, Ti}
+function strength_graph(A::CSRMatrix{Tv, Ti}, θ::Real, ::SignedStrength) where {Tv, Ti}
     n = size(A, 1)
     nzv = nonzeros(A)
     cv = colvals(A)
@@ -125,7 +125,7 @@ end
 
 Dispatch strength computation based on config's strength_type.
 """
-function strength_graph(A::StaticSparsityMatrixCSR, θ::Real, config::AMGConfig)
+function strength_graph(A::CSRMatrix, θ::Real, config::AMGConfig)
     return strength_graph(A, θ, config.strength_type)
 end
 
@@ -134,7 +134,7 @@ end
 
 Return an iterator of strongly connected column indices for a given row.
 """
-function strong_neighbors(A::StaticSparsityMatrixCSR, is_strong::Vector{Bool}, row::Integer)
+function strong_neighbors(A::CSRMatrix, is_strong::Vector{Bool}, row::Integer)
     cv = colvals(A)
     return (cv[nz] for nz in nzrange(A, row) if is_strong[nz])
 end
@@ -152,7 +152,7 @@ matrix used in the solve.
 
 Returns a new matrix with the same sparsity pattern but modified coefficients.
 """
-function _apply_max_row_sum(A::StaticSparsityMatrixCSR{Tv, Ti}, threshold::Real) where {Tv, Ti}
+function _apply_max_row_sum(A::CSRMatrix{Tv, Ti}, threshold::Real) where {Tv, Ti}
     n = size(A, 1)
     cv = colvals(A)
     nzv_old = nonzeros(A)
@@ -188,8 +188,7 @@ function _apply_max_row_sum(A::StaticSparsityMatrixCSR{Tv, Ti}, threshold::Real)
             end
         end
     end
-    return StaticSparsityMatrixCSR(size(A, 1), size(A, 2),
-                                    collect(rp), collect(cv), nzv_new)
+    return CSRMatrix{Tv, Ti}(collect(rp), collect(cv), nzv_new, size(A, 1), size(A, 2))
 end
 
 # ── Safe diagonal helpers ────────────────────────────────────────────────────

@@ -230,10 +230,11 @@ end
 """
     AMGLevel{Tv, Ti}
 
-One level of the AMG hierarchy.
+One level of the AMG hierarchy. The matrix `A` is stored as a `CSRMatrix` (raw
+CSR vectors), decoupled from Jutul's `StaticSparsityMatrixCSR`.
 """
 mutable struct AMGLevel{Tv, Ti<:Integer}
-    A::StaticSparsityMatrixCSR{Tv, Ti}
+    A::CSRMatrix{Tv, Ti}
     P::ProlongationOp{Ti, Tv}
     R_map::RestrictionMap{Ti}
     smoother::AbstractSmoother
@@ -278,6 +279,8 @@ Fields:
 - `initial_coarsening_levels`: Number of levels to use `initial_coarsening` for (default: 0)
 - `min_coarse_ratio`: Minimum ratio n_coarse/n_fine to accept a coarsening level (default: 0.5).
   If coarsening produces a ratio above this (i.e. too little reduction), coarsening stops.
+- `max_stall_levels`: Number of consecutive levels with poor coarsening ratio before terminating (default: 2).
+  This prevents premature termination when a single level (e.g. after aggressive coarsening) has poor ratio.
 - `max_row_sum`: Maximum row sum threshold for dependency weakening (default: 0, disabled).
   When > 0, rows where |row_sum|/|a_ii| > max_row_sum have their off-diagonal entries scaled
   down to enforce the threshold, improving AMG robustness for indefinite or nearly singular systems.
@@ -297,6 +300,7 @@ struct AMGConfig
     initial_coarsening::CoarseningAlgorithm
     initial_coarsening_levels::Int
     min_coarse_ratio::Float64
+    max_stall_levels::Int
     max_row_sum::Float64
     cycle_type::Symbol
     strength_type::StrengthType
@@ -314,6 +318,7 @@ function AMGConfig(;
     initial_coarsening::CoarseningAlgorithm = coarsening,
     initial_coarsening_levels::Int = 0,
     min_coarse_ratio::Float64 = 0.5,
+    max_stall_levels::Int = 2,
     max_row_sum::Float64 = 0.0,
     cycle_type::Symbol = :V,
     strength_type::StrengthType = AbsoluteStrength(),
@@ -322,7 +327,7 @@ function AMGConfig(;
     return AMGConfig(coarsening, smoother, max_levels, max_coarse_size,
                      pre_smoothing_steps, post_smoothing_steps, jacobi_omega, verbose,
                      initial_coarsening, initial_coarsening_levels,
-                     min_coarse_ratio, max_row_sum, cycle_type, strength_type)
+                     min_coarse_ratio, max_stall_levels, max_row_sum, cycle_type, strength_type)
 end
 
 """

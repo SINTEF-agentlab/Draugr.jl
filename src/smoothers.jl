@@ -3,7 +3,7 @@
 
 Build a weighted Jacobi smoother from matrix `A` with damping `ω`.
 """
-function build_jacobi_smoother(A::StaticSparsityMatrixCSR{Tv, Ti}, ω::Real) where {Tv, Ti}
+function build_jacobi_smoother(A::CSRMatrix{Tv, Ti}, ω::Real) where {Tv, Ti}
     n = size(A, 1)
     invdiag = Vector{Tv}(undef, n)
     compute_inverse_diagonal!(invdiag, A)
@@ -17,8 +17,8 @@ end
 Compute inverse of diagonal entries of A using a KA kernel.
 """
 function compute_inverse_diagonal!(invdiag::AbstractVector{Tv},
-                                   A::StaticSparsityMatrixCSR{Tv, Ti};
-                                   backend=CPU()) where {Tv, Ti}
+                                   A::CSRMatrix{Tv, Ti};
+                                   backend=DEFAULT_BACKEND) where {Tv, Ti}
     n = size(A, 1)
     cv = colvals(A)
     nzv = nonzeros(A)
@@ -52,8 +52,8 @@ end
 
 Update the smoother for new matrix values (same sparsity pattern).
 """
-function update_smoother!(smoother::JacobiSmoother, A::StaticSparsityMatrixCSR;
-                          backend=CPU())
+function update_smoother!(smoother::JacobiSmoother, A::CSRMatrix;
+                          backend=DEFAULT_BACKEND)
     compute_inverse_diagonal!(smoother.invdiag, A; backend=backend)
     return smoother
 end
@@ -84,8 +84,8 @@ end
 Apply `steps` iterations of weighted Jacobi smoothing to solve `Ax = b`.
 Uses KernelAbstractions for parallel execution.
 """
-function smooth!(x::AbstractVector, A::StaticSparsityMatrixCSR, b::AbstractVector,
-                 smoother::JacobiSmoother; steps::Int=1, backend=CPU())
+function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
+                 smoother::JacobiSmoother; steps::Int=1, backend=DEFAULT_BACKEND)
     n = size(A, 1)
     nzv = nonzeros(A)
     cv = colvals(A)
@@ -110,7 +110,7 @@ end
 Compute a greedy graph coloring of the adjacency graph of CSR matrix `A`.
 Returns `(colors, num_colors)` where `colors[i]` is the color of node i.
 """
-function greedy_coloring(A::StaticSparsityMatrixCSR{Tv, Ti}) where {Tv, Ti}
+function greedy_coloring(A::CSRMatrix{Tv, Ti}) where {Tv, Ti}
     n = size(A, 1)
     cv = colvals(A)
     colors = zeros(Ti, n)
@@ -140,7 +140,7 @@ end
 
 Build a parallel colored Gauss-Seidel smoother.
 """
-function build_colored_gs_smoother(A::StaticSparsityMatrixCSR{Tv, Ti}) where {Tv, Ti}
+function build_colored_gs_smoother(A::CSRMatrix{Tv, Ti}) where {Tv, Ti}
     n = size(A, 1)
     colors, num_colors = greedy_coloring(A)
     # Sort nodes by color for efficient parallel iteration
@@ -166,8 +166,8 @@ function build_colored_gs_smoother(A::StaticSparsityMatrixCSR{Tv, Ti}) where {Tv
                                                num_colors, invdiag)
 end
 
-function update_smoother!(smoother::ColoredGaussSeidelSmoother, A::StaticSparsityMatrixCSR;
-                          backend=CPU())
+function update_smoother!(smoother::ColoredGaussSeidelSmoother, A::CSRMatrix;
+                          backend=DEFAULT_BACKEND)
     compute_inverse_diagonal!(smoother.invdiag, A; backend=backend)
     return smoother
 end
@@ -193,8 +193,8 @@ end
 
 Apply parallel colored Gauss-Seidel smoothing.
 """
-function smooth!(x::AbstractVector, A::StaticSparsityMatrixCSR, b::AbstractVector,
-                 smoother::ColoredGaussSeidelSmoother; steps::Int=1, backend=CPU())
+function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
+                 smoother::ColoredGaussSeidelSmoother; steps::Int=1, backend=DEFAULT_BACKEND)
     nzv = nonzeros(A)
     cv = colvals(A)
     rp = rowptr(A)
@@ -223,7 +223,7 @@ Build an SPAI(0) smoother.  For each row i, the diagonal entry is:
   m[i] = a[i,i] / ‖A[i,:]‖₂²
 This minimizes ‖e_i - m[i]*A[i,:]‖₂.
 """
-function build_spai0_smoother(A::StaticSparsityMatrixCSR{Tv, Ti}) where {Tv, Ti}
+function build_spai0_smoother(A::CSRMatrix{Tv, Ti}) where {Tv, Ti}
     n = size(A, 1)
     m_diag = Vector{Tv}(undef, n)
     _compute_spai0!(m_diag, A)
@@ -231,8 +231,8 @@ function build_spai0_smoother(A::StaticSparsityMatrixCSR{Tv, Ti}) where {Tv, Ti}
     return SPAI0Smoother{Tv}(m_diag, tmp)
 end
 
-function _compute_spai0!(m_diag::AbstractVector{Tv}, A::StaticSparsityMatrixCSR{Tv, Ti};
-                         backend=CPU()) where {Tv, Ti}
+function _compute_spai0!(m_diag::AbstractVector{Tv}, A::CSRMatrix{Tv, Ti};
+                         backend=DEFAULT_BACKEND) where {Tv, Ti}
     n = size(A, 1)
     nzv = nonzeros(A)
     cv = colvals(A)
@@ -259,8 +259,8 @@ end
     end
 end
 
-function update_smoother!(smoother::SPAI0Smoother, A::StaticSparsityMatrixCSR;
-                          backend=CPU())
+function update_smoother!(smoother::SPAI0Smoother, A::CSRMatrix;
+                          backend=DEFAULT_BACKEND)
     _compute_spai0!(smoother.m_diag, A; backend=backend)
     return smoother
 end
@@ -284,8 +284,8 @@ end
 
 Apply SPAI(0) smoothing iterations.
 """
-function smooth!(x::AbstractVector, A::StaticSparsityMatrixCSR, b::AbstractVector,
-                 smoother::SPAI0Smoother; steps::Int=1, backend=CPU())
+function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
+                 smoother::SPAI0Smoother; steps::Int=1, backend=DEFAULT_BACKEND)
     n = size(A, 1)
     nzv = nonzeros(A)
     cv = colvals(A)
@@ -312,7 +312,7 @@ m_i that minimizes ‖e_i - A^T * m_i‖₂ with sparsity(m_i) ⊆ sparsity(A[i,
 
 This is stored in the same CSR pattern as A but with modified values.
 """
-function build_spai1_smoother(A::StaticSparsityMatrixCSR{Tv, Ti}) where {Tv, Ti}
+function build_spai1_smoother(A::CSRMatrix{Tv, Ti}) where {Tv, Ti}
     n = size(A, 1)
     nzval_m = Vector{Tv}(undef, nnz(A))
     _compute_spai1!(nzval_m, A)
@@ -332,7 +332,7 @@ For efficiency, we compute this row-by-row using the normal equations:
 where J = {columns in row i of A} and A_J = A[:, J] restricted to rows that
 intersect with columns of row i.
 """
-function _compute_spai1!(nzval_m::Vector{Tv}, A::StaticSparsityMatrixCSR{Tv, Ti}) where {Tv, Ti}
+function _compute_spai1!(nzval_m::Vector{Tv}, A::CSRMatrix{Tv, Ti}) where {Tv, Ti}
     n = size(A, 1)
     nzv = nonzeros(A)
     cv = colvals(A)
@@ -405,8 +405,8 @@ function _compute_spai1!(nzval_m::Vector{Tv}, A::StaticSparsityMatrixCSR{Tv, Ti}
     return nzval_m
 end
 
-function update_smoother!(smoother::SPAI1Smoother, A::StaticSparsityMatrixCSR;
-                          backend=CPU())
+function update_smoother!(smoother::SPAI1Smoother, A::CSRMatrix;
+                          backend=DEFAULT_BACKEND)
     _compute_spai1!(smoother.nzval, A)
     return smoother
 end
@@ -450,8 +450,8 @@ end
 Apply SPAI(1) smoothing: x <- x + M*(b - A*x) where M ≈ A⁻¹.
 Two-pass: first compute residual into tmp, then apply M.
 """
-function smooth!(x::AbstractVector, A::StaticSparsityMatrixCSR, b::AbstractVector,
-                 smoother::SPAI1Smoother; steps::Int=1, backend=CPU())
+function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
+                 smoother::SPAI1Smoother; steps::Int=1, backend=DEFAULT_BACKEND)
     n = size(A, 1)
     nzv = nonzeros(A)
     cv = colvals(A)
@@ -474,19 +474,19 @@ end
 # Smoother dispatch based on SmootherType config
 # ══════════════════════════════════════════════════════════════════════════════
 
-function build_smoother(A::StaticSparsityMatrixCSR, ::JacobiSmootherType, ω::Real)
+function build_smoother(A::CSRMatrix, ::JacobiSmootherType, ω::Real; backend=DEFAULT_BACKEND)
     return build_jacobi_smoother(A, ω)
 end
 
-function build_smoother(A::StaticSparsityMatrixCSR, ::ColoredGaussSeidelType, ω::Real)
+function build_smoother(A::CSRMatrix, ::ColoredGaussSeidelType, ω::Real; backend=DEFAULT_BACKEND)
     return build_colored_gs_smoother(A)
 end
 
-function build_smoother(A::StaticSparsityMatrixCSR, ::SPAI0SmootherType, ω::Real)
+function build_smoother(A::CSRMatrix, ::SPAI0SmootherType, ω::Real; backend=DEFAULT_BACKEND)
     return build_spai0_smoother(A)
 end
 
-function build_smoother(A::StaticSparsityMatrixCSR, ::SPAI1SmootherType, ω::Real)
+function build_smoother(A::CSRMatrix, ::SPAI1SmootherType, ω::Real; backend=DEFAULT_BACKEND)
     return build_spai1_smoother(A)
 end
 
@@ -503,7 +503,7 @@ m[i] = ω / (|a_{i,i}| + Σ_{j≠i} |a_{i,j}|)
 More robust than standard Jacobi for matrices with large off-diagonal entries,
 near-zero diagonals, or wrong-sign off-diagonals.
 """
-function build_l1jacobi_smoother(A::StaticSparsityMatrixCSR{Tv, Ti}, ω::Real) where {Tv, Ti}
+function build_l1jacobi_smoother(A::CSRMatrix{Tv, Ti}, ω::Real) where {Tv, Ti}
     n = size(A, 1)
     invdiag = Vector{Tv}(undef, n)
     _compute_l1_invdiag!(invdiag, A)
@@ -512,8 +512,8 @@ function build_l1jacobi_smoother(A::StaticSparsityMatrixCSR{Tv, Ti}, ω::Real) w
 end
 
 function _compute_l1_invdiag!(invdiag::AbstractVector{Tv},
-                               A::StaticSparsityMatrixCSR{Tv, Ti};
-                               backend=CPU()) where {Tv, Ti}
+                               A::CSRMatrix{Tv, Ti};
+                               backend=DEFAULT_BACKEND) where {Tv, Ti}
     n = size(A, 1)
     nzv = nonzeros(A)
     cv = colvals(A)
@@ -536,14 +536,14 @@ end
     end
 end
 
-function update_smoother!(smoother::L1JacobiSmoother, A::StaticSparsityMatrixCSR;
-                          backend=CPU())
+function update_smoother!(smoother::L1JacobiSmoother, A::CSRMatrix;
+                          backend=DEFAULT_BACKEND)
     _compute_l1_invdiag!(smoother.invdiag, A; backend=backend)
     return smoother
 end
 
-function smooth!(x::AbstractVector, A::StaticSparsityMatrixCSR, b::AbstractVector,
-                 smoother::L1JacobiSmoother; steps::Int=1, backend=CPU())
+function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
+                 smoother::L1JacobiSmoother; steps::Int=1, backend=DEFAULT_BACKEND)
     n = size(A, 1)
     nzv = nonzeros(A)
     cv = colvals(A)
@@ -558,7 +558,7 @@ function smooth!(x::AbstractVector, A::StaticSparsityMatrixCSR, b::AbstractVecto
     return x
 end
 
-function build_smoother(A::StaticSparsityMatrixCSR, ::L1JacobiSmootherType, ω::Real)
+function build_smoother(A::CSRMatrix, ::L1JacobiSmootherType, ω::Real; backend=DEFAULT_BACKEND)
     return build_l1jacobi_smoother(A, ω)
 end
 
@@ -571,7 +571,7 @@ end
 
 Estimate the spectral radius of D⁻¹A using power iteration.
 """
-function _estimate_spectral_radius(A::StaticSparsityMatrixCSR{Tv, Ti},
+function _estimate_spectral_radius(A::CSRMatrix{Tv, Ti},
                                    invdiag::Vector{Tv}; niter::Int=10) where {Tv, Ti}
     n = size(A, 1)
     v = randn(Tv, n)
@@ -597,7 +597,7 @@ end
 Build a Chebyshev polynomial smoother. Estimates eigenvalues of D⁻¹A and
 constructs a degree-`degree` Chebyshev iteration.
 """
-function build_chebyshev_smoother(A::StaticSparsityMatrixCSR{Tv, Ti};
+function build_chebyshev_smoother(A::CSRMatrix{Tv, Ti};
                                   degree::Int=3) where {Tv, Ti}
     n = size(A, 1)
     invdiag = Vector{Tv}(undef, n)
@@ -611,8 +611,8 @@ function build_chebyshev_smoother(A::StaticSparsityMatrixCSR{Tv, Ti};
     return ChebyshevSmoother{Tv}(invdiag, tmp1, tmp2, λ_min, λ_max, degree)
 end
 
-function update_smoother!(smoother::ChebyshevSmoother, A::StaticSparsityMatrixCSR;
-                          backend=CPU())
+function update_smoother!(smoother::ChebyshevSmoother, A::CSRMatrix;
+                          backend=DEFAULT_BACKEND)
     compute_inverse_diagonal!(smoother.invdiag, A; backend=backend)
     ρ = _estimate_spectral_radius(A, smoother.invdiag)
     smoother.λ_max = eltype(smoother.invdiag)(1.1) * ρ
@@ -631,8 +631,8 @@ end
 Apply Chebyshev polynomial smoothing. Each step applies the full polynomial
 of the configured degree using the standard three-term recurrence.
 """
-function smooth!(x::AbstractVector, A::StaticSparsityMatrixCSR, b::AbstractVector,
-                 smoother::ChebyshevSmoother; steps::Int=1, backend=CPU())
+function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
+                 smoother::ChebyshevSmoother; steps::Int=1, backend=DEFAULT_BACKEND)
     n = size(A, 1)
     Tv = eltype(x)
     nzv = nonzeros(A)
@@ -685,7 +685,7 @@ end
     end
 end
 
-function build_smoother(A::StaticSparsityMatrixCSR, ::ChebyshevSmootherType, ω::Real)
+function build_smoother(A::CSRMatrix, ::ChebyshevSmootherType, ω::Real; backend=DEFAULT_BACKEND)
     return build_chebyshev_smoother(A)
 end
 
@@ -700,7 +700,7 @@ Build a parallel ILU(0) smoother. Computes an incomplete LU factorization with
 the same sparsity pattern as A, using graph coloring for parallel forward/backward
 substitution.
 """
-function build_ilu0_smoother(A::StaticSparsityMatrixCSR{Tv, Ti}) where {Tv, Ti}
+function build_ilu0_smoother(A::CSRMatrix{Tv, Ti}) where {Tv, Ti}
     n = size(A, 1)
     cv = colvals(A)
     nzv = nonzeros(A)
@@ -755,7 +755,7 @@ U_nzval stores upper triangle + diagonal.
 """
 function _ilu0_factorize!(L_nzval::Vector{Tv}, U_nzval::Vector{Tv},
                           diag_idx::Vector{Ti},
-                          A::StaticSparsityMatrixCSR{Tv, Ti}) where {Tv, Ti}
+                          A::CSRMatrix{Tv, Ti}) where {Tv, Ti}
     n = size(A, 1)
     cv = colvals(A)
     nzv = nonzeros(A)
@@ -834,8 +834,8 @@ function _find_nz_in_row(cv::Vector{Ti}, start::Ti, stop::Ti, col::Ti) where Ti
     return Ti(0)
 end
 
-function update_smoother!(smoother::ILU0Smoother, A::StaticSparsityMatrixCSR;
-                          backend=CPU())
+function update_smoother!(smoother::ILU0Smoother, A::CSRMatrix;
+                          backend=DEFAULT_BACKEND)
     _ilu0_factorize!(smoother.L_nzval, smoother.U_nzval, smoother.diag_idx, A)
     return smoother
 end
@@ -846,8 +846,8 @@ end
 Apply ILU(0) smoothing: x += (LU)⁻¹ (b - Ax).
 Uses sequential forward/backward substitution for robustness.
 """
-function smooth!(x::AbstractVector, A::StaticSparsityMatrixCSR, b::AbstractVector,
-                 smoother::ILU0Smoother; steps::Int=1, backend=CPU())
+function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
+                 smoother::ILU0Smoother; steps::Int=1, backend=DEFAULT_BACKEND)
     n = size(A, 1)
     Tv = eltype(x)
     nzv = nonzeros(A)
@@ -890,6 +890,6 @@ function smooth!(x::AbstractVector, A::StaticSparsityMatrixCSR, b::AbstractVecto
     return x
 end
 
-function build_smoother(A::StaticSparsityMatrixCSR, ::ILU0SmootherType, ω::Real)
+function build_smoother(A::CSRMatrix, ::ILU0SmootherType, ω::Real; backend=DEFAULT_BACKEND)
     return build_ilu0_smoother(A)
 end

@@ -2,10 +2,10 @@
     compute_coarse_sparsity(A_fine, P, n_coarse)
 
 Determine the sparsity pattern of the coarse grid operator A_c = P^T A_f P.
-Returns a StaticSparsityMatrixCSR with the correct structure and values,
+Returns a CSRMatrix with the correct structure and values,
 and a RestrictionMap for in-place updates.
 """
-function compute_coarse_sparsity(A_fine::StaticSparsityMatrixCSR{Tv, Ti},
+function compute_coarse_sparsity(A_fine::CSRMatrix{Tv, Ti},
                                  P::ProlongationOp{Ti, Tv},
                                  n_coarse::Int) where {Tv, Ti}
     n_fine = size(A_fine, 1)
@@ -67,7 +67,7 @@ function compute_coarse_sparsity(A_fine::StaticSparsityMatrixCSR{Tv, Ti},
         coarse_nz_map[(I, J)] = idx
         pos[I] += 1
     end
-    A_coarse = StaticSparsityMatrixCSR(n_coarse, n_coarse, rowptr_c, colval_c, nzval_c)
+    A_coarse = CSRMatrix{Tv, Ti}(rowptr_c, colval_c, nzval_c, n_coarse, n_coarse)
     # Fill coarse NZ indices in the triple map
     # Re-iterate over the same order to fill triple_ci
     k = 0
@@ -95,11 +95,11 @@ In-place Galerkin product: recompute A_coarse values from A_fine and P,
 using the precomputed restriction map. This is used during resetup.
 Uses KernelAbstractions for parallel execution over all triples.
 """
-function galerkin_product!(A_coarse::StaticSparsityMatrixCSR{Tv, Ti},
-                           A_fine::StaticSparsityMatrixCSR{Tv, Ti},
+function galerkin_product!(A_coarse::CSRMatrix{Tv, Ti},
+                           A_fine::CSRMatrix{Tv, Ti},
                            P::ProlongationOp{Ti, Tv},
                            r_map::RestrictionMap{Ti};
-                           backend=CPU()) where {Tv, Ti}
+                           backend=DEFAULT_BACKEND) where {Tv, Ti}
     nzv_c = nonzeros(A_coarse)
     nzv_f = nonzeros(A_fine)
     # Zero out coarse matrix values

@@ -2,7 +2,7 @@
     compute_coarse_sparsity(A_fine, P, n_coarse)
 
 Determine the sparsity pattern of the coarse grid operator A_c = P^T A_f P.
-Returns a StaticSparsityMatrixCSR with the correct structure and zero values,
+Returns a StaticSparsityMatrixCSR with the correct structure and values,
 and a RestrictionMap for in-place updates.
 """
 function compute_coarse_sparsity(A_fine::StaticSparsityMatrixCSR{Tv, Ti},
@@ -12,11 +12,12 @@ function compute_coarse_sparsity(A_fine::StaticSparsityMatrixCSR{Tv, Ti},
     cv_a = colvals(A_fine)
     nzv_a = nonzeros(A_fine)
     # Determine which (I,J) pairs exist in A_c
-    # For each nonzero A_f[i,j], it contributes to A_c[agg_i, agg_j] for each
-    # (agg_i in P-cols of row i) × (agg_j in P-cols of row j)
-    # For piecewise-constant P, each row has exactly one column.
-    # Build set of (I,J) pairs
     coarse_entries = Dict{Tuple{Int,Int}, Tv}()
+    # Also build the triple map for resetup
+    triple_ci = Ti[]  # coarse NZ index
+    triple_pi = Ti[]  # P.nzval index for p_i
+    triple_ai = Ti[]  # A.nzval index for a_ij
+    triple_pj = Ti[]  # P.nzval index for p_j
     @inbounds for i in 1:n_fine
         for pnz_i in P.rowptr[i]:(P.rowptr[i+1]-1)
             I = P.colval[pnz_i]
@@ -30,23 +31,25 @@ function compute_coarse_sparsity(A_fine::StaticSparsityMatrixCSR{Tv, Ti},
                     key = (I, J)
                     val = p_i * a_ij * p_j
                     coarse_entries[key] = get(coarse_entries, key, zero(Tv)) + val
+                    # Store triple (coarse NZ index will be filled after we build the CSR)
+                    push!(triple_pi, Ti(pnz_i))
+                    push!(triple_ai, Ti(anz))
+                    push!(triple_pj, Ti(pnz_j))
+                    push!(triple_ci, Ti(0))  # placeholder
                 end
             end
         end
     end
     # Build CSR arrays for coarse matrix
-    # Sort entries by (row, col)
     sorted_keys = sort!(collect(keys(coarse_entries)))
     nnz_c = length(sorted_keys)
     rowptr_c = Vector{Ti}(undef, n_coarse + 1)
     colval_c = Vector{Ti}(undef, nnz_c)
     nzval_c = Vector{Tv}(undef, nnz_c)
     fill!(rowptr_c, Ti(0))
-    # Count entries per row
     for (I, J) in sorted_keys
         rowptr_c[I] += 1
     end
-    # Cumulative sum
     running_sum = Ti(1)
     for i in 1:n_coarse
         count = rowptr_c[i]
@@ -54,17 +57,20 @@ function compute_coarse_sparsity(A_fine::StaticSparsityMatrixCSR{Tv, Ti},
         running_sum += count
     end
     rowptr_c[n_coarse + 1] = running_sum
-    # Fill column indices and values
     pos = copy(rowptr_c[1:n_coarse])
+    # Build a (I,J) → nz_index map
+    coarse_nz_map = Dict{Tuple{Int,Int}, Ti}()
     for (I, J) in sorted_keys
         idx = pos[I]
         colval_c[idx] = Ti(J)
         nzval_c[idx] = coarse_entries[(I, J)]
+        coarse_nz_map[(I, J)] = idx
         pos[I] += 1
     end
     A_coarse = StaticSparsityMatrixCSR(n_coarse, n_coarse, rowptr_c, colval_c, nzval_c)
-    # Build restriction map: for each nonzero in A_fine, find corresponding position in A_coarse
-    fine_to_coarse_nz = Vector{Ti}(undef, nnz(A_fine))
+    # Fill coarse NZ indices in the triple map
+    # Re-iterate over the same order to fill triple_ci
+    k = 0
     @inbounds for i in 1:n_fine
         for pnz_i in P.rowptr[i]:(P.rowptr[i+1]-1)
             I = P.colval[pnz_i]
@@ -72,14 +78,13 @@ function compute_coarse_sparsity(A_fine::StaticSparsityMatrixCSR{Tv, Ti},
                 j = cv_a[anz]
                 for pnz_j in P.rowptr[j]:(P.rowptr[j+1]-1)
                     J = P.colval[pnz_j]
-                    # Find position of (I,J) in A_coarse
-                    idx = find_nz_index(A_coarse, I, J)
-                    fine_to_coarse_nz[anz] = Ti(idx)
+                    k += 1
+                    triple_ci[k] = coarse_nz_map[(Int(I), Int(J))]
                 end
             end
         end
     end
-    r_map = RestrictionMap{Ti}(fine_to_coarse_nz)
+    r_map = RestrictionMap{Ti}(triple_ci, triple_pi, triple_ai, triple_pj)
     return A_coarse, r_map
 end
 
@@ -88,7 +93,7 @@ end
 
 In-place Galerkin product: recompute A_coarse values from A_fine and P,
 using the precomputed restriction map. This is used during resetup.
-Uses KernelAbstractions for parallel execution.
+Uses KernelAbstractions for parallel execution over all triples.
 """
 function galerkin_product!(A_coarse::StaticSparsityMatrixCSR{Tv, Ti},
                            A_fine::StaticSparsityMatrixCSR{Tv, Ti},
@@ -97,36 +102,25 @@ function galerkin_product!(A_coarse::StaticSparsityMatrixCSR{Tv, Ti},
                            backend=CPU()) where {Tv, Ti}
     nzv_c = nonzeros(A_coarse)
     nzv_f = nonzeros(A_fine)
-    n_fine = size(A_fine, 1)
     # Zero out coarse matrix values
     fill!(nzv_c, zero(Tv))
-    # Accumulate: use kernel over fine-grid rows
-    rp_a = rowptr(A_fine)
-    cv_a = colvals(A_fine)
-    kernel! = galerkin_row_kernel!(backend, 64)
-    kernel!(nzv_c, nzv_f, cv_a, rp_a,
-            P.rowptr, P.colval, P.nzval,
-            r_map.fine_to_coarse_nz; ndrange=n_fine)
-    KernelAbstractions.synchronize(backend)
+    # Accumulate using kernel over all triples
+    ntriples = length(r_map.triple_coarse_nz)
+    if ntriples > 0
+        kernel! = galerkin_triple_kernel!(backend, 64)
+        kernel!(nzv_c, nzv_f, P.nzval,
+                r_map.triple_coarse_nz, r_map.triple_pi_idx,
+                r_map.triple_anz_idx, r_map.triple_pj_idx; ndrange=ntriples)
+        KernelAbstractions.synchronize(backend)
+    end
     return A_coarse
 end
 
-@kernel function galerkin_row_kernel!(nzv_c, @Const(nzv_f), @Const(cv_a), @Const(rp_a),
-                                      @Const(P_rowptr), @Const(P_colval), @Const(P_nzval),
-                                      @Const(fine_to_coarse_nz))
-    i = @index(Global)
+@kernel function galerkin_triple_kernel!(nzv_c, @Const(nzv_f), @Const(P_nzval),
+                                          @Const(ci), @Const(pi), @Const(ai), @Const(pj))
+    k = @index(Global)
     @inbounds begin
-        for pnz_i in P_rowptr[i]:(P_rowptr[i+1]-1)
-            p_i = P_nzval[pnz_i]
-            for anz in rp_a[i]:(rp_a[i+1]-1)
-                j = cv_a[anz]
-                a_ij = nzv_f[anz]
-                for pnz_j in P_rowptr[j]:(P_rowptr[j+1]-1)
-                    p_j = P_nzval[pnz_j]
-                    c_idx = fine_to_coarse_nz[anz]
-                    Atomix.@atomic nzv_c[c_idx] += p_i * a_ij * p_j
-                end
-            end
-        end
+        val = P_nzval[pi[k]] * nzv_f[ai[k]] * P_nzval[pj[k]]
+        Atomix.@atomic nzv_c[ci[k]] += val
     end
 end

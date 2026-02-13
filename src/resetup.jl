@@ -36,7 +36,10 @@ function amg_resetup!(hierarchy::AMGHierarchy{Tv, Ti},
     # The coarsest matrix (for direct solve) is one level below the last AMG level
     # We need to recompute it using the last level's P and R_map
     _recompute_coarsest_dense!(hierarchy, last_level; backend=backend)
-    hierarchy.coarse_factor = lu(hierarchy.coarse_A)
+    # In-place LU refactorization: copy dense values to LU buffer, then factorize
+    copyto!(hierarchy.coarse_lu, hierarchy.coarse_A)
+    LinearAlgebra.LAPACK.getrf!(hierarchy.coarse_lu, hierarchy.coarse_ipiv)
+    hierarchy.coarse_factor = LU(hierarchy.coarse_lu, hierarchy.coarse_ipiv, 0)
     return hierarchy
 end
 
@@ -101,11 +104,13 @@ end
 """
     _update_coarse_solver!(hierarchy, A; backend=CPU())
 
-Update the direct solver at the coarsest level.
+Update the direct solver at the coarsest level using in-place LU refactorization.
 """
 function _update_coarse_solver!(hierarchy::AMGHierarchy{Tv}, A::StaticSparsityMatrixCSR{Tv};
                                 backend=CPU()) where {Tv}
     _csr_to_dense!(hierarchy.coarse_A, A; backend=backend)
-    hierarchy.coarse_factor = lu(hierarchy.coarse_A)
+    copyto!(hierarchy.coarse_lu, hierarchy.coarse_A)
+    LinearAlgebra.LAPACK.getrf!(hierarchy.coarse_lu, hierarchy.coarse_ipiv)
+    hierarchy.coarse_factor = LU(hierarchy.coarse_lu, hierarchy.coarse_ipiv, 0)
     return hierarchy
 end

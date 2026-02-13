@@ -129,7 +129,119 @@ function coarsen_pmis(A::StaticSparsityMatrixCSR{Tv, Ti}, θ::Real;
     return cf, coarse_map, n_coarse
 end
 
-# ── Aggressive coarsening ────────────────────────────────────────────────────
+# ── HMIS coarsening ──────────────────────────────────────────────────────────
+
+"""
+    coarsen_hmis(A, θ; rng=Random.default_rng())
+
+Hybrid Modified Independent Set (HMIS) coarsening. Like PMIS but uses the
+symmetrized strength graph (intersection of S and S^T) for the independent set
+selection, producing generally less aggressive coarsening. Returns same format
+as `coarsen_pmis`.
+"""
+function coarsen_hmis(A::StaticSparsityMatrixCSR{Tv, Ti}, θ::Real;
+                      rng=Random.default_rng()) where {Tv, Ti}
+    n = size(A, 1)
+    is_strong = strength_graph(A, θ)
+    cv = colvals(A)
+    # Build symmetric strength graph: strong in both directions
+    # is_strong_sym[nz] = true iff is_strong[nz] AND is_strong[reverse nz]
+    is_strong_sym = _symmetrize_strength(A, is_strong)
+    # Compute measure: number of symmetric strong connections + random perturbation
+    measure = zeros(Float64, n)
+    @inbounds for i in 1:n
+        count = 0
+        for nz in nzrange(A, i)
+            if is_strong_sym[nz]
+                count += 1
+            end
+        end
+        measure[i] = Float64(count) + rand(rng)
+    end
+    # CF splitting using symmetrized strength for IS selection
+    cf = zeros(Int, n)
+    max_iter = n + 1
+    for iter in 1:max_iter
+        all_decided = true
+        @inbounds for i in 1:n
+            cf[i] != 0 && continue
+            all_decided = false
+            is_max = true
+            for nz in nzrange(A, i)
+                j = cv[nz]
+                if is_strong_sym[nz] && j != i && cf[j] != -1
+                    if measure[j] > measure[i]
+                        is_max = false
+                        break
+                    end
+                end
+            end
+            if is_max
+                cf[i] = 1
+            end
+        end
+        @inbounds for i in 1:n
+            cf[i] != 0 && continue
+            for nz in nzrange(A, i)
+                j = cv[nz]
+                if is_strong_sym[nz] && cf[j] == 1
+                    cf[i] = -1
+                    break
+                end
+            end
+        end
+        all_decided && break
+    end
+    # Remaining undecided → coarse
+    @inbounds for i in 1:n
+        if cf[i] == 0
+            cf[i] = 1
+        end
+    end
+    # Build coarse map
+    n_coarse = 0
+    coarse_map = zeros(Int, n)
+    @inbounds for i in 1:n
+        if cf[i] == 1
+            n_coarse += 1
+            coarse_map[i] = n_coarse
+        end
+    end
+    return cf, coarse_map, n_coarse
+end
+
+"""
+    _symmetrize_strength(A, is_strong)
+
+Build a symmetrized strength indicator: is_strong_sym[nz] = true iff the
+connection (i,j) is strong AND (j,i) is also strong in the CSR structure.
+"""
+function _symmetrize_strength(A::StaticSparsityMatrixCSR{Tv, Ti}, is_strong::Vector{Bool}) where {Tv, Ti}
+    n = size(A, 1)
+    cv = colvals(A)
+    is_strong_sym = copy(is_strong)
+    @inbounds for i in 1:n
+        for nz in nzrange(A, i)
+            if !is_strong[nz]
+                continue
+            end
+            j = cv[nz]
+            j == i && continue
+            # Check if (j, i) is also strong
+            found_reverse = false
+            for nz2 in nzrange(A, j)
+                if cv[nz2] == i && is_strong[nz2]
+                    found_reverse = true
+                    break
+                end
+            end
+            if !found_reverse
+                is_strong_sym[nz] = false
+            end
+        end
+    end
+    return is_strong_sym
+end
 
 """
     coarsen_aggressive(A, θ; rng=Random.default_rng())
@@ -263,19 +375,35 @@ function coarsen(A::StaticSparsityMatrixCSR, alg::AggregationCoarsening)
     return coarsen_aggregation(A, alg.θ)
 end
 
-function coarsen(A::StaticSparsityMatrixCSR, alg::PMISCoarsening)
-    cf, coarse_map, n_coarse = coarsen_pmis(A, alg.θ)
-    # Convert CF splitting to aggregation: each C-point is its own aggregate,
-    # each F-point is assigned to its strongest C-point neighbor
-    return _cf_to_aggregation(A, cf, coarse_map, n_coarse)
-end
-
 function coarsen(A::StaticSparsityMatrixCSR, alg::AggressiveCoarsening)
     return coarsen_aggressive(A, alg.θ)
 end
 
 """
-Convert a CF splitting to an aggregation vector.
+    uses_cf_splitting(alg)
+
+Return true if the coarsening algorithm produces a CF-splitting (rather than aggregation).
+"""
+uses_cf_splitting(::AggregationCoarsening) = false
+uses_cf_splitting(::AggressiveCoarsening) = false
+uses_cf_splitting(::PMISCoarsening) = true
+uses_cf_splitting(::HMISCoarsening) = true
+
+"""
+    coarsen_cf(A, alg)
+
+Perform CF-splitting coarsening. Returns `(cf, coarse_map, n_coarse)`.
+"""
+function coarsen_cf(A::StaticSparsityMatrixCSR, alg::PMISCoarsening)
+    return coarsen_pmis(A, alg.θ)
+end
+
+function coarsen_cf(A::StaticSparsityMatrixCSR, alg::HMISCoarsening)
+    return coarsen_hmis(A, alg.θ)
+end
+
+"""
+Convert a CF splitting to an aggregation vector (legacy fallback).
 """
 function _cf_to_aggregation(A::StaticSparsityMatrixCSR{Tv, Ti}, cf, coarse_map, n_coarse) where {Tv, Ti}
     n = size(A, 1)

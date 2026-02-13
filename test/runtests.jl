@@ -568,4 +568,304 @@ end
         @test Jutul.operator_nrows(prec) == N
     end
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # HMIS Coarsening
+    # ══════════════════════════════════════════════════════════════════════════
+
+    @testset "HMIS Coarsening" begin
+        A = poisson1d_csr(20)
+        cf, cmap, nc = ParallelAMG.coarsen_hmis(A, 0.25)
+        @test length(cf) == 20
+        @test all(abs.(cf) .== 1)
+        @test nc > 0
+        @test nc < 20
+        # Every fine point should have at least one coarse neighbor
+        cv = colvals(A)
+        for i in 1:20
+            if cf[i] == -1
+                has_coarse = false
+                for nz in nzrange(A, i)
+                    j = cv[nz]
+                    if j != i && cf[j] == 1
+                        has_coarse = true
+                        break
+                    end
+                end
+                @test has_coarse
+            end
+        end
+    end
+
+    @testset "HMIS Coarsening - 2D" begin
+        A = poisson2d_csr(8)
+        cf, cmap, nc = ParallelAMG.coarsen_hmis(A, 0.25)
+        @test nc > 0
+        @test nc < 64
+        @test sum(cf .== 1) == nc
+    end
+
+    @testset "AMG Setup - HMIS" begin
+        A = poisson2d_csr(10)
+        config = AMGConfig(coarsening=HMISCoarsening())
+        hierarchy = amg_setup(A, config)
+        @test length(hierarchy.levels) > 0
+    end
+
+    @testset "AMG Solve - HMIS Direct" begin
+        n = 10
+        A = poisson2d_csr(n)
+        N = n*n
+        b = rand(N)
+        x = zeros(N)
+        config = AMGConfig(coarsening=HMISCoarsening(0.25, DirectInterpolation()),
+                           pre_smoothing_steps=2, post_smoothing_steps=2)
+        hierarchy = amg_setup(A, config)
+        x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r = b - sparse(A.At') * x
+        @test norm(r) / norm(b) < 1e-8
+        @test niter < 200
+    end
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Interpolation Types for PMIS
+    # ══════════════════════════════════════════════════════════════════════════
+
+    @testset "PMIS - Direct Interpolation" begin
+        n = 10
+        A = poisson2d_csr(n)
+        N = n*n
+        b = rand(N)
+        x = zeros(N)
+        config = AMGConfig(coarsening=PMISCoarsening(0.25, DirectInterpolation()),
+                           pre_smoothing_steps=2, post_smoothing_steps=2)
+        hierarchy = amg_setup(A, config)
+        @test length(hierarchy.levels) > 0
+        x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r = b - sparse(A.At') * x
+        @test norm(r) / norm(b) < 1e-8
+        @test niter < 200
+    end
+
+    @testset "PMIS - Standard Interpolation" begin
+        n = 10
+        A = poisson2d_csr(n)
+        N = n*n
+        b = rand(N)
+        x = zeros(N)
+        config = AMGConfig(coarsening=PMISCoarsening(0.25, StandardInterpolation()),
+                           pre_smoothing_steps=2, post_smoothing_steps=2)
+        hierarchy = amg_setup(A, config)
+        @test length(hierarchy.levels) > 0
+        x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r = b - sparse(A.At') * x
+        @test norm(r) / norm(b) < 1e-8
+        @test niter < 200
+    end
+
+    @testset "PMIS - Extended+i Interpolation" begin
+        n = 10
+        A = poisson2d_csr(n)
+        N = n*n
+        b = rand(N)
+        x = zeros(N)
+        config = AMGConfig(coarsening=PMISCoarsening(0.25, ExtendedIInterpolation()),
+                           pre_smoothing_steps=2, post_smoothing_steps=2)
+        hierarchy = amg_setup(A, config)
+        @test length(hierarchy.levels) > 0
+        x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r = b - sparse(A.At') * x
+        @test norm(r) / norm(b) < 1e-8
+        @test niter < 200
+    end
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Interpolation Types for HMIS
+    # ══════════════════════════════════════════════════════════════════════════
+
+    @testset "HMIS - Standard Interpolation" begin
+        n = 10
+        A = poisson2d_csr(n)
+        N = n*n
+        b = rand(N)
+        x = zeros(N)
+        config = AMGConfig(coarsening=HMISCoarsening(0.25, StandardInterpolation()),
+                           pre_smoothing_steps=2, post_smoothing_steps=2)
+        hierarchy = amg_setup(A, config)
+        @test length(hierarchy.levels) > 0
+        x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r = b - sparse(A.At') * x
+        @test norm(r) / norm(b) < 1e-8
+        @test niter < 200
+    end
+
+    @testset "HMIS - Extended+i Interpolation" begin
+        n = 10
+        A = poisson2d_csr(n)
+        N = n*n
+        b = rand(N)
+        x = zeros(N)
+        config = AMGConfig(coarsening=HMISCoarsening(0.25, ExtendedIInterpolation()),
+                           pre_smoothing_steps=2, post_smoothing_steps=2)
+        hierarchy = amg_setup(A, config)
+        @test length(hierarchy.levels) > 0
+        x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r = b - sparse(A.At') * x
+        @test norm(r) / norm(b) < 1e-8
+        @test niter < 200
+    end
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # In-place LU Refactorization
+    # ══════════════════════════════════════════════════════════════════════════
+
+    @testset "In-place LU Refactorization" begin
+        n = 8
+        A = poisson2d_csr(n)
+        N = n*n
+        config = AMGConfig(coarsening=AggregationCoarsening())
+        hierarchy = amg_setup(A, config)
+        # Check that LU buffer is separate from coarse_A
+        @test hierarchy.coarse_lu !== hierarchy.coarse_A
+        @test size(hierarchy.coarse_lu) == size(hierarchy.coarse_A)
+        # Check that ipiv is pre-allocated
+        @test length(hierarchy.coarse_ipiv) == size(hierarchy.coarse_A, 1)
+        # Solve, then resetup with scaled matrix and solve again
+        b = rand(N)
+        x1 = zeros(N)
+        x1, _ = amg_solve!(x1, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r1 = b - sparse(A.At') * x1
+        @test norm(r1) / norm(b) < 1e-8
+        # Track the LU buffer memory address
+        lu_ptr = pointer(hierarchy.coarse_lu)
+        ipiv_ptr = pointer(hierarchy.coarse_ipiv)
+        # Resetup
+        nonzeros(A) .*= 2.0
+        amg_resetup!(hierarchy, A, config)
+        # Verify buffers were reused (same memory)
+        @test pointer(hierarchy.coarse_lu) == lu_ptr
+        @test pointer(hierarchy.coarse_ipiv) == ipiv_ptr
+        # Solve with updated matrix
+        x2 = zeros(N)
+        x2, _ = amg_solve!(x2, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r2 = b - sparse(A.At') * x2
+        @test norm(r2) / norm(b) < 1e-8
+    end
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Initial Coarsening Configuration
+    # ══════════════════════════════════════════════════════════════════════════
+
+    @testset "Initial Coarsening - Default" begin
+        config = AMGConfig(coarsening=AggregationCoarsening())
+        # Default: initial_coarsening == coarsening, initial_coarsening_levels == 0
+        @test config.initial_coarsening isa AggregationCoarsening
+        @test config.initial_coarsening_levels == 0
+        # _get_coarsening_for_level always returns main coarsening when levels=0
+        @test ParallelAMG._get_coarsening_for_level(config, 1) isa AggregationCoarsening
+        @test ParallelAMG._get_coarsening_for_level(config, 5) isa AggregationCoarsening
+    end
+
+    @testset "Initial Coarsening - Custom" begin
+        config = AMGConfig(
+            coarsening=AggregationCoarsening(),
+            initial_coarsening=PMISCoarsening(0.25, DirectInterpolation()),
+            initial_coarsening_levels=2,
+        )
+        @test config.initial_coarsening isa PMISCoarsening
+        @test config.initial_coarsening_levels == 2
+        # Levels 1-2 use initial_coarsening, level 3+ uses main
+        @test ParallelAMG._get_coarsening_for_level(config, 1) isa PMISCoarsening
+        @test ParallelAMG._get_coarsening_for_level(config, 2) isa PMISCoarsening
+        @test ParallelAMG._get_coarsening_for_level(config, 3) isa AggregationCoarsening
+    end
+
+    @testset "Initial Coarsening - Solve" begin
+        n = 10
+        A = poisson2d_csr(n)
+        N = n*n
+        b = rand(N)
+        x = zeros(N)
+        # Use aggressive coarsening for first 2 levels, then aggregation
+        config = AMGConfig(
+            coarsening=AggregationCoarsening(),
+            initial_coarsening=PMISCoarsening(0.25, DirectInterpolation()),
+            initial_coarsening_levels=1,
+            pre_smoothing_steps=2,
+            post_smoothing_steps=2,
+        )
+        hierarchy = amg_setup(A, config)
+        @test length(hierarchy.levels) > 0
+        x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r = b - sparse(A.At') * x
+        @test norm(r) / norm(b) < 1e-8
+        @test niter < 200
+    end
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # CF-splitting Prolongation Properties
+    # ══════════════════════════════════════════════════════════════════════════
+
+    @testset "CF Prolongation - Coarse Points Identity" begin
+        A = poisson1d_csr(20)
+        cf, cmap, nc = ParallelAMG.coarsen_pmis(A, 0.25)
+        # Test all three interpolation types
+        for interp in [DirectInterpolation(), StandardInterpolation(), ExtendedIInterpolation()]
+            P = ParallelAMG.build_cf_prolongation(A, cf, cmap, nc, interp)
+            @test P.nrow == 20
+            @test P.ncol == nc
+            # Coarse points should have identity mapping: P[i, cmap[i]] = 1
+            for i in 1:20
+                if cf[i] == 1
+                    nnz_row = P.rowptr[i+1] - P.rowptr[i]
+                    @test nnz_row == 1
+                    @test P.colval[P.rowptr[i]] == cmap[i]
+                    @test P.nzval[P.rowptr[i]] ≈ 1.0
+                end
+            end
+        end
+    end
+
+    @testset "CF Prolongation - Fine Points Have Entries" begin
+        A = poisson1d_csr(20)
+        cf, cmap, nc = ParallelAMG.coarsen_pmis(A, 0.25)
+        for interp in [DirectInterpolation(), StandardInterpolation(), ExtendedIInterpolation()]
+            P = ParallelAMG.build_cf_prolongation(A, cf, cmap, nc, interp)
+            for i in 1:20
+                if cf[i] == -1
+                    nnz_row = P.rowptr[i+1] - P.rowptr[i]
+                    @test nnz_row >= 1  # every fine point should interpolate from somewhere
+                end
+            end
+        end
+    end
+
+    @testset "Galerkin Product - Multi-entry P" begin
+        A = poisson2d_csr(6)
+        cf, cmap, nc = ParallelAMG.coarsen_pmis(A, 0.25)
+        P = ParallelAMG.build_cf_prolongation(A, cf, cmap, nc, StandardInterpolation())
+        A_coarse, r_map = ParallelAMG.compute_coarse_sparsity(A, P, nc)
+        # Verify against explicit computation
+        I_p = Int[]; J_p = Int[]; V_p = Float64[]
+        for i in 1:P.nrow
+            for nz in P.rowptr[i]:(P.rowptr[i+1]-1)
+                push!(I_p, i); push!(J_p, P.colval[nz]); push!(V_p, P.nzval[nz])
+            end
+        end
+        P_sparse = sparse(I_p, J_p, V_p, P.nrow, P.ncol)
+        A_sparse = sparse(A.At')
+        Ac_explicit = P_sparse' * A_sparse * P_sparse
+        for i in 1:nc, j in 1:nc
+            @test A_coarse[i,j] ≈ Ac_explicit[i,j] atol=1e-10
+        end
+        # Test in-place resetup with triple map
+        nzv = nonzeros(A)
+        nzv .*= 1.5
+        ParallelAMG.galerkin_product!(A_coarse, A, P, r_map)
+        A_sparse2 = sparse(A.At')
+        Ac_explicit2 = P_sparse' * A_sparse2 * P_sparse
+        for i in 1:nc, j in 1:nc
+            @test A_coarse[i,j] ≈ Ac_explicit2[i,j] atol=1e-10
+        end
+    end
+
 end

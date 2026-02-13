@@ -1,3 +1,16 @@
+# ── Interpolation type tags ───────────────────────────────────────────────────
+abstract type InterpolationType end
+
+"""Direct interpolation: interpolate only from directly connected coarse points."""
+struct DirectInterpolation <: InterpolationType end
+
+"""Standard (classical Ruge-Stüben) interpolation: includes indirect contributions
+through strong fine neighbors."""
+struct StandardInterpolation <: InterpolationType end
+
+"""Extended+i interpolation: extends standard by including distance-2 coarse points."""
+struct ExtendedIInterpolation <: InterpolationType end
+
 # ── Coarsening type tags ──────────────────────────────────────────────────────
 abstract type CoarseningAlgorithm end
 
@@ -7,11 +20,23 @@ struct AggregationCoarsening <: CoarseningAlgorithm
 end
 AggregationCoarsening() = AggregationCoarsening(0.25)
 
-"""Parallel Modified Independent Set coarsening."""
+"""Parallel Modified Independent Set coarsening with classical interpolation."""
 struct PMISCoarsening <: CoarseningAlgorithm
     θ::Float64
+    interpolation::InterpolationType
 end
-PMISCoarsening() = PMISCoarsening(0.25)
+PMISCoarsening() = PMISCoarsening(0.25, DirectInterpolation())
+PMISCoarsening(θ::Real) = PMISCoarsening(θ, DirectInterpolation())
+
+"""Hybrid Modified Independent Set coarsening. Uses the symmetrized strength graph
+(intersection of S and S^T) for independent set selection, producing generally
+less aggressive coarsening than PMIS."""
+struct HMISCoarsening <: CoarseningAlgorithm
+    θ::Float64
+    interpolation::InterpolationType
+end
+HMISCoarsening() = HMISCoarsening(0.25, DirectInterpolation())
+HMISCoarsening(θ::Real) = HMISCoarsening(θ, DirectInterpolation())
 
 """Aggressive coarsening (two passes of PMIS-based coarsening)."""
 struct AggressiveCoarsening <: CoarseningAlgorithm
@@ -99,11 +124,15 @@ end
 """
     RestrictionMap{Ti}
 
-Maps each nonzero of A_fine to the corresponding nonzero index in A_coarse,
-enabling in-place Galerkin product computation during resetup.
+Maps the Galerkin product triples (P[i,I], A[i,j], P[j,J]) to coarse matrix
+nonzero indices for in-place Galerkin product computation during resetup.
+Each entry k represents a contribution p_i * a_ij * p_j → A_c[I,J].
 """
 struct RestrictionMap{Ti<:Integer}
-    fine_to_coarse_nz::Vector{Ti}
+    triple_coarse_nz::Vector{Ti}  # coarse NZ index to accumulate into
+    triple_pi_idx::Vector{Ti}     # P.nzval index for p_i weight
+    triple_anz_idx::Vector{Ti}    # A.nzval index for a_ij value
+    triple_pj_idx::Vector{Ti}     # P.nzval index for p_j weight
 end
 
 # ── AMG Level ─────────────────────────────────────────────────────────────────
@@ -127,11 +156,15 @@ end
     AMGHierarchy{Tv, Ti}
 
 Complete AMG hierarchy with multiple levels and a direct solver at the coarsest level.
+The coarse LU factorization uses a pre-allocated buffer and pivot vector for
+in-place refactorization during resetup.
 """
 mutable struct AMGHierarchy{Tv, Ti<:Integer}
     levels::Vector{AMGLevel{Tv, Ti}}
-    coarse_A::Matrix{Tv}       # dense coarse matrix
-    coarse_factor::Any         # LU factorization of coarse_A
+    coarse_A::Matrix{Tv}       # dense coarse matrix (values recomputed each resetup)
+    coarse_lu::Matrix{Tv}      # separate buffer for LU factorization (overwritten by getrf!)
+    coarse_ipiv::Vector{LinearAlgebra.BlasInt}  # pivot vector (reused across resetups)
+    coarse_factor::LU{Tv, Matrix{Tv}, Vector{LinearAlgebra.BlasInt}}  # LU wrapper (references lu/ipiv)
     coarse_x::Vector{Tv}       # workspace for coarsest level
     coarse_b::Vector{Tv}       # workspace for coarsest level
     solve_r::Vector{Tv}        # residual buffer for amg_solve! (finest level size)
@@ -142,6 +175,16 @@ end
     AMGConfig
 
 Configuration for AMG setup.
+
+Fields:
+- `coarsening`: Main coarsening algorithm used at each level (default: `AggregationCoarsening()`)
+- `smoother`: Smoother type (default: `JacobiSmootherType()`)
+- `max_levels`, `max_coarse_size`: Hierarchy limits
+- `pre_smoothing_steps`, `post_smoothing_steps`: Smoothing counts
+- `jacobi_omega`: Damping factor for Jacobi smoother
+- `verbose`: Print hierarchy information and solve diagnostics
+- `initial_coarsening`: Optional alternative coarsening for the first N levels (defaults to `coarsening`)
+- `initial_coarsening_levels`: Number of levels to use `initial_coarsening` for (default: 0)
 """
 struct AMGConfig
     coarsening::CoarseningAlgorithm
@@ -152,6 +195,8 @@ struct AMGConfig
     post_smoothing_steps::Int
     jacobi_omega::Float64
     verbose::Bool
+    initial_coarsening::CoarseningAlgorithm
+    initial_coarsening_levels::Int
 end
 
 function AMGConfig(;
@@ -163,7 +208,23 @@ function AMGConfig(;
     post_smoothing_steps::Int = 1,
     jacobi_omega::Float64 = 2.0/3.0,
     verbose::Bool = false,
+    initial_coarsening::CoarseningAlgorithm = coarsening,
+    initial_coarsening_levels::Int = 0,
 )
     return AMGConfig(coarsening, smoother, max_levels, max_coarse_size,
-                     pre_smoothing_steps, post_smoothing_steps, jacobi_omega, verbose)
+                     pre_smoothing_steps, post_smoothing_steps, jacobi_omega, verbose,
+                     initial_coarsening, initial_coarsening_levels)
+end
+
+"""
+    _get_coarsening_for_level(config, lvl)
+
+Return the coarsening algorithm to use at level `lvl`, accounting for
+the `initial_coarsening` / `initial_coarsening_levels` configuration.
+"""
+function _get_coarsening_for_level(config::AMGConfig, lvl::Int)
+    if lvl <= config.initial_coarsening_levels
+        return config.initial_coarsening
+    end
+    return config.coarsening
 end

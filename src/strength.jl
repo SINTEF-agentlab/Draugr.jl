@@ -203,11 +203,20 @@ value that avoids Inf/NaN.
 """
 function _safe_inv_diag(d::Tv, row_norm::Real) where Tv
     abs_d = abs(d)
-    threshold = eps(real(Tv)) * max(one(real(Tv)), real(Tv)(row_norm))
+    threshold = eps(real(Tv)) * max(one(real(Tv)), convert(real(Tv), row_norm))
     if abs_d > threshold
         return one(Tv) / d
     else
         # Return zero for truly zero diagonal (isolated node)
         return zero(Tv)
     end
+end
+
+"""
+    _safe_threshold(::Type{Tv}, scale)
+
+Compute a safe threshold for near-zero checks: eps(Tv) * max(1, scale).
+"""
+function _safe_threshold(::Type{Tv}, scale::Real) where Tv
+    return eps(real(Tv)) * max(one(real(Tv)), convert(real(Tv), scale))
 end

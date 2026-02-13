@@ -98,12 +98,6 @@ function _smooth_prolongation(A::CSRMatrix{Tv, Ti},
             end
         end
         # If entire row was dropped, preserve at least one entry from P_tent
-        row_has_entry = false
-        for nz in (length(I_p) - length(row_entries) + 1):length(I_p)
-            nz > 0 && (row_has_entry = true; break)
-        end
-        # Check if we actually added any entries for row i
-        row_start = length(I_p)
         found_i = false
         for k in max(1, length(I_p) - length(row_entries) + 1):length(I_p)
             if I_p[k] == Ti(i)

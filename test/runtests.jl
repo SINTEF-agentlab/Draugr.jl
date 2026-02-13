@@ -1338,7 +1338,7 @@ end
         x_w, niter_w = amg_solve!(x_w, b, h_w, config_w; tol=1e-8, maxiter=200)
         r_w = b - sparse(A.At') * x_w
         @test norm(r_w) / norm(b) < 1e-8
-        # W-cycle should converge in <= iterations than V-cycle
+        # W-cycle should converge in fewer or equal iterations than V-cycle
         @test niter_w <= niter_v
     end
 

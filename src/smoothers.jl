@@ -765,21 +765,29 @@ function _ilu0_factorize!(L_nzval::Vector{Tv}, U_nzval::Vector{Tv},
     copyto!(U_nzval, nzv)
     fill!(L_nzval, zero(Tv))
 
+    # Maximum factor growth for ILU entries
+    const_max_ilu_factor = Tv(1e8)
+
     @inbounds for i in 1:n
         # Process row i: for each k < i in row i's lower triangle
         for nz in rp[i]:(diag_idx[i]-1)
             k = cv[nz]
             # L[i,k] = U[i,k] / U[k,k]
             u_kk = U_nzval[diag_idx[k]]
-            if abs(u_kk) < eps(real(Tv)) * max(one(real(Tv)), abs(u_kk))
+            # Use original row k's norm as reference scale for zero check
+            row_k_norm = zero(real(Tv))
+            for nz_k in rp[k]:(rp[k+1]-1)
+                row_k_norm += abs(nzv[nz_k])
+            end
+            if abs(u_kk) < _safe_threshold(Tv, row_k_norm)
                 L_nzval[nz] = zero(Tv)
                 U_nzval[nz] = zero(Tv)
                 continue
             end
             l_ik = U_nzval[nz] / u_kk
             # Clamp to prevent growth
-            if abs(l_ik) > Tv(1e8)
-                l_ik = sign(l_ik) * Tv(1e8)
+            if abs(l_ik) > const_max_ilu_factor
+                l_ik = sign(l_ik) * const_max_ilu_factor
             end
             L_nzval[nz] = l_ik
             U_nzval[nz] = zero(Tv)  # Clear lower triangle in U
@@ -800,8 +808,9 @@ function _ilu0_factorize!(L_nzval::Vector{Tv}, U_nzval::Vector{Tv},
         for nz in rp[i]:(rp[i+1]-1)
             row_norm += abs(nzv[nz])
         end
-        if abs(u_ii) < eps(real(Tv)) * max(one(real(Tv)), row_norm)
-            U_nzval[diag_idx[i]] = eps(real(Tv)) * max(one(real(Tv)), row_norm)
+        safe_thresh = _safe_threshold(Tv, row_norm)
+        if abs(u_ii) < safe_thresh
+            U_nzval[diag_idx[i]] = safe_thresh
         end
     end
     return nothing

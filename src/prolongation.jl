@@ -53,7 +53,7 @@ function _smooth_prolongation(A::StaticSparsityMatrixCSR{Tv, Ti},
                 break
             end
         end
-        invdiag[i] = abs(d) > eps(real(Tv)) * max(one(real(Tv)), abs(d)) ? one(Tv) / d : zero(Tv)
+        invdiag[i] = _safe_inv_diag(d, abs(d))
     end
 
     # Build the smoothed P in COO format
@@ -293,7 +293,7 @@ function _build_interpolation(A::StaticSparsityMatrixCSR{Tv, Ti}, cf::Vector{Int
             else
                 for k in eachindex(strong_coarse_cols)
                     cval[pos] = strong_coarse_cols[k]
-                    nzv_p[pos] = abs(d_i) > eps(real(Tv)) ? -strong_coarse_vals[k] / d_i : zero(Tv)
+                    nzv_p[pos] = abs(d_i) > _safe_threshold(Tv, abs(d_i)) ? -strong_coarse_vals[k] / d_i : zero(Tv)
                     pos += 1
                 end
             end
@@ -388,9 +388,11 @@ function _build_interpolation(A::StaticSparsityMatrixCSR{Tv, Ti}, cf::Vector{Int
             push!(I_p, Ti(i)); push!(J_p, Ti(best_j)); push!(V_p, one(Tv))
         else
             for (cm, val) in contributions
-                w = abs(d_i) > eps(real(Tv)) * max(one(real(Tv)), abs(d_i)) ? -val / d_i : zero(Tv)
-                # Clamp weight to avoid explosion
-                w = clamp(real(w), real(Tv)(-10), real(Tv)(10)) |> Tv
+                w = abs(d_i) > _safe_threshold(Tv, abs(d_i)) ? -val / d_i : zero(Tv)
+                # Clamp weight magnitude to avoid explosion
+                if abs(w) > 10
+                    w *= Tv(10) / abs(w)
+                end
                 push!(I_p, Ti(i)); push!(J_p, Ti(cm)); push!(V_p, w)
             end
         end
@@ -477,9 +479,11 @@ function _build_interpolation(A::StaticSparsityMatrixCSR{Tv, Ti}, cf::Vector{Int
             # Compute raw weights, then truncate and normalize to avoid instability
             raw_weights = Dict{Int, Tv}()
             for (cm, val) in extended_coarse
-                w = abs(d_i) > eps(real(Tv)) * max(one(real(Tv)), abs(d_i)) ? -val / d_i : zero(Tv)
-                # Clamp weight to avoid explosion
-                w = clamp(real(w), real(Tv)(-10), real(Tv)(10)) |> Tv
+                w = abs(d_i) > _safe_threshold(Tv, abs(d_i)) ? -val / d_i : zero(Tv)
+                # Clamp weight magnitude to avoid explosion
+                if abs(w) > 10
+                    w *= Tv(10) / abs(w)
+                end
                 raw_weights[cm] = w
             end
             # Truncation: drop entries with |w| < 0.1 * max|w| and redistribute

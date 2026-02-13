@@ -22,6 +22,141 @@ function build_prolongation(A::StaticSparsityMatrixCSR{Tv, Ti}, agg::Vector{Int}
 end
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Smoothed aggregation: P_smooth = (I - ω D⁻¹ A) P_tent
+# ══════════════════════════════════════════════════════════════════════════════
+
+"""
+    _smooth_prolongation(A, P_tent, ω)
+
+Smooth a tentative (piecewise-constant) prolongation operator using a damped
+Jacobi step: P = (I - ω D⁻¹ A) P_tent.
+
+The result has the sparsity pattern of A * P_tent (union of P_tent sparsity and
+one ring of neighbors through A).
+"""
+function _smooth_prolongation(A::StaticSparsityMatrixCSR{Tv, Ti},
+                              P_tent::ProlongationOp{Ti, Tv},
+                              ω::Real) where {Tv, Ti}
+    n_fine = P_tent.nrow
+    n_coarse = P_tent.ncol
+    cv_a = colvals(A)
+    nzv_a = nonzeros(A)
+    rp_a = rowptr(A)
+
+    # Compute inverse diagonal of A
+    invdiag = Vector{Tv}(undef, n_fine)
+    @inbounds for i in 1:n_fine
+        d = zero(Tv)
+        for nz in rp_a[i]:(rp_a[i+1]-1)
+            if cv_a[nz] == i
+                d = nzv_a[nz]
+                break
+            end
+        end
+        invdiag[i] = abs(d) > eps(Tv) ? one(Tv) / d : zero(Tv)
+    end
+
+    # Build the smoothed P in COO format
+    # P_smooth[i, J] = P_tent[i, J] - ω * invdiag[i] * Σ_j a_{i,j} * P_tent[j, J]
+    I_p = Ti[]
+    J_p = Ti[]
+    V_p = Tv[]
+
+    @inbounds for i in 1:n_fine
+        # Collect contributions for row i
+        row_entries = Dict{Int, Tv}()
+
+        # Term 1: P_tent[i, :]
+        for pnz in P_tent.rowptr[i]:(P_tent.rowptr[i+1]-1)
+            J = P_tent.colval[pnz]
+            row_entries[Int(J)] = get(row_entries, Int(J), zero(Tv)) + P_tent.nzval[pnz]
+        end
+
+        # Term 2: -ω * invdiag[i] * Σ_j a_{i,j} * P_tent[j, :]
+        factor = -Tv(ω) * invdiag[i]
+        for anz in rp_a[i]:(rp_a[i+1]-1)
+            j = cv_a[anz]
+            a_ij = nzv_a[anz]
+            w = factor * a_ij
+            for pnz in P_tent.rowptr[j]:(P_tent.rowptr[j+1]-1)
+                J = P_tent.colval[pnz]
+                row_entries[Int(J)] = get(row_entries, Int(J), zero(Tv)) + w * P_tent.nzval[pnz]
+            end
+        end
+
+        for (J, val) in row_entries
+            push!(I_p, Ti(i))
+            push!(J_p, Ti(J))
+            push!(V_p, val)
+        end
+    end
+
+    return _coo_to_prolongation(I_p, J_p, V_p, n_fine, n_coarse)
+end
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Prolongation filtering
+# ══════════════════════════════════════════════════════════════════════════════
+
+"""
+    _filter_prolongation(P, tol)
+
+Filter (drop) small entries from the prolongation operator P. For each row i,
+entries with |p_{i,j}| < tol * max_j |p_{i,j}| are dropped. Remaining entries
+are rescaled so each row sums to 1 (for tentative/aggregation P) or preserves
+coarse-point identity mappings.
+"""
+function _filter_prolongation(P::ProlongationOp{Ti, Tv}, tol::Real) where {Ti, Tv}
+    n_fine = P.nrow
+    n_coarse = P.ncol
+
+    I_p = Ti[]
+    J_p = Ti[]
+    V_p = Tv[]
+
+    @inbounds for i in 1:n_fine
+        rstart = P.rowptr[i]
+        rend = P.rowptr[i+1] - 1
+        rstart > rend && continue
+
+        # Find max absolute value in this row
+        max_val = zero(real(Tv))
+        for nz in rstart:rend
+            max_val = max(max_val, abs(P.nzval[nz]))
+        end
+        threshold = Tv(tol) * max_val
+
+        # Collect entries above threshold
+        row_sum = zero(Tv)
+        for nz in rstart:rend
+            if abs(P.nzval[nz]) >= threshold
+                push!(I_p, Ti(i))
+                push!(J_p, P.colval[nz])
+                push!(V_p, P.nzval[nz])
+                row_sum += P.nzval[nz]
+            end
+        end
+
+        # If all entries were dropped, keep the largest
+        if isempty(I_p) || I_p[end] != Ti(i)
+            best_nz = rstart
+            best_val = zero(real(Tv))
+            for nz in rstart:rend
+                if abs(P.nzval[nz]) > best_val
+                    best_val = abs(P.nzval[nz])
+                    best_nz = nz
+                end
+            end
+            push!(I_p, Ti(i))
+            push!(J_p, P.colval[best_nz])
+            push!(V_p, P.nzval[best_nz])
+        end
+    end
+
+    return _coo_to_prolongation(I_p, J_p, V_p, n_fine, n_coarse)
+end
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Classical interpolation methods for CF-splitting based coarsening
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -313,9 +448,31 @@ function _build_interpolation(A::StaticSparsityMatrixCSR{Tv, Ti}, cf::Vector{Int
             best_j = _find_nearest_coarse(A, i, cf, coarse_map)
             push!(I_p, Ti(i)); push!(J_p, Ti(best_j)); push!(V_p, one(Tv))
         else
+            # Compute raw weights, then truncate and normalize to avoid instability
+            raw_weights = Dict{Int, Tv}()
             for (cm, val) in extended_coarse
                 w = abs(d_i) > eps(Tv) ? -val / d_i : zero(Tv)
-                push!(I_p, Ti(i)); push!(J_p, Ti(cm)); push!(V_p, w)
+                raw_weights[cm] = w
+            end
+            # Truncation: drop entries with |w| < 0.1 * max|w| and redistribute
+            max_w = maximum(abs, values(raw_weights))
+            trunc_threshold = Tv(0.1) * max_w
+            for (cm, w) in raw_weights
+                if abs(w) >= trunc_threshold
+                    push!(I_p, Ti(i)); push!(J_p, Ti(cm)); push!(V_p, w)
+                end
+            end
+            # If everything was truncated, keep the largest
+            if isempty(I_p) || I_p[end] != Ti(i)
+                best_cm = first(keys(raw_weights))
+                best_w = zero(real(Tv))
+                for (cm, w) in raw_weights
+                    if abs(w) > best_w
+                        best_w = abs(w)
+                        best_cm = cm
+                    end
+                end
+                push!(I_p, Ti(i)); push!(J_p, Ti(best_cm)); push!(V_p, raw_weights[best_cm])
             end
         end
     end

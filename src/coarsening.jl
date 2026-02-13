@@ -371,11 +371,21 @@ end
 
 # ── Dispatch coarsening by type ──────────────────────────────────────────────
 
-function coarsen(A::StaticSparsityMatrixCSR, alg::AggregationCoarsening)
+function coarsen(A::StaticSparsityMatrixCSR, alg::AggregationCoarsening,
+                config::AMGConfig=AMGConfig())
+    if config.max_row_sum > 0
+        A_weak = _apply_max_row_sum(A, config.max_row_sum)
+        return coarsen_aggregation(A_weak, alg.θ)
+    end
     return coarsen_aggregation(A, alg.θ)
 end
 
-function coarsen(A::StaticSparsityMatrixCSR, alg::AggressiveCoarsening)
+function coarsen(A::StaticSparsityMatrixCSR, alg::AggressiveCoarsening,
+                config::AMGConfig=AMGConfig())
+    if config.max_row_sum > 0
+        A_weak = _apply_max_row_sum(A, config.max_row_sum)
+        return coarsen_aggressive(A_weak, alg.θ)
+    end
     return coarsen_aggressive(A, alg.θ)
 end
 
@@ -386,19 +396,31 @@ Return true if the coarsening algorithm produces a CF-splitting (rather than agg
 """
 uses_cf_splitting(::AggregationCoarsening) = false
 uses_cf_splitting(::AggressiveCoarsening) = false
+uses_cf_splitting(::SmoothedAggregationCoarsening) = false
 uses_cf_splitting(::PMISCoarsening) = true
 uses_cf_splitting(::HMISCoarsening) = true
 
 """
-    coarsen_cf(A, alg)
+    coarsen_cf(A, alg, config)
 
 Perform CF-splitting coarsening. Returns `(cf, coarse_map, n_coarse)`.
+When max_row_sum is configured, strength is computed on a weakened matrix.
 """
-function coarsen_cf(A::StaticSparsityMatrixCSR, alg::PMISCoarsening)
+function coarsen_cf(A::StaticSparsityMatrixCSR, alg::PMISCoarsening,
+                    config::AMGConfig=AMGConfig())
+    if config.max_row_sum > 0
+        A_weak = _apply_max_row_sum(A, config.max_row_sum)
+        return coarsen_pmis(A_weak, alg.θ)
+    end
     return coarsen_pmis(A, alg.θ)
 end
 
-function coarsen_cf(A::StaticSparsityMatrixCSR, alg::HMISCoarsening)
+function coarsen_cf(A::StaticSparsityMatrixCSR, alg::HMISCoarsening,
+                    config::AMGConfig=AMGConfig())
+    if config.max_row_sum > 0
+        A_weak = _apply_max_row_sum(A, config.max_row_sum)
+        return coarsen_hmis(A_weak, alg.θ)
+    end
     return coarsen_hmis(A, alg.θ)
 end
 

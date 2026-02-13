@@ -47,7 +47,7 @@ include("jutul_interface.jl")
 # Public API
 export StaticSparsityMatrixCSR, static_sparsity_sparse, static_csr_from_csc
 export colvals, rowptr
-export AggregationCoarsening, PMISCoarsening, HMISCoarsening, AggressiveCoarsening
+export AggregationCoarsening, PMISCoarsening, HMISCoarsening, AggressiveCoarsening, SmoothedAggregationCoarsening
 export DirectInterpolation, StandardInterpolation, ExtendedIInterpolation
 export AMGConfig, AMGHierarchy, AMGLevel
 export amg_setup, amg_resetup!, amg_cycle!, amg_solve!

@@ -14,11 +14,21 @@ struct ExtendedIInterpolation <: InterpolationType end
 # ── Coarsening type tags ──────────────────────────────────────────────────────
 abstract type CoarseningAlgorithm end
 
-"""Greedy aggregation coarsening."""
+"""Greedy aggregation coarsening.
+
+Fields:
+- `θ`: Strength threshold (default: 0.25)
+- `filtering`: If true, filter (drop) small entries from P to improve sparsity (default: false)
+- `filter_tol`: Tolerance for filtering; entries with |p_ij| < filter_tol * max|p_i,:| are dropped (default: 0.1)
+"""
 struct AggregationCoarsening <: CoarseningAlgorithm
     θ::Float64   # strength threshold
+    filtering::Bool
+    filter_tol::Float64
 end
-AggregationCoarsening() = AggregationCoarsening(0.25)
+AggregationCoarsening() = AggregationCoarsening(0.25, false, 0.1)
+AggregationCoarsening(θ::Real) = AggregationCoarsening(θ, false, 0.1)
+AggregationCoarsening(θ::Real, filtering::Bool) = AggregationCoarsening(θ, filtering, 0.1)
 
 """Parallel Modified Independent Set coarsening with classical interpolation."""
 struct PMISCoarsening <: CoarseningAlgorithm
@@ -43,6 +53,25 @@ struct AggressiveCoarsening <: CoarseningAlgorithm
     θ::Float64
 end
 AggressiveCoarsening() = AggressiveCoarsening(0.25)
+
+"""Smoothed aggregation coarsening. Builds a tentative prolongation from aggregation,
+then smooths it with a damped Jacobi step: P = (I - ω D⁻¹ A) P_tent.
+
+Fields:
+- `θ`: Strength threshold (default: 0.25)
+- `ω`: Damping factor for the Jacobi smoothing step (default: 2/3)
+- `filtering`: If true, filter small entries from the smoothed P (default: false)
+- `filter_tol`: Tolerance for filtering (default: 0.1)
+"""
+struct SmoothedAggregationCoarsening <: CoarseningAlgorithm
+    θ::Float64
+    ω::Float64
+    filtering::Bool
+    filter_tol::Float64
+end
+SmoothedAggregationCoarsening() = SmoothedAggregationCoarsening(0.25, 2.0/3.0, false, 0.1)
+SmoothedAggregationCoarsening(θ::Real) = SmoothedAggregationCoarsening(θ, 2.0/3.0, false, 0.1)
+SmoothedAggregationCoarsening(θ::Real, ω::Real) = SmoothedAggregationCoarsening(θ, ω, false, 0.1)
 
 # ── Smoother type tags ────────────────────────────────────────────────────────
 abstract type SmootherType end
@@ -186,6 +215,11 @@ Fields:
 - `verbose`: Print hierarchy information and solve diagnostics
 - `initial_coarsening`: Optional alternative coarsening for the first N levels (defaults to `coarsening`)
 - `initial_coarsening_levels`: Number of levels to use `initial_coarsening` for (default: 0)
+- `min_coarse_ratio`: Minimum ratio n_coarse/n_fine to accept a coarsening level (default: 0.5).
+  If coarsening produces a ratio above this (i.e. too little reduction), coarsening stops.
+- `max_row_sum`: Maximum row sum threshold for dependency weakening (default: 0, disabled).
+  When > 0, rows where |row_sum|/|a_ii| > max_row_sum have their off-diagonal entries scaled
+  down to enforce the threshold, improving AMG robustness for indefinite or nearly singular systems.
 """
 struct AMGConfig
     coarsening::CoarseningAlgorithm
@@ -198,6 +232,8 @@ struct AMGConfig
     verbose::Bool
     initial_coarsening::CoarseningAlgorithm
     initial_coarsening_levels::Int
+    min_coarse_ratio::Float64
+    max_row_sum::Float64
 end
 
 function AMGConfig(;
@@ -211,10 +247,13 @@ function AMGConfig(;
     verbose::Bool = false,
     initial_coarsening::CoarseningAlgorithm = coarsening,
     initial_coarsening_levels::Int = 0,
+    min_coarse_ratio::Float64 = 0.5,
+    max_row_sum::Float64 = 0.0,
 )
     return AMGConfig(coarsening, smoother, max_levels, max_coarse_size,
                      pre_smoothing_steps, post_smoothing_steps, jacobi_omega, verbose,
-                     initial_coarsening, initial_coarsening_levels)
+                     initial_coarsening, initial_coarsening_levels,
+                     min_coarse_ratio, max_row_sum)
 end
 
 """

@@ -19,8 +19,14 @@ function amg_setup(A::StaticSparsityMatrixCSR{Tv, Ti}, config::AMGConfig=AMGConf
         # Select coarsening algorithm for this level
         coarsening_alg = _get_coarsening_for_level(config, lvl)
         # Coarsen and build prolongation
-        P, n_coarse = _coarsen_and_build_P(A_current, coarsening_alg)
+        P, n_coarse = _coarsen_and_build_P(A_current, coarsening_alg, config)
         n_coarse >= n && break  # no coarsening progress
+        # Check minimum coarsening ratio to avoid stalling
+        coarse_ratio = n_coarse / n
+        if coarse_ratio > config.min_coarse_ratio && n_coarse > config.max_coarse_size
+            config.verbose && println("Coarsening stalled at level $lvl: ratio=$(round(coarse_ratio, digits=3)), stopping.")
+            break
+        end
         # Compute coarse operator via Galerkin product
         A_coarse, r_map = compute_coarse_sparsity(A_current, P, n_coarse)
         # Build smoother
@@ -55,22 +61,45 @@ function amg_setup(A::StaticSparsityMatrixCSR{Tv, Ti}, config::AMGConfig=AMGConf
 end
 
 """
-    _coarsen_and_build_P(A, alg)
+    _coarsen_and_build_P(A, alg, config)
 
 Perform coarsening and build the prolongation operator. Dispatches based on
 whether the algorithm uses CF-splitting or aggregation.
+When max_row_sum is configured, strength computation uses a weakened matrix.
 """
-function _coarsen_and_build_P(A::StaticSparsityMatrixCSR, alg::CoarseningAlgorithm)
+function _coarsen_and_build_P(A::StaticSparsityMatrixCSR, alg::CoarseningAlgorithm,
+                              config::AMGConfig=AMGConfig())
     if uses_cf_splitting(alg)
-        cf, coarse_map, n_coarse = coarsen_cf(A, alg)
+        cf, coarse_map, n_coarse = coarsen_cf(A, alg, config)
         P = build_cf_prolongation(A, cf, coarse_map, n_coarse, alg.interpolation)
         return P, n_coarse
     else
-        agg, n_coarse = coarsen(A, alg)
+        agg, n_coarse = coarsen(A, alg, config)
         P = build_prolongation(A, agg, n_coarse)
+        # Apply filtering if requested
+        if _has_filtering(alg) && alg.filtering
+            P = _filter_prolongation(P, alg.filter_tol)
+        end
         return P, n_coarse
     end
 end
+
+function _coarsen_and_build_P(A::StaticSparsityMatrixCSR, alg::SmoothedAggregationCoarsening,
+                              config::AMGConfig=AMGConfig())
+    agg, n_coarse = coarsen(A, AggregationCoarsening(alg.θ), config)
+    P_tent = build_prolongation(A, agg, n_coarse)
+    # Smooth: P = (I - ω D⁻¹ A) P_tent
+    P = _smooth_prolongation(A, P_tent, alg.ω)
+    # Apply filtering if requested
+    if alg.filtering
+        P = _filter_prolongation(P, alg.filter_tol)
+    end
+    return P, n_coarse
+end
+
+_has_filtering(::AggregationCoarsening) = true
+_has_filtering(::SmoothedAggregationCoarsening) = true
+_has_filtering(::CoarseningAlgorithm) = false
 
 """
     _print_hierarchy_info(hierarchy, n_finest, t_setup)

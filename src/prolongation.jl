@@ -57,12 +57,6 @@ function _build_interpolation(A::StaticSparsityMatrixCSR{Tv, Ti}, cf::Vector{Int
     n_fine = size(A, 1)
     cv = colvals(A)
     nzv = nonzeros(A)
-    is_strong = strength_graph(A, zero(Float64))  # recompute, but any entry is "strong" here
-    # Actually, we need the real strength. Let's recompute with a standard threshold.
-    # We use the threshold from the strength graph used during coarsening.
-    # For simplicity, use θ=0.25 (standard). But actually we don't need strength here;
-    # we classify connections based on the CF-splitting and use all coarse connections.
-    # Direct interpolation uses strong coarse neighbors. Recompute strength:
     is_strong = strength_graph(A, 0.25)
 
     # First pass: count entries per row
@@ -106,8 +100,8 @@ function _build_interpolation(A::StaticSparsityMatrixCSR{Tv, Ti}, cf::Vector{Int
             # Compute diagonal correction: d_i = a_{i,i} + Σ weak/fine connections
             a_ii = zero(Tv)
             sum_nonC = zero(Tv)
-            strong_coarse_cols = Ti[]
-            strong_coarse_vals = Tv[]
+            strong_coarse_cols = Vector{Ti}()
+            strong_coarse_vals = Vector{Tv}()
             for nz in nzrange(A, i)
                 j = cv[nz]
                 if j == i

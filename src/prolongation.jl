@@ -127,18 +127,18 @@ function _filter_prolongation(P::ProlongationOp{Ti, Tv}, tol::Real) where {Ti, T
         threshold = Tv(tol) * max_val
 
         # Collect entries above threshold
-        row_sum = zero(Tv)
+        row_count = 0
         for nz in rstart:rend
             if abs(P.nzval[nz]) >= threshold
                 push!(I_p, Ti(i))
                 push!(J_p, P.colval[nz])
                 push!(V_p, P.nzval[nz])
-                row_sum += P.nzval[nz]
+                row_count += 1
             end
         end
 
         # If all entries were dropped, keep the largest
-        if isempty(I_p) || I_p[end] != Ti(i)
+        if row_count == 0
             best_nz = rstart
             best_val = zero(real(Tv))
             for nz in rstart:rend
@@ -457,13 +457,15 @@ function _build_interpolation(A::StaticSparsityMatrixCSR{Tv, Ti}, cf::Vector{Int
             # Truncation: drop entries with |w| < 0.1 * max|w| and redistribute
             max_w = maximum(abs, values(raw_weights))
             trunc_threshold = Tv(0.1) * max_w
+            trunc_count = 0
             for (cm, w) in raw_weights
                 if abs(w) >= trunc_threshold
                     push!(I_p, Ti(i)); push!(J_p, Ti(cm)); push!(V_p, w)
+                    trunc_count += 1
                 end
             end
             # If everything was truncated, keep the largest
-            if isempty(I_p) || I_p[end] != Ti(i)
+            if trunc_count == 0
                 best_cm = first(keys(raw_weights))
                 best_w = zero(real(Tv))
                 for (cm, w) in raw_weights

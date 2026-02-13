@@ -53,7 +53,7 @@ function _smooth_prolongation(A::StaticSparsityMatrixCSR{Tv, Ti},
                 break
             end
         end
-        invdiag[i] = abs(d) > eps(Tv) ? one(Tv) / d : zero(Tv)
+        invdiag[i] = abs(d) > eps(real(Tv)) * max(one(real(Tv)), abs(d)) ? one(Tv) / d : zero(Tv)
     end
 
     # Build the smoothed P in COO format
@@ -182,9 +182,12 @@ Direct interpolation: for each fine point i, interpolate only from directly
 connected strong coarse neighbors. Weak and fine connections are lumped
 into the diagonal.
 
+Handles "wrong"-sign off-diagonals (positive off-diags when diagonal is positive):
+such connections are treated as weak and lumped into the diagonal correction.
+
 P[i, coarse_map[i]] = 1 for coarse points.
 P[i, coarse_map[j]] = -a_{i,j} / d_i for fine points, where j ∈ C_i^s and
-d_i = a_{i,i} + Σ_{k ∈ weak ∪ F_i^s} a_{i,k}.
+d_i = a_{i,i} + Σ_{k ∈ weak ∪ F_i^s ∪ same_sign} a_{i,k}.
 """
 function _build_interpolation(A::StaticSparsityMatrixCSR{Tv, Ti}, cf::Vector{Int},
                               coarse_map::Vector{Int}, n_coarse::Int,
@@ -200,12 +203,24 @@ function _build_interpolation(A::StaticSparsityMatrixCSR{Tv, Ti}, cf::Vector{Int
         if cf[i] == 1
             row_counts[i] = 1  # coarse point: identity mapping
         else
-            # Fine point: count strong coarse neighbors
+            # Find diagonal sign
+            a_ii = zero(Tv)
+            for nz in nzrange(A, i)
+                if cv[nz] == i
+                    a_ii = nzv[nz]
+                    break
+                end
+            end
+            diag_sign = sign(real(a_ii))
+            # Fine point: count strong coarse neighbors with opposite sign
             for nz in nzrange(A, i)
                 j = cv[nz]
                 j == i && continue
                 if is_strong[nz] && cf[j] == 1
-                    row_counts[i] += 1
+                    # Only interpolate from opposite-sign connections
+                    if diag_sign == 0 || sign(real(nzv[nz])) != diag_sign
+                        row_counts[i] += 1
+                    end
                 end
             end
             if row_counts[i] == 0
@@ -232,16 +247,25 @@ function _build_interpolation(A::StaticSparsityMatrixCSR{Tv, Ti}, cf::Vector{Int
             cval[pos] = Ti(coarse_map[i])
             nzv_p[pos] = one(Tv)
         else
-            # Compute diagonal correction: d_i = a_{i,i} + Σ weak/fine connections
+            # Compute diagonal correction: d_i = a_{i,i} + Σ weak/fine/same-sign connections
             a_ii = zero(Tv)
             sum_nonC = zero(Tv)
             strong_coarse_cols = Vector{Ti}()
             strong_coarse_vals = Vector{Tv}()
+            diag_sign = zero(real(Tv))
             for nz in nzrange(A, i)
                 j = cv[nz]
                 if j == i
                     a_ii = nzv[nz]
-                elseif is_strong[nz] && cf[j] == 1
+                    diag_sign = sign(real(a_ii))
+                end
+            end
+            for nz in nzrange(A, i)
+                j = cv[nz]
+                j == i && continue
+                is_interp_coarse = is_strong[nz] && cf[j] == 1 &&
+                    (diag_sign == 0 || sign(real(nzv[nz])) != diag_sign)
+                if is_interp_coarse
                     push!(strong_coarse_cols, Ti(coarse_map[j]))
                     push!(strong_coarse_vals, nzv[nz])
                 else
@@ -269,7 +293,7 @@ function _build_interpolation(A::StaticSparsityMatrixCSR{Tv, Ti}, cf::Vector{Int
             else
                 for k in eachindex(strong_coarse_cols)
                     cval[pos] = strong_coarse_cols[k]
-                    nzv_p[pos] = abs(d_i) > eps(Tv) ? -strong_coarse_vals[k] / d_i : zero(Tv)
+                    nzv_p[pos] = abs(d_i) > eps(real(Tv)) ? -strong_coarse_vals[k] / d_i : zero(Tv)
                     pos += 1
                 end
             end
@@ -364,7 +388,9 @@ function _build_interpolation(A::StaticSparsityMatrixCSR{Tv, Ti}, cf::Vector{Int
             push!(I_p, Ti(i)); push!(J_p, Ti(best_j)); push!(V_p, one(Tv))
         else
             for (cm, val) in contributions
-                w = abs(d_i) > eps(Tv) ? -val / d_i : zero(Tv)
+                w = abs(d_i) > eps(real(Tv)) * max(one(real(Tv)), abs(d_i)) ? -val / d_i : zero(Tv)
+                # Clamp weight to avoid explosion
+                w = clamp(real(w), real(Tv)(-10), real(Tv)(10)) |> Tv
                 push!(I_p, Ti(i)); push!(J_p, Ti(cm)); push!(V_p, w)
             end
         end
@@ -451,7 +477,9 @@ function _build_interpolation(A::StaticSparsityMatrixCSR{Tv, Ti}, cf::Vector{Int
             # Compute raw weights, then truncate and normalize to avoid instability
             raw_weights = Dict{Int, Tv}()
             for (cm, val) in extended_coarse
-                w = abs(d_i) > eps(Tv) ? -val / d_i : zero(Tv)
+                w = abs(d_i) > eps(real(Tv)) * max(one(real(Tv)), abs(d_i)) ? -val / d_i : zero(Tv)
+                # Clamp weight to avoid explosion
+                w = clamp(real(w), real(Tv)(-10), real(Tv)(10)) |> Tv
                 raw_weights[cm] = w
             end
             # Truncation: drop entries with |w| < 0.1 * max|w| and redistribute

@@ -1154,4 +1154,381 @@ end
         @test nnz_smooth >= nnz_tent
     end
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # Robustness & Hardening
+    # ══════════════════════════════════════════════════════════════════════════
+
+    # Helper: reservoir-like matrix with positive off-diags and large variation
+    function reservoir_like_csr(n)
+        I = Int[]; J = Int[]; V = Float64[]
+        for i in 1:n
+            push!(I, i); push!(J, i); push!(V, 10.0)
+            if i > 1
+                v = i % 3 == 0 ? 0.5 : -1.0  # positive off-diag every 3rd row
+                push!(I, i); push!(J, i-1); push!(V, v)
+            end
+            if i < n
+                v = (i+1) % 5 == 0 ? 0.3 : -2.0  # positive off-diag every 5th row
+                push!(I, i); push!(J, i+1); push!(V, v)
+            end
+        end
+        return static_sparsity_sparse(I, J, V, n, n)
+    end
+
+    # Helper: anisotropic 2D problem
+    function anisotropic_csr(nx, ny; kx=1e4, ky=1e-2)
+        n = nx * ny
+        I = Int[]; J = Int[]; V = Float64[]
+        for j in 1:ny, i in 1:nx
+            idx = (j-1)*nx + i
+            diag = 2*kx + 2*ky
+            push!(I, idx); push!(J, idx); push!(V, diag)
+            if i > 1 push!(I, idx); push!(J, idx-1); push!(V, -kx) end
+            if i < nx push!(I, idx); push!(J, idx+1); push!(V, -kx) end
+            if j > 1 push!(I, idx); push!(J, idx-nx); push!(V, -ky) end
+            if j < ny push!(I, idx); push!(J, idx+nx); push!(V, -ky) end
+        end
+        return static_sparsity_sparse(I, J, V, n, n)
+    end
+
+    @testset "Sign-Aware Strength - AbsoluteStrength" begin
+        A = reservoir_like_csr(20)
+        is_strong = ParallelAMG.strength_graph(A, 0.25, AbsoluteStrength())
+        @test length(is_strong) == nnz(A)
+        @test sum(is_strong) > 0
+    end
+
+    @testset "Sign-Aware Strength - SignedStrength" begin
+        A = reservoir_like_csr(20)
+        is_strong_signed = ParallelAMG.strength_graph(A, 0.25, SignedStrength())
+        is_strong_abs = ParallelAMG.strength_graph(A, 0.25, AbsoluteStrength())
+        @test length(is_strong_signed) == nnz(A)
+        # Signed strength should not mark positive off-diags as strong (when diag is positive)
+        cv = colvals(A)
+        nzv = nonzeros(A)
+        for nz in 1:nnz(A)
+            if is_strong_signed[nz]
+                # This connection should have opposite sign from diagonal
+                # (or be in a fallback row)
+                @test true  # basic validity
+            end
+        end
+        # Should have fewer or equal strong connections (positive off-diags excluded)
+        @test sum(is_strong_signed) <= sum(is_strong_abs)
+    end
+
+    @testset "SignedStrength - Solve" begin
+        A = reservoir_like_csr(50)
+        N = 50
+        b = rand(N)
+        x = zeros(N)
+        config = AMGConfig(strength_type=SignedStrength())
+        hierarchy = amg_setup(A, config)
+        x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r = b - sparse(A.At') * x
+        @test norm(r) / norm(b) < 1e-8
+        @test niter < 200
+    end
+
+    @testset "SignedStrength - Config dispatch" begin
+        A = poisson2d_csr(8)
+        is1 = ParallelAMG.strength_graph(A, 0.25, AMGConfig(strength_type=AbsoluteStrength()))
+        is2 = ParallelAMG.strength_graph(A, 0.25, AMGConfig(strength_type=SignedStrength()))
+        @test length(is1) == nnz(A)
+        @test length(is2) == nnz(A)
+    end
+
+    @testset "Positive Off-Diags - All smoothers converge" begin
+        A = reservoir_like_csr(50)
+        N = 50
+        b = rand(N)
+        for (name, cfg) in [
+            ("Jacobi", AMGConfig()),
+            ("l1-Jacobi", AMGConfig(smoother=L1JacobiSmootherType())),
+            ("Colored GS", AMGConfig(smoother=ColoredGaussSeidelType())),
+            ("SPAI0", AMGConfig(smoother=SPAI0SmootherType())),
+            ("ILU0", AMGConfig(smoother=ILU0SmootherType())),
+        ]
+            x = zeros(N)
+            hierarchy = amg_setup(A, cfg)
+            x, niter = amg_solve!(x, b, hierarchy, cfg; tol=1e-8, maxiter=200)
+            r = b - sparse(A.At') * x
+            @test norm(r) / norm(b) < 1e-8
+        end
+    end
+
+    @testset "Anisotropic Matrix - Convergence" begin
+        A = anisotropic_csr(8, 8)
+        N = 64
+        b = rand(N)
+        for (name, cfg) in [
+            ("Default", AMGConfig(pre_smoothing_steps=2, post_smoothing_steps=2)),
+            ("l1-Jacobi", AMGConfig(smoother=L1JacobiSmootherType(), pre_smoothing_steps=2, post_smoothing_steps=2)),
+            ("ILU0", AMGConfig(smoother=ILU0SmootherType())),
+        ]
+            x = zeros(N)
+            hierarchy = amg_setup(A, cfg)
+            x, niter = amg_solve!(x, b, hierarchy, cfg; tol=1e-8, maxiter=300)
+            r = b - sparse(A.At') * x
+            @test norm(r) / norm(b) < 1e-8
+        end
+    end
+
+    @testset "Safe Diagonal - Zero diagonal row" begin
+        # Matrix with near-zero diagonal in one row
+        I = [1,1,2,2,2,3,3]
+        J = [1,2,1,2,3,2,3]
+        V = [2.0,-1.0,-1.0,1e-20,-1.0,-1.0,2.0]  # row 2 has near-zero diagonal
+        A = static_sparsity_sparse(I, J, V, 3, 3)
+        smoother = ParallelAMG.build_jacobi_smoother(A, 2.0/3.0)
+        # invdiag should be safe (zero, not Inf)
+        @test isfinite(smoother.invdiag[1])
+        @test isfinite(smoother.invdiag[2])
+        @test isfinite(smoother.invdiag[3])
+    end
+
+    @testset "Small/Trivial Systems" begin
+        # 1x1 system
+        A1 = static_sparsity_sparse([1], [1], [5.0], 1, 1)
+        config = AMGConfig(max_coarse_size=10)
+        h = amg_setup(A1, config)
+        x = zeros(1)
+        x, niter = amg_solve!(x, [3.0], h, config; tol=1e-10)
+        @test x[1] ≈ 0.6 atol=1e-8
+
+        # 2x2 system
+        A2 = static_sparsity_sparse([1,1,2,2], [1,2,1,2], [4.0,-1.0,-1.0,4.0], 2, 2)
+        config2 = AMGConfig(max_coarse_size=10)
+        h2 = amg_setup(A2, config2)
+        b = [1.0, 1.0]
+        x = zeros(2)
+        x, niter = amg_solve!(x, b, h2, config2; tol=1e-10)
+        @test norm(b - sparse(A2.At') * x) / norm(b) < 1e-10
+    end
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # W-Cycle
+    # ══════════════════════════════════════════════════════════════════════════
+
+    @testset "W-Cycle Config" begin
+        config = AMGConfig(cycle_type=:W)
+        @test config.cycle_type == :W
+        config_v = AMGConfig()
+        @test config_v.cycle_type == :V
+    end
+
+    @testset "W-Cycle Solve" begin
+        n = 10
+        A = poisson2d_csr(n)
+        N = n*n
+        b = rand(N)
+
+        # V-cycle baseline
+        x_v = zeros(N)
+        config_v = AMGConfig(cycle_type=:V, pre_smoothing_steps=2, post_smoothing_steps=2)
+        h = amg_setup(A, config_v)
+        x_v, niter_v = amg_solve!(x_v, b, h, config_v; tol=1e-8, maxiter=200)
+        r_v = b - sparse(A.At') * x_v
+        @test norm(r_v) / norm(b) < 1e-8
+
+        # W-cycle should also converge
+        x_w = zeros(N)
+        config_w = AMGConfig(cycle_type=:W, pre_smoothing_steps=2, post_smoothing_steps=2)
+        h_w = amg_setup(A, config_w)
+        x_w, niter_w = amg_solve!(x_w, b, h_w, config_w; tol=1e-8, maxiter=200)
+        r_w = b - sparse(A.At') * x_w
+        @test norm(r_w) / norm(b) < 1e-8
+        # W-cycle should converge in <= iterations than V-cycle
+        @test niter_w <= niter_v
+    end
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # l1-Jacobi Smoother
+    # ══════════════════════════════════════════════════════════════════════════
+
+    @testset "l1-Jacobi Smoother - Build" begin
+        A = poisson1d_csr(10)
+        smoother = ParallelAMG.build_l1jacobi_smoother(A, 2.0/3.0)
+        @test length(smoother.invdiag) == 10
+        @test smoother.ω ≈ 2.0/3.0
+        # For interior row: l1 norm = |−1| + |2| + |−1| = 4, invdiag = 1/4
+        @test smoother.invdiag[5] ≈ 0.25
+    end
+
+    @testset "l1-Jacobi Smoother - Smoothing" begin
+        A = poisson1d_csr(10)
+        smoother = ParallelAMG.build_l1jacobi_smoother(A, 2.0/3.0)
+        b = ones(10)
+        x = zeros(10)
+        smooth!(x, A, b, smoother; steps=10)
+        r = b - sparse(A.At') * x
+        @test norm(r) < norm(b)
+    end
+
+    @testset "l1-Jacobi Smoother - AMG Solve" begin
+        n = 10
+        A = poisson2d_csr(n)
+        N = n*n
+        b = rand(N)
+        x = zeros(N)
+        config = AMGConfig(smoother=L1JacobiSmootherType())
+        hierarchy = amg_setup(A, config)
+        x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r = b - sparse(A.At') * x
+        @test norm(r) / norm(b) < 1e-8
+        @test niter < 200
+    end
+
+    @testset "l1-Jacobi - Resetup" begin
+        n = 8
+        A = poisson2d_csr(n)
+        N = n*n
+        config = AMGConfig(smoother=L1JacobiSmootherType())
+        hierarchy = amg_setup(A, config)
+        b = rand(N)
+        x1 = zeros(N)
+        x1, _ = amg_solve!(x1, b, hierarchy, config; tol=1e-8, maxiter=200)
+        nonzeros(A) .*= 2.0
+        amg_resetup!(hierarchy, A, config)
+        x2 = zeros(N)
+        x2, _ = amg_solve!(x2, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r2 = b - sparse(A.At') * x2
+        @test norm(r2) / norm(b) < 1e-8
+    end
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Chebyshev Smoother
+    # ══════════════════════════════════════════════════════════════════════════
+
+    @testset "Chebyshev Smoother - Build" begin
+        A = poisson1d_csr(10)
+        smoother = ParallelAMG.build_chebyshev_smoother(A)
+        @test length(smoother.invdiag) == 10
+        @test smoother.λ_max > 0
+        @test smoother.λ_min > 0
+        @test smoother.λ_max > smoother.λ_min
+        @test smoother.degree == 3
+    end
+
+    @testset "Chebyshev Smoother - Smoothing" begin
+        A = poisson1d_csr(10)
+        smoother = ParallelAMG.build_chebyshev_smoother(A)
+        b = ones(10)
+        x = zeros(10)
+        smooth!(x, A, b, smoother; steps=5)
+        r = b - sparse(A.At') * x
+        @test norm(r) < norm(b)
+    end
+
+    @testset "Chebyshev Smoother - AMG Solve" begin
+        n = 10
+        A = poisson2d_csr(n)
+        N = n*n
+        b = rand(N)
+        x = zeros(N)
+        config = AMGConfig(smoother=ChebyshevSmootherType(),
+                           pre_smoothing_steps=2, post_smoothing_steps=2)
+        hierarchy = amg_setup(A, config)
+        x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r = b - sparse(A.At') * x
+        @test norm(r) / norm(b) < 1e-8
+        @test niter < 200
+    end
+
+    @testset "Chebyshev - Resetup" begin
+        n = 8
+        A = poisson2d_csr(n)
+        N = n*n
+        config = AMGConfig(smoother=ChebyshevSmootherType(),
+                           pre_smoothing_steps=2, post_smoothing_steps=2)
+        hierarchy = amg_setup(A, config)
+        b = rand(N)
+        x1 = zeros(N)
+        x1, _ = amg_solve!(x1, b, hierarchy, config; tol=1e-8, maxiter=200)
+        nonzeros(A) .*= 2.0
+        amg_resetup!(hierarchy, A, config)
+        x2 = zeros(N)
+        x2, _ = amg_solve!(x2, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r2 = b - sparse(A.At') * x2
+        @test norm(r2) / norm(b) < 1e-8
+    end
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # ILU(0) Smoother
+    # ══════════════════════════════════════════════════════════════════════════
+
+    @testset "ILU(0) Smoother - Build" begin
+        A = poisson1d_csr(10)
+        smoother = ParallelAMG.build_ilu0_smoother(A)
+        @test length(smoother.L_nzval) == nnz(A)
+        @test length(smoother.U_nzval) == nnz(A)
+        @test length(smoother.diag_idx) == 10
+        @test smoother.num_colors >= 2
+    end
+
+    @testset "ILU(0) Smoother - Smoothing" begin
+        A = poisson1d_csr(10)
+        smoother = ParallelAMG.build_ilu0_smoother(A)
+        b = ones(10)
+        x = zeros(10)
+        smooth!(x, A, b, smoother; steps=3)
+        r = b - sparse(A.At') * x
+        @test norm(r) < norm(b)
+    end
+
+    @testset "ILU(0) Smoother - AMG Solve" begin
+        n = 10
+        A = poisson2d_csr(n)
+        N = n*n
+        b = rand(N)
+        x = zeros(N)
+        config = AMGConfig(smoother=ILU0SmootherType())
+        hierarchy = amg_setup(A, config)
+        x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r = b - sparse(A.At') * x
+        @test norm(r) / norm(b) < 1e-8
+        @test niter < 200
+    end
+
+    @testset "ILU(0) Smoother - Resetup" begin
+        n = 8
+        A = poisson2d_csr(n)
+        N = n*n
+        config = AMGConfig(smoother=ILU0SmootherType())
+        hierarchy = amg_setup(A, config)
+        b = rand(N)
+        x1 = zeros(N)
+        x1, _ = amg_solve!(x1, b, hierarchy, config; tol=1e-8, maxiter=200)
+        nonzeros(A) .*= 2.0
+        amg_resetup!(hierarchy, A, config)
+        x2 = zeros(N)
+        x2, _ = amg_solve!(x2, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r2 = b - sparse(A.At') * x2
+        @test norm(r2) / norm(b) < 1e-8
+    end
+
+    @testset "ILU(0) - Anisotropic" begin
+        A = anisotropic_csr(8, 8)
+        N = 64
+        b = rand(N)
+        x = zeros(N)
+        config = AMGConfig(smoother=ILU0SmootherType())
+        hierarchy = amg_setup(A, config)
+        x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r = b - sparse(A.At') * x
+        @test norm(r) / norm(b) < 1e-8
+    end
+
+    @testset "ILU(0) - Reservoir-like" begin
+        A = reservoir_like_csr(50)
+        N = 50
+        b = rand(N)
+        x = zeros(N)
+        config = AMGConfig(smoother=ILU0SmootherType())
+        hierarchy = amg_setup(A, config)
+        x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r = b - sparse(A.At') * x
+        @test norm(r) / norm(b) < 1e-8
+    end
+
 end

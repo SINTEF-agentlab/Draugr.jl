@@ -7,6 +7,15 @@ Returns a boolean CSR matrix `S` where `S[i,j] = true` if j is a strong connecti
 A connection (i,j) is strong if |A[i,j]| ≥ θ * max_{k≠i} |A[i,k]|
 """
 function strength_graph(A::StaticSparsityMatrixCSR{Tv, Ti}, θ::Real) where {Tv, Ti}
+    return strength_graph(A, θ, AbsoluteStrength())
+end
+
+"""
+    strength_graph(A, θ, ::AbsoluteStrength)
+
+Absolute-value strength: |a_{i,j}| ≥ θ * max_{k≠i} |a_{i,k}|.
+"""
+function strength_graph(A::StaticSparsityMatrixCSR{Tv, Ti}, θ::Real, ::AbsoluteStrength) where {Tv, Ti}
     n = size(A, 1)
     nzv = nonzeros(A)
     cv = colvals(A)
@@ -33,6 +42,91 @@ function strength_graph(A::StaticSparsityMatrixCSR{Tv, Ti}, θ::Real) where {Tv,
         end
     end
     return is_strong
+end
+
+"""
+    strength_graph(A, θ, ::SignedStrength)
+
+Sign-aware (classical Ruge-Stüben) strength of connection for non-M-matrices.
+Only off-diagonals with opposite sign from the diagonal are considered for strong
+connections. This is critical for reservoir simulation where some off-diagonals
+may have "wrong" (positive) sign.
+
+A connection (i,j) is strong if:
+  sign(a_{i,j}) ≠ sign(a_{i,i})  AND  |a_{i,j}| ≥ θ * max_{k: sign(a_{i,k})≠sign(a_{i,i})} |a_{i,k}|
+
+If all off-diagonals have the same sign as the diagonal (no "proper" connections),
+falls back to absolute-value strength for that row.
+"""
+function strength_graph(A::StaticSparsityMatrixCSR{Tv, Ti}, θ::Real, ::SignedStrength) where {Tv, Ti}
+    n = size(A, 1)
+    nzv = nonzeros(A)
+    cv = colvals(A)
+    is_strong = Vector{Bool}(undef, nnz(A))
+    @inbounds for row in 1:n
+        rng = nzrange(A, row)
+        # Find diagonal
+        a_ii = zero(Tv)
+        for nz in rng
+            if cv[nz] == row
+                a_ii = nzv[nz]
+                break
+            end
+        end
+        diag_sign = sign(real(a_ii))
+        if diag_sign == 0
+            diag_sign = one(real(Tv))  # default to positive if zero diagonal
+        end
+        # Find max magnitude among opposite-sign off-diagonals
+        max_opposite = zero(real(Tv))
+        has_opposite = false
+        for nz in rng
+            col = cv[nz]
+            if col != row && sign(real(nzv[nz])) != diag_sign
+                max_opposite = max(max_opposite, abs(nzv[nz]))
+                has_opposite = true
+            end
+        end
+        if has_opposite
+            threshold = θ * max_opposite
+            for nz in rng
+                col = cv[nz]
+                if col != row && sign(real(nzv[nz])) != diag_sign
+                    is_strong[nz] = abs(nzv[nz]) >= threshold
+                else
+                    is_strong[nz] = false
+                end
+            end
+        else
+            # Fallback: no opposite-sign connections, use absolute value
+            max_offdiag = zero(real(Tv))
+            for nz in rng
+                col = cv[nz]
+                if col != row
+                    max_offdiag = max(max_offdiag, abs(nzv[nz]))
+                end
+            end
+            threshold = θ * max_offdiag
+            for nz in rng
+                col = cv[nz]
+                if col != row
+                    is_strong[nz] = abs(nzv[nz]) >= threshold
+                else
+                    is_strong[nz] = false
+                end
+            end
+        end
+    end
+    return is_strong
+end
+
+"""
+    strength_graph(A, θ, config::AMGConfig)
+
+Dispatch strength computation based on config's strength_type.
+"""
+function strength_graph(A::StaticSparsityMatrixCSR, θ::Real, config::AMGConfig)
+    return strength_graph(A, θ, config.strength_type)
 end
 
 """
@@ -96,4 +190,24 @@ function _apply_max_row_sum(A::StaticSparsityMatrixCSR{Tv, Ti}, threshold::Real)
     end
     return StaticSparsityMatrixCSR(size(A, 1), size(A, 2),
                                     collect(rp), collect(cv), nzv_new)
+end
+
+# ── Safe diagonal helpers ────────────────────────────────────────────────────
+
+"""
+    _safe_inv_diag(d, row_norm)
+
+Compute a safe inverse of diagonal entry `d`, using `row_norm` as a fallback
+scale. Returns `1/d` when `|d|` is large enough, otherwise returns a safe
+value that avoids Inf/NaN.
+"""
+function _safe_inv_diag(d::Tv, row_norm::Real) where Tv
+    abs_d = abs(d)
+    threshold = eps(real(Tv)) * max(one(real(Tv)), real(Tv)(row_norm))
+    if abs_d > threshold
+        return one(Tv) / d
+    else
+        # Return zero for truly zero diagonal (isolated node)
+        return zero(Tv)
+    end
 end

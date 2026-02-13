@@ -33,13 +33,17 @@ end
     i = @index(Global)
     @inbounds begin
         diag_val = zero(eltype(invdiag))
+        row_norm = zero(real(eltype(invdiag)))
         for nz in rp[i]:(rp[i+1]-1)
+            row_norm += abs(nzval[nz])
             if colval[nz] == i
                 diag_val = nzval[nz]
-                break
             end
         end
-        invdiag[i] = inv(diag_val)
+        # Safe inverse: avoid Inf/NaN for zero or near-zero diagonals
+        abs_d = abs(diag_val)
+        threshold = eps(real(eltype(invdiag))) * max(one(real(eltype(invdiag))), row_norm)
+        invdiag[i] = abs_d > threshold ? inv(diag_val) : zero(eltype(invdiag))
     end
 end
 
@@ -484,4 +488,399 @@ end
 
 function build_smoother(A::StaticSparsityMatrixCSR, ::SPAI1SmootherType, ω::Real)
     return build_spai1_smoother(A)
+end
+
+# ══════════════════════════════════════════════════════════════════════════════
+# l1-Jacobi Smoother
+# ══════════════════════════════════════════════════════════════════════════════
+
+"""
+    build_l1jacobi_smoother(A, ω)
+
+Build an l1-Jacobi smoother. Uses l1 row norms for diagonal scaling:
+m[i] = ω / (|a_{i,i}| + Σ_{j≠i} |a_{i,j}|)
+
+More robust than standard Jacobi for matrices with large off-diagonal entries,
+near-zero diagonals, or wrong-sign off-diagonals.
+"""
+function build_l1jacobi_smoother(A::StaticSparsityMatrixCSR{Tv, Ti}, ω::Real) where {Tv, Ti}
+    n = size(A, 1)
+    invdiag = Vector{Tv}(undef, n)
+    _compute_l1_invdiag!(invdiag, A)
+    tmp = zeros(Tv, n)
+    return L1JacobiSmoother{Tv}(invdiag, tmp, Tv(ω))
+end
+
+function _compute_l1_invdiag!(invdiag::AbstractVector{Tv},
+                               A::StaticSparsityMatrixCSR{Tv, Ti};
+                               backend=CPU()) where {Tv, Ti}
+    n = size(A, 1)
+    nzv = nonzeros(A)
+    cv = colvals(A)
+    rp = rowptr(A)
+    kernel! = l1_invdiag_kernel!(backend, 64)
+    kernel!(invdiag, nzv, cv, rp; ndrange=n)
+    KernelAbstractions.synchronize(backend)
+    return invdiag
+end
+
+@kernel function l1_invdiag_kernel!(invdiag, @Const(nzval), @Const(colval), @Const(rp))
+    i = @index(Global)
+    @inbounds begin
+        l1_norm = zero(real(eltype(invdiag)))
+        for nz in rp[i]:(rp[i+1]-1)
+            l1_norm += abs(nzval[nz])
+        end
+        # Safe inverse
+        invdiag[i] = l1_norm > eps(real(eltype(invdiag))) ? inv(l1_norm) : zero(eltype(invdiag))
+    end
+end
+
+function update_smoother!(smoother::L1JacobiSmoother, A::StaticSparsityMatrixCSR;
+                          backend=CPU())
+    _compute_l1_invdiag!(smoother.invdiag, A; backend=backend)
+    return smoother
+end
+
+function smooth!(x::AbstractVector, A::StaticSparsityMatrixCSR, b::AbstractVector,
+                 smoother::L1JacobiSmoother; steps::Int=1, backend=CPU())
+    n = size(A, 1)
+    nzv = nonzeros(A)
+    cv = colvals(A)
+    rp = rowptr(A)
+    tmp = smoother.tmp
+    for _ in 1:steps
+        kernel! = jacobi_kernel!(backend, 64)
+        kernel!(tmp, x, b, nzv, cv, rp, smoother.invdiag, smoother.ω; ndrange=n)
+        KernelAbstractions.synchronize(backend)
+        copyto!(x, tmp)
+    end
+    return x
+end
+
+function build_smoother(A::StaticSparsityMatrixCSR, ::L1JacobiSmootherType, ω::Real)
+    return build_l1jacobi_smoother(A, ω)
+end
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Chebyshev Polynomial Smoother
+# ══════════════════════════════════════════════════════════════════════════════
+
+"""
+    _estimate_spectral_radius(A, invdiag; niter=10)
+
+Estimate the spectral radius of D⁻¹A using power iteration.
+"""
+function _estimate_spectral_radius(A::StaticSparsityMatrixCSR{Tv, Ti},
+                                   invdiag::Vector{Tv}; niter::Int=10) where {Tv, Ti}
+    n = size(A, 1)
+    v = randn(Tv, n)
+    v ./= norm(v)
+    w = similar(v)
+    λ = one(Tv)
+    for _ in 1:niter
+        mul!(w, A, v)
+        @inbounds for i in 1:n
+            w[i] *= invdiag[i]
+        end
+        λ = norm(w)
+        if λ > eps(Tv)
+            v .= w ./ λ
+        end
+    end
+    return real(λ)
+end
+
+"""
+    build_chebyshev_smoother(A; degree=3)
+
+Build a Chebyshev polynomial smoother. Estimates eigenvalues of D⁻¹A and
+constructs a degree-`degree` Chebyshev iteration.
+"""
+function build_chebyshev_smoother(A::StaticSparsityMatrixCSR{Tv, Ti};
+                                  degree::Int=3) where {Tv, Ti}
+    n = size(A, 1)
+    invdiag = Vector{Tv}(undef, n)
+    compute_inverse_diagonal!(invdiag, A)
+    ρ = _estimate_spectral_radius(A, invdiag)
+    # Standard Chebyshev bounds for SPD: [ρ/30, 1.1*ρ]
+    λ_max = Tv(1.1) * ρ
+    λ_min = λ_max / Tv(30.0)
+    tmp1 = zeros(Tv, n)
+    tmp2 = zeros(Tv, n)
+    return ChebyshevSmoother{Tv}(invdiag, tmp1, tmp2, λ_min, λ_max, degree)
+end
+
+function update_smoother!(smoother::ChebyshevSmoother, A::StaticSparsityMatrixCSR;
+                          backend=CPU())
+    compute_inverse_diagonal!(smoother.invdiag, A; backend=backend)
+    ρ = _estimate_spectral_radius(A, smoother.invdiag)
+    smoother.λ_max = eltype(smoother.invdiag)(1.1) * ρ
+    smoother.λ_min = smoother.λ_max / eltype(smoother.invdiag)(30.0)
+    return smoother
+end
+
+@kernel function chebyshev_apply_kernel!(x, @Const(r), @Const(invdiag), scale)
+    i = @index(Global)
+    @inbounds x[i] += scale * invdiag[i] * r[i]
+end
+
+"""
+    smooth!(x, A, b, smoother::ChebyshevSmoother; steps=1)
+
+Apply Chebyshev polynomial smoothing. Each step applies the full polynomial
+of the configured degree using the standard three-term recurrence.
+"""
+function smooth!(x::AbstractVector, A::StaticSparsityMatrixCSR, b::AbstractVector,
+                 smoother::ChebyshevSmoother; steps::Int=1, backend=CPU())
+    n = size(A, 1)
+    Tv = eltype(x)
+    nzv = nonzeros(A)
+    cv = colvals(A)
+    rp = rowptr(A)
+    r = smoother.tmp1
+    d = smoother.tmp2
+
+    θ = (smoother.λ_max + smoother.λ_min) / 2
+    δ = (smoother.λ_max - smoother.λ_min) / 2
+
+    for _ in 1:steps
+        # Iteration 0: r = b - A*x, d = (1/θ) * D⁻¹ * r, x += d
+        rkernel! = residual_kernel_smoother!(backend, 64)
+        rkernel!(r, b, x, nzv, cv, rp; ndrange=n)
+        KernelAbstractions.synchronize(backend)
+
+        @inbounds for i in 1:n
+            d[i] = smoother.invdiag[i] * r[i] / θ
+            x[i] += d[i]
+        end
+
+        # Iterations 1..degree-1 using three-term recurrence
+        σ_old = θ / δ
+        for k in 1:(smoother.degree - 1)
+            rkernel!(r, b, x, nzv, cv, rp; ndrange=n)
+            KernelAbstractions.synchronize(backend)
+
+            σ_new = one(Tv) / (Tv(2) * θ / δ - σ_old)
+            @inbounds for i in 1:n
+                d[i] = Tv(2) * σ_new / δ * smoother.invdiag[i] * r[i] + σ_new * σ_old * d[i]
+                x[i] += d[i]
+            end
+            σ_old = σ_new
+        end
+    end
+    return x
+end
+
+@kernel function residual_kernel_smoother!(r, @Const(b), @Const(x),
+                                           @Const(nzval), @Const(colval), @Const(rp))
+    i = @index(Global)
+    @inbounds begin
+        Ax_i = zero(eltype(r))
+        for nz in rp[i]:(rp[i+1]-1)
+            j = colval[nz]
+            Ax_i += nzval[nz] * x[j]
+        end
+        r[i] = b[i] - Ax_i
+    end
+end
+
+function build_smoother(A::StaticSparsityMatrixCSR, ::ChebyshevSmootherType, ω::Real)
+    return build_chebyshev_smoother(A)
+end
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ILU(0) Smoother
+# ══════════════════════════════════════════════════════════════════════════════
+
+"""
+    build_ilu0_smoother(A)
+
+Build a parallel ILU(0) smoother. Computes an incomplete LU factorization with
+the same sparsity pattern as A, using graph coloring for parallel forward/backward
+substitution.
+"""
+function build_ilu0_smoother(A::StaticSparsityMatrixCSR{Tv, Ti}) where {Tv, Ti}
+    n = size(A, 1)
+    cv = colvals(A)
+    nzv = nonzeros(A)
+    rp = rowptr(A)
+
+    # Compute coloring for parallel triangular solves
+    colors, num_colors = greedy_coloring(A)
+    color_counts = zeros(Int, num_colors)
+    @inbounds for i in 1:n
+        color_counts[colors[i]] += 1
+    end
+    color_offsets = Vector{Int}(undef, num_colors + 1)
+    color_offsets[1] = 1
+    for c in 1:num_colors
+        color_offsets[c+1] = color_offsets[c] + color_counts[c]
+    end
+    color_order = Vector{Ti}(undef, n)
+    pos = copy(color_offsets[1:num_colors])
+    @inbounds for i in 1:n
+        c = colors[i]
+        color_order[pos[c]] = Ti(i)
+        pos[c] += 1
+    end
+
+    # Find diagonal indices
+    diag_idx = Vector{Ti}(undef, n)
+    @inbounds for i in 1:n
+        for nz in rp[i]:(rp[i+1]-1)
+            if cv[nz] == i
+                diag_idx[i] = Ti(nz)
+                break
+            end
+        end
+    end
+
+    # ILU(0) factorization
+    L_nzval = zeros(Tv, nnz(A))
+    U_nzval = copy(nzv)
+    _ilu0_factorize!(L_nzval, U_nzval, diag_idx, A)
+
+    tmp = zeros(Tv, n)
+    return ILU0Smoother{Tv, Ti}(L_nzval, U_nzval, diag_idx, colors,
+                                 color_offsets, color_order, num_colors, tmp)
+end
+
+"""
+    _ilu0_factorize!(L_nzval, U_nzval, diag_idx, A)
+
+Compute ILU(0) factorization: A ≈ L*U where L,U have the same sparsity as A.
+L has 1 on the diagonal, L_nzval stores strictly lower triangle.
+U_nzval stores upper triangle + diagonal.
+"""
+function _ilu0_factorize!(L_nzval::Vector{Tv}, U_nzval::Vector{Tv},
+                          diag_idx::Vector{Ti},
+                          A::StaticSparsityMatrixCSR{Tv, Ti}) where {Tv, Ti}
+    n = size(A, 1)
+    cv = colvals(A)
+    nzv = nonzeros(A)
+    rp = rowptr(A)
+
+    # Copy A values into U
+    copyto!(U_nzval, nzv)
+    fill!(L_nzval, zero(Tv))
+
+    @inbounds for i in 1:n
+        # Process row i: for each k < i in row i's lower triangle
+        for nz in rp[i]:(diag_idx[i]-1)
+            k = cv[nz]
+            # L[i,k] = U[i,k] / U[k,k]
+            u_kk = U_nzval[diag_idx[k]]
+            if abs(u_kk) < eps(real(Tv)) * max(one(real(Tv)), abs(u_kk))
+                L_nzval[nz] = zero(Tv)
+                U_nzval[nz] = zero(Tv)
+                continue
+            end
+            l_ik = U_nzval[nz] / u_kk
+            # Clamp to prevent growth
+            if abs(l_ik) > Tv(1e8)
+                l_ik = sign(l_ik) * Tv(1e8)
+            end
+            L_nzval[nz] = l_ik
+            U_nzval[nz] = zero(Tv)  # Clear lower triangle in U
+
+            # Update row i: for each j in row k with j > k, if (i,j) exists
+            for nz_k in (diag_idx[k]+1):(rp[k+1]-1)
+                j = cv[nz_k]
+                # Find (i,j) in row i
+                nz_ij = _find_nz_in_row(cv, rp[i], rp[i+1]-1, j)
+                if nz_ij > 0
+                    U_nzval[nz_ij] -= l_ik * U_nzval[nz_k]
+                end
+            end
+        end
+        # Diagonal safeguard: if U[i,i] became zero or near-zero, perturb it
+        u_ii = U_nzval[diag_idx[i]]
+        row_norm = zero(real(Tv))
+        for nz in rp[i]:(rp[i+1]-1)
+            row_norm += abs(nzv[nz])
+        end
+        if abs(u_ii) < eps(real(Tv)) * max(one(real(Tv)), row_norm)
+            U_nzval[diag_idx[i]] = eps(real(Tv)) * max(one(real(Tv)), row_norm)
+        end
+    end
+    return nothing
+end
+
+"""Find column `col` in row range [start, stop] of colval array."""
+function _find_nz_in_row(cv::Vector{Ti}, start::Ti, stop::Ti, col::Ti) where Ti
+    # Binary search since columns are sorted in CSR
+    lo, hi = Int(start), Int(stop)
+    while lo <= hi
+        mid = (lo + hi) >> 1
+        @inbounds c = cv[mid]
+        if c == col
+            return Ti(mid)
+        elseif c < col
+            lo = mid + 1
+        else
+            hi = mid - 1
+        end
+    end
+    return Ti(0)
+end
+
+function update_smoother!(smoother::ILU0Smoother, A::StaticSparsityMatrixCSR;
+                          backend=CPU())
+    _ilu0_factorize!(smoother.L_nzval, smoother.U_nzval, smoother.diag_idx, A)
+    return smoother
+end
+
+"""
+    smooth!(x, A, b, smoother::ILU0Smoother; steps=1)
+
+Apply ILU(0) smoothing: x += (LU)⁻¹ (b - Ax).
+Uses sequential forward/backward substitution for robustness.
+"""
+function smooth!(x::AbstractVector, A::StaticSparsityMatrixCSR, b::AbstractVector,
+                 smoother::ILU0Smoother; steps::Int=1, backend=CPU())
+    n = size(A, 1)
+    Tv = eltype(x)
+    nzv = nonzeros(A)
+    cv = colvals(A)
+    rp = rowptr(A)
+    tmp = smoother.tmp  # residual / solve workspace
+
+    for _ in 1:steps
+        # Compute residual: tmp = b - A*x
+        rkernel! = residual_kernel_smoother!(backend, 64)
+        rkernel!(tmp, b, x, nzv, cv, rp; ndrange=n)
+        KernelAbstractions.synchronize(backend)
+
+        # Forward substitution: L * z = tmp  (z stored in tmp, natural row order)
+        @inbounds for i in 1:n
+            for nz in rp[i]:(smoother.diag_idx[i]-1)
+                j = cv[nz]
+                tmp[i] -= smoother.L_nzval[nz] * tmp[j]
+            end
+        end
+
+        # Backward substitution: U * dx = z  (dx stored in tmp, reverse row order)
+        @inbounds for i in n:-1:1
+            for nz in (smoother.diag_idx[i]+1):(rp[i+1]-1)
+                j = cv[nz]
+                tmp[i] -= smoother.U_nzval[nz] * tmp[j]
+            end
+            u_ii = smoother.U_nzval[smoother.diag_idx[i]]
+            tmp[i] = abs(u_ii) > eps(real(Tv)) ? tmp[i] / u_ii : zero(Tv)
+        end
+
+        # Update: x += dx (with NaN protection)
+        @inbounds for i in 1:n
+            v = tmp[i]
+            if isfinite(v)
+                x[i] += v
+            end
+        end
+    end
+    return x
+end
+
+function build_smoother(A::StaticSparsityMatrixCSR, ::ILU0SmootherType, ω::Real)
+    return build_ilu0_smoother(A)
 end

@@ -9,6 +9,10 @@ aggregates.
 """
 function coarsen_aggregation(A::StaticSparsityMatrixCSR{Tv, Ti}, θ::Real) where {Tv, Ti}
     n = size(A, 1)
+    # Edge case: trivial system
+    if n <= 1
+        return ones(Int, n), n
+    end
     is_strong = strength_graph(A, θ)
     cv = colvals(A)
     agg = zeros(Int, n)  # 0 = unassigned
@@ -61,6 +65,10 @@ where `cf[i] = 1` for coarse points and `cf[i] = 0` for fine points,
 function coarsen_pmis(A::StaticSparsityMatrixCSR{Tv, Ti}, θ::Real;
                       rng=Random.default_rng()) where {Tv, Ti}
     n = size(A, 1)
+    # Edge case: trivial system
+    if n <= 1
+        return ones(Int, n), collect(1:n), n
+    end
     is_strong = strength_graph(A, θ)
     cv = colvals(A)
     # Compute measure: number of strong connections + random perturbation
@@ -142,6 +150,10 @@ as `coarsen_pmis`.
 function coarsen_hmis(A::StaticSparsityMatrixCSR{Tv, Ti}, θ::Real;
                       rng=Random.default_rng()) where {Tv, Ti}
     n = size(A, 1)
+    # Edge case: trivial system
+    if n <= 1
+        return ones(Int, n), collect(1:n), n
+    end
     is_strong = strength_graph(A, θ)
     cv = colvals(A)
     # Build symmetric strength graph: strong in both directions

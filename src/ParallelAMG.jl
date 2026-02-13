@@ -49,10 +49,13 @@ export StaticSparsityMatrixCSR, static_sparsity_sparse, static_csr_from_csc
 export colvals, rowptr
 export AggregationCoarsening, PMISCoarsening, HMISCoarsening, AggressiveCoarsening, SmoothedAggregationCoarsening
 export DirectInterpolation, StandardInterpolation, ExtendedIInterpolation
+export AbsoluteStrength, SignedStrength
 export AMGConfig, AMGHierarchy, AMGLevel
 export amg_setup, amg_resetup!, amg_cycle!, amg_solve!
 export JacobiSmoother, ColoredGaussSeidelSmoother, SPAI0Smoother, SPAI1Smoother
+export L1JacobiSmoother, ChebyshevSmoother, ILU0Smoother
 export JacobiSmootherType, ColoredGaussSeidelType, SPAI0SmootherType, SPAI1SmootherType
+export L1JacobiSmootherType, ChebyshevSmootherType, ILU0SmootherType
 export smooth!
 export ParallelAMGPreconditioner
 

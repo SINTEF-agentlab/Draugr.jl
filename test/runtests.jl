@@ -1141,7 +1141,7 @@ end
         @test norm(r2) / norm(b) < 1e-8
     end
 
-    @testset "Smooth Prolongation Construction" begin
+    @testset "Smoothed Prolongation Construction" begin
         A = poisson1d_csr(10)
         agg, nc = ParallelAMG.coarsen_aggregation(A, 0.25)
         P_tent = ParallelAMG.build_prolongation(A, agg, nc)

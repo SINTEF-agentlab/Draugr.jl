@@ -117,7 +117,6 @@ end
 AggressiveCoarsening() = AggressiveCoarsening(0.25, :pmis, ExtendedIInterpolation())
 AggressiveCoarsening(θ::Real) = AggressiveCoarsening(θ, :pmis, ExtendedIInterpolation())
 AggressiveCoarsening(θ::Real, base::Symbol) = AggressiveCoarsening(θ, base, ExtendedIInterpolation())
-AggressiveCoarsening(θ::Real, base::Symbol, interp::InterpolationType) = AggressiveCoarsening(θ, base, interp)
 
 """Smoothed aggregation coarsening. Builds a tentative prolongation from aggregation,
 then smooths it with a damped Jacobi step: P = (I - ω D⁻¹ A) P_tent.

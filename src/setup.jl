@@ -40,7 +40,7 @@ function amg_setup(A::StaticSparsityMatrixCSR{Tv, Ti}, config::AMGConfig=AMGConf
     coarse_lu = copy(coarse_dense)
     coarse_ipiv = Vector{LinearAlgebra.BlasInt}(undef, n_coarse)
     LinearAlgebra.LAPACK.getrf!(coarse_lu, coarse_ipiv)
-    coarse_factor = LU(coarse_lu, coarse_ipiv, 0)
+    coarse_factor = LU(coarse_lu, coarse_ipiv, 0)  # 0 = successful factorization info
     coarse_x = zeros(Tv, n_coarse)
     coarse_b = zeros(Tv, n_coarse)
     # Pre-allocate residual buffer for amg_solve! at finest level size

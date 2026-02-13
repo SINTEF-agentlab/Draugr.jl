@@ -124,9 +124,10 @@ end
 """
     RestrictionMap{Ti}
 
-Maps the Galerkin product triples (P[i,I], A[i,j], P[j,J]) to coarse matrix
-nonzero indices for in-place Galerkin product computation during resetup.
-Each entry k represents a contribution p_i * a_ij * p_j → A_c[I,J].
+Maps the Galerkin product triples to coarse matrix nonzero indices for in-place
+computation during resetup. Each entry k represents a contribution:
+  `P.nzval[triple_pi_idx[k]] * A.nzval[triple_anz_idx[k]] * P.nzval[triple_pj_idx[k]]`
+that is accumulated (atomically) into `A_coarse.nzval[triple_coarse_nz[k]]`.
 """
 struct RestrictionMap{Ti<:Integer}
     triple_coarse_nz::Vector{Ti}  # coarse NZ index to accumulate into

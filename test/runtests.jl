@@ -868,4 +868,290 @@ end
         end
     end
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # Coarsening stalling heuristic
+    # ══════════════════════════════════════════════════════════════════════════
+
+    @testset "Coarsening Stalling - min_coarse_ratio" begin
+        A = poisson2d_csr(30)
+        # With a very strict ratio, coarsening should stop early
+        config = AMGConfig(coarsening=HMISCoarsening(0.25, DirectInterpolation()),
+                           min_coarse_ratio=0.3)
+        hierarchy = amg_setup(A, config)
+        nlevels = length(hierarchy.levels) + 1
+        # Check that we didn't create too many similar-sized levels
+        for i in 1:length(hierarchy.levels)-1
+            n_current = size(hierarchy.levels[i].A, 1)
+            n_next = size(hierarchy.levels[i+1].A, 1)
+            ratio = n_next / n_current
+            # Ratio should be below or near the threshold
+            @test ratio <= 0.6 || n_next <= config.max_coarse_size
+        end
+    end
+
+    @testset "Coarsening Stalling - Default ratio stops gracefully" begin
+        A = poisson2d_csr(20)
+        config = AMGConfig(coarsening=PMISCoarsening(0.25, DirectInterpolation()),
+                           min_coarse_ratio=0.5)
+        hierarchy = amg_setup(A, config)
+        @test length(hierarchy.levels) >= 1
+        # Solve should still work
+        N = size(A, 1)
+        b = rand(N)
+        x = zeros(N)
+        x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r = b - sparse(A.At') * x
+        @test norm(r) / norm(b) < 1e-8
+    end
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # ExtendedI Interpolation convergence fix
+    # ══════════════════════════════════════════════════════════════════════════
+
+    @testset "ExtendedI Convergence - PMIS" begin
+        n = 15
+        A = poisson2d_csr(n)
+        N = n*n
+        b = rand(N)
+        x = zeros(N)
+        config = AMGConfig(coarsening=PMISCoarsening(0.25, ExtendedIInterpolation()),
+                           pre_smoothing_steps=2, post_smoothing_steps=2)
+        hierarchy = amg_setup(A, config)
+        x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r = b - sparse(A.At') * x
+        @test norm(r) / norm(b) < 1e-8
+        @test niter < 200
+    end
+
+    @testset "ExtendedI Convergence - HMIS" begin
+        n = 15
+        A = poisson2d_csr(n)
+        N = n*n
+        b = rand(N)
+        x = zeros(N)
+        config = AMGConfig(coarsening=HMISCoarsening(0.25, ExtendedIInterpolation()),
+                           pre_smoothing_steps=2, post_smoothing_steps=2)
+        hierarchy = amg_setup(A, config)
+        x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r = b - sparse(A.At') * x
+        @test norm(r) / norm(b) < 1e-8
+        @test niter < 200
+    end
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Filtering for Aggregation Coarsening
+    # ══════════════════════════════════════════════════════════════════════════
+
+    @testset "Aggregation Filtering - Config" begin
+        alg = AggregationCoarsening(0.25, true, 0.2)
+        @test alg.filtering == true
+        @test alg.filter_tol ≈ 0.2
+        alg2 = AggregationCoarsening()
+        @test alg2.filtering == false
+    end
+
+    @testset "Aggregation Filtering - Solve" begin
+        n = 10
+        A = poisson2d_csr(n)
+        N = n*n
+        b = rand(N)
+        x = zeros(N)
+        config = AMGConfig(coarsening=AggregationCoarsening(0.25, true, 0.1))
+        hierarchy = amg_setup(A, config)
+        x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r = b - sparse(A.At') * x
+        @test norm(r) / norm(b) < 1e-8
+        @test niter < 200
+    end
+
+    @testset "Filter Prolongation" begin
+        # Build a P with some small entries that should be filtered
+        P = ParallelAMG.ProlongationOp{Int, Float64}(
+            [1, 4, 7, 10],  # rowptr: 3 entries per row
+            [1, 2, 3, 1, 2, 3, 1, 2, 3],  # colval
+            [1.0, 0.05, 0.01, 0.01, 1.0, 0.05, 0.05, 0.01, 1.0],  # nzval
+            3, 3
+        )
+        P_filt = ParallelAMG._filter_prolongation(P, 0.1)
+        # After filtering with tol=0.1:
+        # Row 1: max=1.0, threshold=0.1, keep entries ≥ 0.1: [1.0] (drop 0.05, 0.01)
+        for i in 1:3
+            nnz_row = P_filt.rowptr[i+1] - P_filt.rowptr[i]
+            @test nnz_row >= 1  # at least one entry per row
+        end
+    end
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Max Row Sum Threshold
+    # ══════════════════════════════════════════════════════════════════════════
+
+    @testset "Max Row Sum - Config" begin
+        config = AMGConfig(max_row_sum=0.9)
+        @test config.max_row_sum ≈ 0.9
+        config2 = AMGConfig()
+        @test config2.max_row_sum ≈ 0.0  # disabled by default
+    end
+
+    @testset "Max Row Sum - Weakening Function" begin
+        A = poisson2d_csr(5)
+        # For Poisson 2D boundary row: |a_ii|=4, |off-diag|=2, ratio=(4+2)/4=1.5
+        # With threshold=1.2, rows with ratio > 1.2 should be scaled
+        A_weak = ParallelAMG._apply_max_row_sum(A, 1.2)
+        # The weakened matrix should have same size and structure
+        @test size(A_weak) == size(A)
+        @test nnz(A_weak) == nnz(A)
+        cv = colvals(A)
+        nzv_orig = nonzeros(A)
+        nzv_weak = nonzeros(A_weak)
+        rp = rowptr(A)
+        # Interior row (center point, index 13 for 5x5): ratio = (4+4)/4 = 2.0 > 1.2
+        # Actually all rows with 4 off-diag neighbors: ratio=(4+4)/4=2.0 > 1.2, will be scaled
+        # Rows with 2 off-diag neighbors: ratio=(4+2)/4=1.5 > 1.2, also scaled
+        # So with threshold=1.2, most rows get scaled
+        # Let's use threshold=1.8 to only affect boundary rows
+        A_weak2 = ParallelAMG._apply_max_row_sum(A, 1.8)
+        nzv_weak2 = nonzeros(A_weak2)
+        # Interior row 13 (4 neighbors): ratio=2.0 > 1.8, should be scaled
+        has_scaled_interior = false
+        for nz in rp[13]:(rp[13+1]-1)
+            j = cv[nz]
+            if j != 13 && abs(nzv_weak2[nz]) < abs(nzv_orig[nz]) - 1e-14
+                has_scaled_interior = true
+            end
+        end
+        @test has_scaled_interior
+        # Row 1 (corner, 2 neighbors): ratio=1.5 < 1.8, should NOT be scaled
+        row1_unchanged = true
+        for nz in rp[1]:(rp[1+1]-1)
+            if abs(nzv_weak2[nz] - nzv_orig[nz]) > 1e-14
+                row1_unchanged = false
+            end
+        end
+        @test row1_unchanged
+    end
+
+    @testset "Max Row Sum - Solve" begin
+        n = 10
+        A = poisson2d_csr(n)
+        N = n*n
+        b = rand(N)
+        x = zeros(N)
+        config = AMGConfig(max_row_sum=0.9)
+        hierarchy = amg_setup(A, config)
+        x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r = b - sparse(A.At') * x
+        @test norm(r) / norm(b) < 1e-8
+        @test niter < 200
+    end
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Smoothed Aggregation
+    # ══════════════════════════════════════════════════════════════════════════
+
+    @testset "Smoothed Aggregation - Config" begin
+        alg = SmoothedAggregationCoarsening()
+        @test alg.θ ≈ 0.25
+        @test alg.ω ≈ 2/3
+        @test alg.filtering == false
+        alg2 = SmoothedAggregationCoarsening(0.3, 0.5)
+        @test alg2.θ ≈ 0.3
+        @test alg2.ω ≈ 0.5
+    end
+
+    @testset "Smoothed Aggregation - Setup" begin
+        A = poisson2d_csr(10)
+        config = AMGConfig(coarsening=SmoothedAggregationCoarsening())
+        hierarchy = amg_setup(A, config)
+        @test length(hierarchy.levels) >= 1
+        # SA produces denser coarse matrices than plain aggregation
+        @test nnz(hierarchy.levels[1].A) > 0
+    end
+
+    @testset "Smoothed Aggregation - Solve" begin
+        n = 10
+        A = poisson2d_csr(n)
+        N = n*n
+        b = rand(N)
+        x = zeros(N)
+        config = AMGConfig(coarsening=SmoothedAggregationCoarsening(),
+                           pre_smoothing_steps=2, post_smoothing_steps=2)
+        hierarchy = amg_setup(A, config)
+        x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r = b - sparse(A.At') * x
+        @test norm(r) / norm(b) < 1e-8
+        @test niter < 200
+    end
+
+    @testset "Smoothed Aggregation - Better than Plain Aggregation" begin
+        n = 15
+        A = poisson2d_csr(n)
+        N = n*n
+        b = rand(N)
+
+        # Plain aggregation
+        x1 = zeros(N)
+        config1 = AMGConfig(coarsening=AggregationCoarsening(),
+                            pre_smoothing_steps=2, post_smoothing_steps=2)
+        hierarchy1 = amg_setup(A, config1)
+        x1, niter1 = amg_solve!(x1, b, hierarchy1, config1; tol=1e-8, maxiter=200)
+
+        # Smoothed aggregation
+        x2 = zeros(N)
+        config2 = AMGConfig(coarsening=SmoothedAggregationCoarsening(),
+                            pre_smoothing_steps=2, post_smoothing_steps=2)
+        hierarchy2 = amg_setup(A, config2)
+        x2, niter2 = amg_solve!(x2, b, hierarchy2, config2; tol=1e-8, maxiter=200)
+
+        # SA should converge in fewer iterations
+        @test niter2 <= niter1
+    end
+
+    @testset "Smoothed Aggregation - With Filtering" begin
+        n = 10
+        A = poisson2d_csr(n)
+        N = n*n
+        b = rand(N)
+        x = zeros(N)
+        config = AMGConfig(coarsening=SmoothedAggregationCoarsening(0.25, 2/3, true, 0.1),
+                           pre_smoothing_steps=2, post_smoothing_steps=2)
+        hierarchy = amg_setup(A, config)
+        x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r = b - sparse(A.At') * x
+        @test norm(r) / norm(b) < 1e-8
+        @test niter < 200
+    end
+
+    @testset "Smoothed Aggregation - Resetup" begin
+        n = 10
+        A = poisson2d_csr(n)
+        N = n*n
+        b = rand(N)
+        config = AMGConfig(coarsening=SmoothedAggregationCoarsening(),
+                           pre_smoothing_steps=2, post_smoothing_steps=2)
+        hierarchy = amg_setup(A, config)
+        x1 = zeros(N)
+        x1, niter1 = amg_solve!(x1, b, hierarchy, config; tol=1e-8, maxiter=200)
+        @test niter1 < 200
+        # Resetup with modified coefficients
+        nonzeros(A) .*= 2.0
+        amg_resetup!(hierarchy, A, config)
+        x2 = zeros(N)
+        x2, niter2 = amg_solve!(x2, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r2 = b - sparse(A.At') * x2
+        @test norm(r2) / norm(b) < 1e-8
+    end
+
+    @testset "Smooth Prolongation Construction" begin
+        A = poisson1d_csr(10)
+        agg, nc = ParallelAMG.coarsen_aggregation(A, 0.25)
+        P_tent = ParallelAMG.build_prolongation(A, agg, nc)
+        P_smooth = ParallelAMG._smooth_prolongation(A, P_tent, 2/3)
+        @test P_smooth.nrow == 10
+        @test P_smooth.ncol == nc
+        # Smoothed P should have more nonzeros than tentative P
+        nnz_tent = P_tent.rowptr[end] - 1
+        nnz_smooth = P_smooth.rowptr[end] - 1
+        @test nnz_smooth >= nnz_tent
+    end
+
 end

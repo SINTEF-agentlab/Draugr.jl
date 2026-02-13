@@ -153,9 +153,62 @@ end
         # Test restriction
         rf = ones(10)
         bc = zeros(nc)
-        ParallelAMG.restrict!(bc, P, rf)
+        Pt_map = ParallelAMG.build_transpose_map(P)
+        ParallelAMG.restrict!(bc, Pt_map, P, rf)
         # Sum should be preserved
         @test sum(bc) ≈ sum(rf)
+        # Test TransposeMap structure
+        @test length(Pt_map.offsets) == nc + 1
+        @test Pt_map.offsets[1] == 1
+        @test Pt_map.offsets[nc + 1] == P.nrow + 1  # every fine row maps to one coarse row
+        # Verify restrict! against explicit P^T * r computation
+        rf2 = randn(10)
+        bc2 = zeros(nc)
+        ParallelAMG.restrict!(bc2, Pt_map, P, rf2)
+        # Build explicit P and compute P^T * rf2
+        I_p = Int[]; J_p = Int[]; V_p = Float64[]
+        for i in 1:P.nrow
+            for nz in P.rowptr[i]:(P.rowptr[i+1]-1)
+                push!(I_p, i); push!(J_p, P.colval[nz]); push!(V_p, P.nzval[nz])
+            end
+        end
+        P_sparse = sparse(I_p, J_p, V_p, P.nrow, P.ncol)
+        bc_ref = P_sparse' * rf2
+        @test bc2 ≈ bc_ref atol=1e-12
+    end
+
+    @testset "Galerkin Product - contention-free kernel" begin
+        # Verify the grouped nz_offsets structure produces correct results
+        A = poisson1d_csr(20)
+        Ac = to_csr(A)
+        agg, nc = ParallelAMG.coarsen_aggregation(Ac, 0.25)
+        P = ParallelAMG.build_prolongation(Ac, agg, nc)
+        A_coarse, r_map = ParallelAMG.compute_coarse_sparsity(Ac, P, nc)
+        # Verify nz_offsets structure
+        nnz_c = SparseArrays.nnz(A_coarse)
+        @test length(r_map.nz_offsets) == nnz_c + 1
+        @test r_map.nz_offsets[1] == 1
+        # Every offset range should be non-empty (each coarse NZ has contributing triples)
+        for k in 1:nnz_c
+            @test r_map.nz_offsets[k+1] >= r_map.nz_offsets[k]
+        end
+        # Verify resetup: modify values and compare to explicit
+        nzv = nonzeros(A)
+        nzv .*= 3.0
+        Ac_new = to_csr(A)
+        ParallelAMG.galerkin_product!(A_coarse, Ac_new, P, r_map)
+        I_p = Int[]; J_p = Int[]; V_p = Float64[]
+        for i in 1:P.nrow
+            for nz in P.rowptr[i]:(P.rowptr[i+1]-1)
+                push!(I_p, i); push!(J_p, P.colval[nz]); push!(V_p, P.nzval[nz])
+            end
+        end
+        P_sparse = sparse(I_p, J_p, V_p, P.nrow, P.ncol)
+        A_sparse = sparse(A.At')
+        Ac_explicit = P_sparse' * A_sparse * P_sparse
+        for i in 1:nc, j in 1:nc
+            @test A_coarse[i,j] ≈ Ac_explicit[i,j] atol=1e-12
+        end
     end
 
     @testset "Galerkin Product" begin

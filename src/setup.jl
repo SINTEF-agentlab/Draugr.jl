@@ -36,13 +36,15 @@ function amg_setup(A_csr::CSRMatrix{Tv, Ti}, config::AMGConfig=AMGConfig();
         n_coarse == 0 && break  # degenerate case
         # Compute coarse operator via Galerkin product
         A_coarse, r_map = compute_coarse_sparsity(A_current, P, n_coarse)
+        # Build transpose map for atomic-free restriction
+        Pt_map = build_transpose_map(P)
         # Build smoother
         smoother = build_smoother(A_current, config.smoother, config.jacobi_omega; backend=backend)
         # Workspace
         r = KernelAbstractions.zeros(backend, Tv, n)
         xc = KernelAbstractions.zeros(backend, Tv, n_coarse)
         bc = KernelAbstractions.zeros(backend, Tv, n_coarse)
-        level = AMGLevel{Tv, Ti}(A_current, P, r_map, smoother, r, xc, bc)
+        level = AMGLevel{Tv, Ti}(A_current, P, Pt_map, r_map, smoother, r, xc, bc)
         push!(levels, level)
         A_current = A_coarse
     end

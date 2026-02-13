@@ -82,7 +82,8 @@ end
     smooth!(x, A, b, smoother::JacobiSmoother; steps=1)
 
 Apply `steps` iterations of weighted Jacobi smoothing to solve `Ax = b`.
-Uses KernelAbstractions for parallel execution.
+Uses KernelAbstractions for parallel execution. Alternates read/write buffers
+to avoid an extra copy per step; only copies back on odd step counts.
 """
 function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
                  smoother::JacobiSmoother; steps::Int=1, backend=DEFAULT_BACKEND)
@@ -91,10 +92,17 @@ function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
     cv = colvals(A)
     rp = rowptr(A)
     tmp = smoother.tmp
+    src = x
+    dst = tmp
     for _ in 1:steps
         kernel! = jacobi_kernel!(backend, 64)
-        kernel!(tmp, x, b, nzv, cv, rp, smoother.invdiag, smoother.ω; ndrange=n)
+        kernel!(dst, src, b, nzv, cv, rp, smoother.invdiag, smoother.ω; ndrange=n)
         KernelAbstractions.synchronize(backend)
+        src, dst = dst, src
+    end
+    # After the loop, src holds the latest result.
+    # If steps is odd, src == tmp, so copy result back to x.
+    if isodd(steps)
         copyto!(x, tmp)
     end
     return x
@@ -282,7 +290,7 @@ end
 """
     smooth!(x, A, b, smoother::SPAI0Smoother; steps=1)
 
-Apply SPAI(0) smoothing iterations.
+Apply SPAI(0) smoothing iterations. Alternates buffers to avoid extra copies.
 """
 function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
                  smoother::SPAI0Smoother; steps::Int=1, backend=DEFAULT_BACKEND)
@@ -291,10 +299,15 @@ function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
     cv = colvals(A)
     rp = rowptr(A)
     tmp = smoother.tmp
+    src = x
+    dst = tmp
     for _ in 1:steps
         kernel! = spai0_smooth_kernel!(backend, 64)
-        kernel!(tmp, x, b, nzv, cv, rp, smoother.m_diag; ndrange=n)
+        kernel!(dst, src, b, nzv, cv, rp, smoother.m_diag; ndrange=n)
         KernelAbstractions.synchronize(backend)
+        src, dst = dst, src
+    end
+    if isodd(steps)
         copyto!(x, tmp)
     end
     return x
@@ -549,10 +562,15 @@ function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
     cv = colvals(A)
     rp = rowptr(A)
     tmp = smoother.tmp
+    src = x
+    dst = tmp
     for _ in 1:steps
         kernel! = jacobi_kernel!(backend, 64)
-        kernel!(tmp, x, b, nzv, cv, rp, smoother.invdiag, smoother.ω; ndrange=n)
+        kernel!(dst, src, b, nzv, cv, rp, smoother.invdiag, smoother.ω; ndrange=n)
         KernelAbstractions.synchronize(backend)
+        src, dst = dst, src
+    end
+    if isodd(steps)
         copyto!(x, tmp)
     end
     return x

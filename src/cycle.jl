@@ -77,8 +77,11 @@ function _vcycle_descend!(x::AbstractVector{Tv}, b::AbstractVector{Tv},
     # Solve on coarse grid
     fill!(xc, zero(Tv))
     if lvl < nlevels
-        # Recurse
-        _vcycle_descend!(xc, bc, hierarchy, config, lvl + 1; backend=backend)
+        # Recurse (W-cycle: recurse twice, V-cycle: once)
+        n_recurse = config.cycle_type == :W ? 2 : 1
+        for _ in 1:n_recurse
+            _vcycle_descend!(xc, bc, hierarchy, config, lvl + 1; backend=backend)
+        end
     else
         # Direct solve at coarsest level
         copyto!(hierarchy.coarse_b, bc)

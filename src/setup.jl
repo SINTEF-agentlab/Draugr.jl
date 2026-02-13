@@ -147,6 +147,9 @@ _smoother_name(::JacobiSmoother) = "Jacobi"
 _smoother_name(::ColoredGaussSeidelSmoother) = "Colored GS"
 _smoother_name(::SPAI0Smoother) = "SPAI(0)"
 _smoother_name(::SPAI1Smoother) = "SPAI(1)"
+_smoother_name(::L1JacobiSmoother) = "l1-Jacobi"
+_smoother_name(::ChebyshevSmoother) = "Chebyshev"
+_smoother_name(::ILU0Smoother) = "ILU(0)"
 
 """
     _csr_to_dense!(M, A; backend=CPU())

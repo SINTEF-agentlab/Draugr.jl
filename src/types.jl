@@ -73,12 +73,27 @@ SmoothedAggregationCoarsening() = SmoothedAggregationCoarsening(0.25, 2.0/3.0, f
 SmoothedAggregationCoarsening(θ::Real) = SmoothedAggregationCoarsening(θ, 2.0/3.0, false, 0.1)
 SmoothedAggregationCoarsening(θ::Real, ω::Real) = SmoothedAggregationCoarsening(θ, ω, false, 0.1)
 
+# ── Strength of connection type tags ──────────────────────────────────────────
+abstract type StrengthType end
+
+"""Default absolute-value strength: |a_{i,j}| ≥ θ * max_{k≠i} |a_{i,k}|."""
+struct AbsoluteStrength <: StrengthType end
+
+"""Sign-aware (classical RS) strength for non-M-matrices.
+A connection (i,j) is strong if a_{i,j} has opposite sign from a_{i,i}
+and |a_{i,j}| ≥ θ * max_{k: sign(a_{i,k})≠sign(a_{i,i})} |a_{i,k}|.
+Positive off-diagonals (same sign as diagonal) are treated as weak."""
+struct SignedStrength <: StrengthType end
+
 # ── Smoother type tags ────────────────────────────────────────────────────────
 abstract type SmootherType end
 struct JacobiSmootherType <: SmootherType end
 struct ColoredGaussSeidelType <: SmootherType end
 struct SPAI0SmootherType <: SmootherType end
 struct SPAI1SmootherType <: SmootherType end
+struct L1JacobiSmootherType <: SmootherType end
+struct ChebyshevSmootherType <: SmootherType end
+struct ILU0SmootherType <: SmootherType end
 
 # ── Abstract smoother ─────────────────────────────────────────────────────────
 abstract type AbstractSmoother end
@@ -132,6 +147,52 @@ The result is stored in CSR format matching A's sparsity.
 mutable struct SPAI1Smoother{Tv, Ti} <: AbstractSmoother
     nzval::Vector{Tv}          # nonzero values of the approximate inverse (same pattern as A)
     tmp::Vector{Tv}            # workspace
+end
+
+"""
+    L1JacobiSmoother{Tv}
+
+l1-Jacobi smoother: uses l1 row norms for diagonal scaling instead of just the
+diagonal entry.  More robust for matrices with large off-diagonal entries.
+m[i] = ω / (|a_{i,i}| + Σ_{j≠i} |a_{i,j}|)
+"""
+mutable struct L1JacobiSmoother{Tv} <: AbstractSmoother
+    invdiag::Vector{Tv}        # 1 / l1_row_norm
+    tmp::Vector{Tv}
+    ω::Tv
+end
+
+"""
+    ChebyshevSmoother{Tv}
+
+Chebyshev polynomial smoother. Uses eigenvalue estimates to construct an optimal
+polynomial iteration. Good for SPD problems. Does not require explicit diagonal info.
+"""
+mutable struct ChebyshevSmoother{Tv} <: AbstractSmoother
+    invdiag::Vector{Tv}       # inverse diagonal (for preconditioning)
+    tmp1::Vector{Tv}
+    tmp2::Vector{Tv}
+    λ_min::Tv                 # estimated min eigenvalue
+    λ_max::Tv                 # estimated max eigenvalue
+    degree::Int               # polynomial degree
+end
+
+"""
+    ILU0Smoother{Tv, Ti}
+
+Parallel ILU(0) smoother. Computes an incomplete LU factorization with the same
+sparsity pattern as A, then applies forward/backward substitution using graph
+coloring for parallelism.
+"""
+mutable struct ILU0Smoother{Tv, Ti} <: AbstractSmoother
+    L_nzval::Vector{Tv}       # strictly lower triangle values (same pattern positions as A)
+    U_nzval::Vector{Tv}       # upper triangle + diagonal values
+    diag_idx::Vector{Ti}      # index of diagonal in each row's nzrange
+    colors::Vector{Ti}
+    color_offsets::Vector{Int}
+    color_order::Vector{Ti}
+    num_colors::Int
+    tmp::Vector{Tv}
 end
 
 # ── Prolongation info (stored implicitly) ─────────────────────────────────────
@@ -220,6 +281,9 @@ Fields:
 - `max_row_sum`: Maximum row sum threshold for dependency weakening (default: 0, disabled).
   When > 0, rows where |row_sum|/|a_ii| > max_row_sum have their off-diagonal entries scaled
   down to enforce the threshold, improving AMG robustness for indefinite or nearly singular systems.
+- `cycle_type`: AMG cycle type, `:V` for V-cycle or `:W` for W-cycle (default: `:V`)
+- `strength_type`: Strength of connection algorithm (default: `AbsoluteStrength()`).
+  Use `SignedStrength()` for non-M-matrices with positive off-diagonals.
 """
 struct AMGConfig
     coarsening::CoarseningAlgorithm
@@ -234,6 +298,8 @@ struct AMGConfig
     initial_coarsening_levels::Int
     min_coarse_ratio::Float64
     max_row_sum::Float64
+    cycle_type::Symbol
+    strength_type::StrengthType
 end
 
 function AMGConfig(;
@@ -249,11 +315,14 @@ function AMGConfig(;
     initial_coarsening_levels::Int = 0,
     min_coarse_ratio::Float64 = 0.5,
     max_row_sum::Float64 = 0.0,
+    cycle_type::Symbol = :V,
+    strength_type::StrengthType = AbsoluteStrength(),
 )
+    @assert cycle_type in (:V, :W) "cycle_type must be :V or :W"
     return AMGConfig(coarsening, smoother, max_levels, max_coarse_size,
                      pre_smoothing_steps, post_smoothing_steps, jacobi_omega, verbose,
                      initial_coarsening, initial_coarsening_levels,
-                     min_coarse_ratio, max_row_sum)
+                     min_coarse_ratio, max_row_sum, cycle_type, strength_type)
 end
 
 """

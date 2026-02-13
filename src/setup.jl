@@ -16,11 +16,11 @@ function amg_setup(A::StaticSparsityMatrixCSR{Tv, Ti}, config::AMGConfig=AMGConf
     for lvl in 1:(config.max_levels - 1)
         n = size(A_current, 1)
         n <= config.max_coarse_size && break
-        # Coarsen
-        agg, n_coarse = coarsen(A_current, config.coarsening)
+        # Select coarsening algorithm for this level
+        coarsening_alg = _get_coarsening_for_level(config, lvl)
+        # Coarsen and build prolongation
+        P, n_coarse = _coarsen_and_build_P(A_current, coarsening_alg)
         n_coarse >= n && break  # no coarsening progress
-        # Build prolongation
-        P = build_prolongation(A_current, agg, n_coarse)
         # Compute coarse operator via Galerkin product
         A_coarse, r_map = compute_coarse_sparsity(A_current, P, n_coarse)
         # Build smoother
@@ -33,21 +33,43 @@ function amg_setup(A::StaticSparsityMatrixCSR{Tv, Ti}, config::AMGConfig=AMGConf
         push!(levels, level)
         A_current = A_coarse
     end
-    # Set up direct solver at coarsest level
+    # Set up direct solver at coarsest level with in-place LU buffer
     n_coarse = size(A_current, 1)
     coarse_dense = Matrix{Tv}(undef, n_coarse, n_coarse)
     _csr_to_dense!(coarse_dense, A_current)
-    coarse_factor = lu(coarse_dense)
+    coarse_lu = copy(coarse_dense)
+    coarse_ipiv = Vector{LinearAlgebra.BlasInt}(undef, n_coarse)
+    LinearAlgebra.LAPACK.getrf!(coarse_lu, coarse_ipiv)
+    coarse_factor = LU(coarse_lu, coarse_ipiv, 0)
     coarse_x = zeros(Tv, n_coarse)
     coarse_b = zeros(Tv, n_coarse)
     # Pre-allocate residual buffer for amg_solve! at finest level size
     solve_r = zeros(Tv, n_finest)
-    hierarchy = AMGHierarchy{Tv, Ti}(levels, coarse_dense, coarse_factor, coarse_x, coarse_b, solve_r)
+    hierarchy = AMGHierarchy{Tv, Ti}(levels, coarse_dense, coarse_lu, coarse_ipiv,
+                                      coarse_factor, coarse_x, coarse_b, solve_r)
     t_setup = time() - t_setup
     if config.verbose
         _print_hierarchy_info(hierarchy, n_finest, t_setup)
     end
     return hierarchy
+end
+
+"""
+    _coarsen_and_build_P(A, alg)
+
+Perform coarsening and build the prolongation operator. Dispatches based on
+whether the algorithm uses CF-splitting or aggregation.
+"""
+function _coarsen_and_build_P(A::StaticSparsityMatrixCSR, alg::CoarseningAlgorithm)
+    if uses_cf_splitting(alg)
+        cf, coarse_map, n_coarse = coarsen_cf(A, alg)
+        P = build_cf_prolongation(A, cf, coarse_map, n_coarse, alg.interpolation)
+        return P, n_coarse
+    else
+        agg, n_coarse = coarsen(A, alg)
+        P = build_prolongation(A, agg, n_coarse)
+        return P, n_coarse
+    end
 end
 
 """

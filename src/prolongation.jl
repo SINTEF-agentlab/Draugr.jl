@@ -184,16 +184,17 @@ end
 # ══════════════════════════════════════════════════════════════════════════════
 
 """
-    build_cf_prolongation(A, cf, coarse_map, n_coarse, interp)
+    build_cf_prolongation(A, cf, coarse_map, n_coarse, interp, θ)
 
 Build a prolongation operator from a CF-splitting using the specified interpolation method.
 - `cf[i] == 1` → coarse point, `cf[i] == -1` → fine point
 - `coarse_map[i]` → coarse-grid index for coarse points
+- `θ` → strength threshold used consistently for interpolation stencil selection
 """
 function build_cf_prolongation(A::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                                coarse_map::Vector{Int}, n_coarse::Int,
-                               interp::InterpolationType) where {Tv, Ti}
-    return _build_interpolation(A, cf, coarse_map, n_coarse, interp)
+                               interp::InterpolationType, θ::Real=0.25) where {Tv, Ti}
+    return _build_interpolation(A, cf, coarse_map, n_coarse, interp, θ)
 end
 
 # ── Direct interpolation ─────────────────────────────────────────────────────
@@ -214,11 +215,11 @@ d_i = a_{i,i} + Σ_{k ∈ weak ∪ F_i^s ∪ same_sign} a_{i,k}.
 """
 function _build_interpolation(A::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                               coarse_map::Vector{Int}, n_coarse::Int,
-                              ::DirectInterpolation) where {Tv, Ti}
+                              ::DirectInterpolation, θ::Real=0.25) where {Tv, Ti}
     n_fine = size(A, 1)
     cv = colvals(A)
     nzv = nonzeros(A)
-    is_strong = strength_graph(A, 0.25)
+    is_strong = strength_graph(A, θ)
 
     # First pass: count entries per row
     row_counts = zeros(Int, n_fine)
@@ -340,11 +341,11 @@ where d_i = a_{i,i} + Σ_{k∈weak} a_{i,k}
 """
 function _build_interpolation(A::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                               coarse_map::Vector{Int}, n_coarse::Int,
-                              ::StandardInterpolation) where {Tv, Ti}
+                              ::StandardInterpolation, θ::Real=0.25) where {Tv, Ti}
     n_fine = size(A, 1)
     cv = colvals(A)
     nzv = nonzeros(A)
-    is_strong = strength_graph(A, 0.25)
+    is_strong = strength_graph(A, θ)
 
     # Build P using COO format, then convert to CSR
     I_p = Ti[]
@@ -435,11 +436,11 @@ interpolation targets, resulting in a larger but more accurate interpolation ste
 """
 function _build_interpolation(A::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                               coarse_map::Vector{Int}, n_coarse::Int,
-                              ::ExtendedIInterpolation) where {Tv, Ti}
+                              ::ExtendedIInterpolation, θ::Real=0.25) where {Tv, Ti}
     n_fine = size(A, 1)
     cv = colvals(A)
     nzv = nonzeros(A)
-    is_strong = strength_graph(A, 0.25)
+    is_strong = strength_graph(A, θ)
 
     I_p = Ti[]
     J_p = Ti[]

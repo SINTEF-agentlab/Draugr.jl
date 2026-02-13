@@ -103,7 +103,7 @@ _reduce_theta(a::SmoothedAggregationCoarsening, f) = SmoothedAggregationCoarseni
 _reduce_theta(a::PMISCoarsening, f) = PMISCoarsening(a.θ * f, a.interpolation)
 _reduce_theta(a::HMISCoarsening, f) = HMISCoarsening(a.θ * f, a.interpolation)
 _reduce_theta(a::RSCoarsening, f) = RSCoarsening(a.θ * f, a.interpolation)
-_reduce_theta(a::AggressiveCoarsening, f) = AggressiveCoarsening(a.θ * f)
+_reduce_theta(a::AggressiveCoarsening, f) = AggressiveCoarsening(a.θ * f, a.base, a.interpolation)
 _reduce_theta(::CoarseningAlgorithm, _) = nothing
 
 """
@@ -117,7 +117,12 @@ function _coarsen_and_build_P(A::CSRMatrix, alg::CoarseningAlgorithm,
                               config::AMGConfig=AMGConfig())
     if uses_cf_splitting(alg)
         cf, coarse_map, n_coarse = coarsen_cf(A, alg, config)
-        P = build_cf_prolongation(A, cf, coarse_map, n_coarse, alg.interpolation)
+        P = build_cf_prolongation(A, cf, coarse_map, n_coarse, alg.interpolation, alg.θ)
+        # Apply interpolation truncation if configured
+        tf = _get_trunc_factor(alg.interpolation)
+        if tf > 0
+            P = _truncate_interpolation(P, tf)
+        end
         return P, n_coarse
     else
         agg, n_coarse = coarsen(A, alg, config)
@@ -143,9 +148,61 @@ function _coarsen_and_build_P(A::CSRMatrix, alg::SmoothedAggregationCoarsening,
     return P, n_coarse
 end
 
+"""
+    _coarsen_and_build_P(A, alg::AggressiveCoarsening, config)
+
+Aggressive coarsening dispatch. When `base=:hmis` or `base=:pmis`, performs
+two-pass CF-splitting (HYPRE-style aggressive coarsening) and builds
+interpolation using the configured interpolation type.
+When `base=:pmis` with no interpolation specified, falls back to aggregation-based
+aggressive coarsening.
+"""
+function _coarsen_and_build_P(A::CSRMatrix, alg::AggressiveCoarsening,
+                              config::AMGConfig=AMGConfig())
+    if alg.base == :hmis
+        cf, coarse_map, n_coarse = coarsen_aggressive_cf(A, alg.θ, :hmis; config=config)
+        P = build_cf_prolongation(A, cf, coarse_map, n_coarse, alg.interpolation, alg.θ)
+        tf = _get_trunc_factor(alg.interpolation)
+        if tf > 0
+            P = _truncate_interpolation(P, tf)
+        end
+        return P, n_coarse
+    elseif alg.base == :pmis
+        cf, coarse_map, n_coarse = coarsen_aggressive_cf(A, alg.θ, :pmis; config=config)
+        P = build_cf_prolongation(A, cf, coarse_map, n_coarse, alg.interpolation, alg.θ)
+        tf = _get_trunc_factor(alg.interpolation)
+        if tf > 0
+            P = _truncate_interpolation(P, tf)
+        end
+        return P, n_coarse
+    else
+        # Legacy: aggregation-based aggressive coarsening
+        agg, n_coarse = coarsen(A, alg, config)
+        P = build_prolongation(A, agg, n_coarse)
+        return P, n_coarse
+    end
+end
+
 _has_filtering(::AggregationCoarsening) = true
 _has_filtering(::SmoothedAggregationCoarsening) = true
 _has_filtering(::CoarseningAlgorithm) = false
+
+"""Get the truncation factor from an interpolation type (0 = no truncation)."""
+_get_trunc_factor(i::DirectInterpolation) = i.trunc_factor
+_get_trunc_factor(i::StandardInterpolation) = i.trunc_factor
+_get_trunc_factor(i::ExtendedIInterpolation) = i.trunc_factor
+_get_trunc_factor(::InterpolationType) = 0.0
+
+"""
+    _truncate_interpolation(P, trunc_factor)
+
+Truncate interpolation weights: for each row, drop entries with
+|w| < trunc_factor * max|w| and rescale remaining entries to preserve row sum.
+This is equivalent to HYPRE's AggTruncFactor.
+"""
+function _truncate_interpolation(P::ProlongationOp{Ti, Tv}, trunc_factor::Real) where {Ti, Tv}
+    return _filter_prolongation(P, trunc_factor)
+end
 
 # ── Pretty-printing helpers ──────────────────────────────────────────────────
 
@@ -157,7 +214,7 @@ Return a human-readable string describing the coarsening algorithm and its param
 _coarsening_name(a::AggregationCoarsening) = a.filtering ? "Aggregation(θ=$(a.θ), filtered)" : "Aggregation(θ=$(a.θ))"
 _coarsening_name(a::PMISCoarsening) = "PMIS(θ=$(a.θ), $(typeof(a.interpolation).name.name))"
 _coarsening_name(a::HMISCoarsening) = "HMIS(θ=$(a.θ), $(typeof(a.interpolation).name.name))"
-_coarsening_name(a::AggressiveCoarsening) = "Aggressive(θ=$(a.θ))"
+_coarsening_name(a::AggressiveCoarsening) = "Aggressive(θ=$(a.θ), base=$(a.base), $(typeof(a.interpolation).name.name))"
 _coarsening_name(a::RSCoarsening) = "RS(θ=$(a.θ), $(typeof(a.interpolation).name.name))"
 _coarsening_name(a::SmoothedAggregationCoarsening) = a.filtering ? "SmoothedAgg(θ=$(a.θ), ω=$(round(a.ω; digits=3)), filtered)" : "SmoothedAgg(θ=$(a.θ), ω=$(round(a.ω; digits=3)))"
 

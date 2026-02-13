@@ -653,6 +653,143 @@ function union_roots!(parent::Vector{Int}, a::Int, b::Int)
     end
 end
 
+# ── Aggressive CF-splitting coarsening (HYPRE-style) ─────────────────────────
+
+"""
+    coarsen_aggressive_cf(A, θ, base; config)
+
+Two-pass CF-splitting aggressive coarsening (HYPRE-style). Performs a first pass
+of CF splitting using the base algorithm (HMIS or PMIS), then a second pass
+among the C-points using distance-2 strong connections to further coarsen.
+
+This matches HYPRE's behavior when AggNumLevels > 0 with CoarsenType=10 (HMIS).
+Returns `(cf, coarse_map, n_coarse)` where the CF-splitting assigns more points
+as fine than standard HMIS/PMIS alone.
+"""
+function coarsen_aggressive_cf(A::CSRMatrix{Tv, Ti}, θ::Real, base::Symbol;
+                               config::AMGConfig=AMGConfig(),
+                               rng=Random.default_rng()) where {Tv, Ti}
+    n = size(A, 1)
+    if n <= 1
+        return ones(Int, n), collect(1:n), n
+    end
+    # First pass: standard CF-splitting using base algorithm
+    A_eff = config.max_row_sum > 0 ? _apply_max_row_sum(A, config.max_row_sum) : A
+    if base == :hmis
+        cf1, _, nc1 = coarsen_hmis(A_eff, θ; rng=rng)
+    else  # :pmis
+        cf1, _, nc1 = coarsen_pmis(A_eff, θ; rng=rng)
+    end
+    # Second pass: among C-points from first pass, do another CF-splitting
+    # using distance-2 strong connections to further reduce the coarse set.
+    is_strong = strength_graph(A_eff, θ)
+    cv = colvals(A_eff)
+
+    # Build distance-2 strong connection graph among C-points:
+    # Two C-points are distance-2 connected if they share a strong connection
+    # through any point (F or C).
+    c_indices = Int[]
+    c_local = zeros(Int, n)  # map from original index to C-point index
+    @inbounds for i in 1:n
+        if cf1[i] == 1
+            push!(c_indices, i)
+            c_local[i] = length(c_indices)
+        end
+    end
+    nc1_actual = length(c_indices)
+
+    # For each C-point, find other C-points at distance 2 (through strong graph)
+    # Build a neighbor set for each C-point in the C-subgraph
+    c_neighbors = [Set{Int}() for _ in 1:nc1_actual]
+    @inbounds for i in 1:n
+        # Collect strong C-neighbors of i
+        c_nbrs_of_i = Int[]
+        for nz in nzrange(A_eff, i)
+            j = cv[nz]
+            if j != i && is_strong[nz] && cf1[j] == 1
+                push!(c_nbrs_of_i, c_local[j])
+            end
+        end
+        # All pairs of C-neighbors of i are distance-2 connected in C-graph
+        for a in c_nbrs_of_i
+            for b in c_nbrs_of_i
+                if a != b
+                    push!(c_neighbors[a], b)
+                end
+            end
+            # Also add direct C-C connections
+            if cf1[i] == 1
+                ci = c_local[i]
+                push!(c_neighbors[ci], a)
+                push!(c_neighbors[a], ci)
+            end
+        end
+    end
+
+    # Now do PMIS-style splitting on the C-subgraph
+    c_measure = zeros(Float64, nc1_actual)
+    @inbounds for ci in 1:nc1_actual
+        c_measure[ci] = Float64(length(c_neighbors[ci])) + rand(rng)
+    end
+
+    cf2 = zeros(Int, nc1_actual)  # CF-splitting of C-points: 1=coarse, -1=fine
+    max_iter = nc1_actual + 1
+    for iter in 1:max_iter
+        all_decided = true
+        @inbounds for ci in 1:nc1_actual
+            cf2[ci] != 0 && continue
+            all_decided = false
+            is_max = true
+            for cj in c_neighbors[ci]
+                if cf2[cj] != -1 && c_measure[cj] > c_measure[ci]
+                    is_max = false
+                    break
+                end
+            end
+            if is_max
+                cf2[ci] = 1
+            end
+        end
+        @inbounds for ci in 1:nc1_actual
+            cf2[ci] != 0 && continue
+            for cj in c_neighbors[ci]
+                if cf2[cj] == 1
+                    cf2[ci] = -1
+                    break
+                end
+            end
+        end
+        all_decided && break
+    end
+    @inbounds for ci in 1:nc1_actual
+        if cf2[ci] == 0
+            cf2[ci] = 1
+        end
+    end
+
+    # Combine: original F-points stay F; C-points that became F in second pass stay F
+    cf_final = copy(cf1)
+    @inbounds for ci in 1:nc1_actual
+        if cf2[ci] == -1
+            cf_final[c_indices[ci]] = -1  # demote to fine
+        end
+    end
+
+    # Ensure every F-point has at least one strong C-neighbor
+    _ensure_fine_have_coarse_neighbor!(cf_final, A_eff, is_strong)
+
+    # Build coarse map
+    n_coarse = 0
+    coarse_map = zeros(Int, n)
+    @inbounds for i in 1:n
+        if cf_final[i] == 1
+            n_coarse += 1
+            coarse_map[i] = n_coarse
+        end
+    end
+    return cf_final, coarse_map, n_coarse
+end
+
 # ── Dispatch coarsening by type ──────────────────────────────────────────────
 
 function coarsen(A::CSRMatrix, alg::AggregationCoarsening,

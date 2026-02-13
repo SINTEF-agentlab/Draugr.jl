@@ -21,13 +21,6 @@ struct CSRMatrix{Tv, Ti<:Integer, Vr<:AbstractVector{Ti}, Vc<:AbstractVector{Ti}
     ncol::Int
 end
 
-# Convenience constructor that infers vector types
-function CSRMatrix(rowptr::AbstractVector{Ti}, colval::AbstractVector{Ti},
-                   nzval::AbstractVector{Tv}, nrow::Int, ncol::Int) where {Tv, Ti<:Integer}
-    return CSRMatrix{Tv, Ti, typeof(rowptr), typeof(colval), typeof(nzval)}(
-        rowptr, colval, nzval, nrow, ncol)
-end
-
 Base.size(A::CSRMatrix) = (A.nrow, A.ncol)
 Base.size(A::CSRMatrix, d::Int) = d == 1 ? A.nrow : (d == 2 ? A.ncol : 1)
 SparseArrays.nnz(A::CSRMatrix) = length(A.nzval)

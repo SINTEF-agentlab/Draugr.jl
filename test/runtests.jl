@@ -160,7 +160,7 @@ end
         # Test TransposeMap structure
         @test length(Pt_map.offsets) == nc + 1
         @test Pt_map.offsets[1] == 1
-        @test Pt_map.offsets[nc + 1] == P.nrow + 1  # every fine row maps to one coarse row
+        @test Pt_map.offsets[nc + 1] == P.nrow + 1  # aggregation P: one NZ per fine row
         # Verify restrict! against explicit P^T * r computation
         rf2 = randn(10)
         bc2 = zeros(nc)

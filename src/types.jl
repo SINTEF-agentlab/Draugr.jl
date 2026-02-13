@@ -231,9 +231,9 @@ end
 Pre-computed transpose structure for P, mapping coarse rows to fine rows.
 Enables atomic-free restriction (P^T * r) by parallelizing over coarse rows.
 
-- `offsets[J]` to `offsets[J+1]-1` gives the range of fine rows that have
-  P[i, J] != 0.
-- `fine_rows[k]` is the fine row index.
+- `offsets[J]` to `offsets[J+1]-1` gives the range of fine rows i that have
+  P[i, J] != 0 (i.e., fine rows that interpolate from coarse column J).
+- `fine_rows[k]` is the fine row index i where P[i, J] is nonzero.
 - `p_nz_idx[k]` is the index into P.nzval for the weight P[fine_rows[k], J].
 """
 struct TransposeMap{Ti<:Integer}

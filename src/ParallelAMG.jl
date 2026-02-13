@@ -4,7 +4,6 @@ using SparseArrays
 using LinearAlgebra
 using Random
 using KernelAbstractions
-using Atomix
 using Printf
 
 # Import StaticCSR types from Jutul

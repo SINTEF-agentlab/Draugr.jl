@@ -73,7 +73,7 @@ function _vcycle_descend!(x::AbstractVector{Tv}, b::AbstractVector{Tv},
     # Compute residual: r = b - A*x (parallelized, no allocations)
     compute_residual!(r, A, x, b; backend=backend)
     # Restrict residual to coarse grid
-    restrict!(bc, P, r; backend=backend)
+    restrict!(bc, level.Pt_map, P, r; backend=backend)
     # Solve on coarse grid
     fill!(xc, zero(Tv))
     if lvl < nlevels

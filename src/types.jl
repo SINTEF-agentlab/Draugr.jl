@@ -226,18 +226,40 @@ mutable struct ProlongationOp{Ti<:Integer, Tv}
 end
 
 """
+    TransposeMap{Ti}
+
+Pre-computed transpose structure for P, mapping coarse rows to fine rows.
+Enables atomic-free restriction (P^T * r) by parallelizing over coarse rows.
+
+- `offsets[J]` to `offsets[J+1]-1` gives the range of fine rows that have
+  P[i, J] != 0.
+- `fine_rows[k]` is the fine row index.
+- `p_nz_idx[k]` is the index into P.nzval for the weight P[fine_rows[k], J].
+"""
+struct TransposeMap{Ti<:Integer}
+    offsets::Vector{Ti}    # n_coarse + 1 entries
+    fine_rows::Vector{Ti}  # which fine rows map to each coarse row
+    p_nz_idx::Vector{Ti}   # index into P.nzval for the weight
+end
+
+"""
     RestrictionMap{Ti}
 
-Maps the Galerkin product triples to coarse matrix nonzero indices for in-place
-computation during resetup. Each entry k represents a contribution:
-  `P.nzval[triple_pi_idx[k]] * A.nzval[triple_anz_idx[k]] * P.nzval[triple_pj_idx[k]]`
-that is accumulated (atomically) into `A_coarse.nzval[triple_coarse_nz[k]]`.
+Maps the Galerkin product triples to coarse matrix nonzero entries for in-place
+computation during resetup. Triples are grouped by their destination coarse NZ
+index so that `galerkin_product!` can parallelize over coarse NZ entries (one
+thread per output entry) without atomics.
+
+- `nz_offsets[k]` to `nz_offsets[k+1]-1` gives the range of triples that
+  contribute to coarse NZ entry `k`.
+- Each triple `t` represents the contribution:
+  `P.nzval[triple_pi_idx[t]] * A.nzval[triple_anz_idx[t]] * P.nzval[triple_pj_idx[t]]`
 """
 struct RestrictionMap{Ti<:Integer}
-    triple_coarse_nz::Vector{Ti}  # coarse NZ index to accumulate into
-    triple_pi_idx::Vector{Ti}     # P.nzval index for p_i weight
-    triple_anz_idx::Vector{Ti}    # A.nzval index for a_ij value
-    triple_pj_idx::Vector{Ti}     # P.nzval index for p_j weight
+    nz_offsets::Vector{Ti}        # offset array: nnz_c + 1 entries
+    triple_pi_idx::Vector{Ti}     # P.nzval index for p_i weight (sorted by dest NZ)
+    triple_anz_idx::Vector{Ti}    # A.nzval index for a_ij value (sorted by dest NZ)
+    triple_pj_idx::Vector{Ti}     # P.nzval index for p_j weight (sorted by dest NZ)
 end
 
 # ── AMG Level ─────────────────────────────────────────────────────────────────
@@ -252,6 +274,7 @@ Conversion from `StaticSparsityMatrixCSR` happens at the API boundary in
 mutable struct AMGLevel{Tv, Ti<:Integer}
     A::CSRMatrix{Tv, Ti}
     P::ProlongationOp{Ti, Tv}
+    Pt_map::TransposeMap{Ti}
     R_map::RestrictionMap{Ti}
     smoother::AbstractSmoother
     r::Vector{Tv}      # residual workspace

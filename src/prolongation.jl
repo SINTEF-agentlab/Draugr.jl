@@ -607,28 +607,69 @@ end
 end
 
 """
-    restrict!(b_coarse, P, r_fine)
+    build_transpose_map(P) -> TransposeMap
+
+Build a transpose structure for prolongation operator P, mapping each coarse
+column J to its contributing fine rows. Enables atomic-free restriction.
+"""
+function build_transpose_map(P::ProlongationOp{Ti, Tv}) where {Ti, Tv}
+    n_fine = P.nrow
+    n_coarse = P.ncol
+    # Count entries per coarse column
+    col_counts = zeros(Int, n_coarse)
+    @inbounds for i in 1:n_fine
+        for nz in P.rowptr[i]:(P.rowptr[i+1]-1)
+            col_counts[P.colval[nz]] += 1
+        end
+    end
+    # Build offsets
+    offsets = Vector{Ti}(undef, n_coarse + 1)
+    offsets[1] = Ti(1)
+    for j in 1:n_coarse
+        offsets[j+1] = offsets[j] + Ti(col_counts[j])
+    end
+    total = offsets[n_coarse + 1] - Ti(1)
+    fine_rows = Vector{Ti}(undef, total)
+    p_nz_idx = Vector{Ti}(undef, total)
+    # Fill entries
+    pos = copy(offsets[1:n_coarse])
+    @inbounds for i in 1:n_fine
+        for nz in P.rowptr[i]:(P.rowptr[i+1]-1)
+            J = P.colval[nz]
+            fine_rows[pos[J]] = Ti(i)
+            p_nz_idx[pos[J]] = Ti(nz)
+            pos[J] += Ti(1)
+        end
+    end
+    return TransposeMap{Ti}(offsets, fine_rows, p_nz_idx)
+end
+
+"""
+    restrict!(b_coarse, Pt_map, P, r_fine)
 
 Apply restriction (P^T): b_coarse = P^T * r_fine.
-For aggregation-based P (one nonzero per row), this is race-free when
-parallelized over fine rows using atomics.
+Uses the pre-computed TransposeMap to parallelize over coarse rows without atomics.
 """
-function restrict!(b_coarse::AbstractVector, P::ProlongationOp, r_fine::AbstractVector;
+function restrict!(b_coarse::AbstractVector, Pt_map::TransposeMap,
+                   P::ProlongationOp, r_fine::AbstractVector;
                    backend=DEFAULT_BACKEND)
-    fill!(b_coarse, zero(eltype(b_coarse)))
+    n_coarse = P.ncol
     kernel! = restrict_kernel!(backend, 64)
-    kernel!(b_coarse, P.rowptr, P.colval, P.nzval, r_fine; ndrange=P.nrow)
+    kernel!(b_coarse, Pt_map.offsets, Pt_map.fine_rows,
+            Pt_map.p_nz_idx, P.nzval, r_fine; ndrange=n_coarse)
     KernelAbstractions.synchronize(backend)
     return b_coarse
 end
 
-@kernel function restrict_kernel!(b_coarse, @Const(P_rowptr), @Const(P_colval),
-                                  @Const(P_nzval), @Const(r_fine))
-    i = @index(Global)
+@kernel function restrict_kernel!(b_coarse, @Const(offsets), @Const(fine_rows),
+                                  @Const(p_nz_idx), @Const(P_nzval), @Const(r_fine))
+    J = @index(Global)
     @inbounds begin
-        for nz in P_rowptr[i]:(P_rowptr[i+1]-1)
-            j = P_colval[nz]
-            Atomix.@atomic b_coarse[j] += P_nzval[nz] * r_fine[i]
+        acc = zero(eltype(b_coarse))
+        for k in offsets[J]:(offsets[J+1]-1)
+            i = fine_rows[k]
+            acc += P_nzval[p_nz_idx[k]] * r_fine[i]
         end
+        b_coarse[J] = acc
     end
 end

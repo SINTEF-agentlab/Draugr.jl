@@ -113,33 +113,35 @@ function coarsen_aggregation(A::CSRMatrix{Tv, Ti}, θ::Real) where {Tv, Ti}
     # Phase 3: merge small aggregates (size ≤ 1) into neighboring aggregates
     # This prevents the pathological case of many singleton aggregates at
     # coarser levels where the strong graph becomes sparse.
-    agg_sizes = zeros(Int, n_coarse)
+    # Sizes are tracked only at union-find roots for correctness.
+    aggregate_sizes = zeros(Int, n_coarse)
     @inbounds for i in 1:n
-        agg_sizes[agg[i]] += 1
+        aggregate_sizes[agg[i]] += 1
     end
     # Build merge map using union-find
     merge_map = collect(1:n_coarse)
     @inbounds for i in 1:n
-        my_agg = find_root!(merge_map, agg[i])
-        agg_sizes[my_agg] > 1 && continue
+        my_root = find_root!(merge_map, agg[i])
+        aggregate_sizes[my_root] > 1 && continue
         # Find the best neighboring aggregate to merge into
         best_target = 0
         best_val = zero(real(Tv))
         for nz in nzrange(A, i)
             j = cv[nz]
             j == i && continue
-            j_agg = find_root!(merge_map, agg[j])
-            if j_agg != my_agg && abs(nzv[nz]) > best_val
+            j_root = find_root!(merge_map, agg[j])
+            if j_root != my_root && abs(nzv[nz]) > best_val
                 best_val = abs(nzv[nz])
-                best_target = j_agg
+                best_target = j_root
             end
         end
         if best_target != 0
-            # Merge my_agg into best_target
-            union_roots!(merge_map, best_target, my_agg)
-            # Update size tracking
-            root = find_root!(merge_map, best_target)
-            agg_sizes[root] = agg_sizes[my_agg] + agg_sizes[best_target]
+            # Merge my_root into best_target; accumulate size at new root
+            old_my_size = aggregate_sizes[my_root]
+            old_tgt_size = aggregate_sizes[best_target]
+            union_roots!(merge_map, best_target, my_root)
+            new_root = find_root!(merge_map, best_target)
+            aggregate_sizes[new_root] = old_my_size + old_tgt_size
         end
     end
     # Compact aggregate numbering after merges

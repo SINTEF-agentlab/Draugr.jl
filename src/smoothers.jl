@@ -817,7 +817,7 @@ function _ilu0_factorize!(L_nzval::Vector{Tv}, U_nzval::Vector{Tv},
 end
 
 """Find column `col` in row range [start, stop] of colval array."""
-function _find_nz_in_row(cv::Vector{Ti}, start::Ti, stop::Ti, col::Ti) where Ti
+function _find_nz_in_row(cv::AbstractVector{Ti}, start::Ti, stop::Ti, col::Ti) where Ti
     # Binary search since columns are sorted in CSR
     lo, hi = Int(start), Int(stop)
     while lo <= hi

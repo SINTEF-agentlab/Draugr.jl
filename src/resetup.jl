@@ -1,12 +1,8 @@
 """
-    amg_resetup!(hierarchy, A_new, config)
+    amg_resetup!(hierarchy, A_new::StaticSparsityMatrixCSR, config)
 
-Re-setup the AMG hierarchy for new matrix coefficients, reusing the existing
-sparsity pattern and prolongation structure. This updates:
-1. The fine-grid matrix at the first level
-2. Galerkin products at all levels (in-place, parallelized with KA kernels)
-3. Smoothers at all levels
-4. The direct solver at the coarsest level
+External API entry point: convert `StaticSparsityMatrixCSR` to `CSRMatrix` once
+and forward to the general resetup.
 """
 function amg_resetup!(hierarchy::AMGHierarchy{Tv, Ti},
                       A_new::StaticSparsityMatrixCSR{Tv, Ti},
@@ -14,7 +10,6 @@ function amg_resetup!(hierarchy::AMGHierarchy{Tv, Ti},
                       backend=DEFAULT_BACKEND) where {Tv, Ti}
     nlevels = length(hierarchy.levels)
     if nlevels == 0
-        # Only one level (coarsest), update direct solver
         A_csr = csr_from_static(A_new)
         _update_coarse_solver!(hierarchy, A_csr; backend=backend)
         return hierarchy
@@ -27,15 +22,12 @@ function amg_resetup!(hierarchy::AMGHierarchy{Tv, Ti},
     for lvl in 1:(nlevels - 1)
         level = hierarchy.levels[lvl]
         next_level = hierarchy.levels[lvl + 1]
-        # Recompute A_coarse in-place
         galerkin_product!(next_level.A, level.A, level.P, level.R_map; backend=backend)
-        # Update smoother
         update_smoother!(next_level.smoother, next_level.A; backend=backend)
     end
-    # Recompute Galerkin product for the last level to get the coarsest matrix
+    # Recompute coarsest dense matrix
     last_level = hierarchy.levels[nlevels]
     _recompute_coarsest_dense!(hierarchy, last_level; backend=backend)
-    # In-place LU refactorization: copy dense values to LU buffer, then factorize
     copyto!(hierarchy.coarse_lu, hierarchy.coarse_A)
     LinearAlgebra.LAPACK.getrf!(hierarchy.coarse_lu, hierarchy.coarse_ipiv)
     hierarchy.coarse_factor = LU(hierarchy.coarse_lu, hierarchy.coarse_ipiv, 0)

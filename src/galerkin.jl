@@ -67,7 +67,7 @@ function compute_coarse_sparsity(A_fine::CSRMatrix{Tv, Ti},
         coarse_nz_map[(I, J)] = idx
         pos[I] += 1
     end
-    A_coarse = CSRMatrix{Tv, Ti}(rowptr_c, colval_c, nzval_c, n_coarse, n_coarse)
+    A_coarse = CSRMatrix(rowptr_c, colval_c, nzval_c, n_coarse, n_coarse)
     # Fill coarse NZ indices in the triple map
     # Re-iterate over the same order to fill triple_ci
     k = 0

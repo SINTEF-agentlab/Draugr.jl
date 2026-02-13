@@ -51,14 +51,12 @@ include("cycle.jl")
 # Jutul preconditioner interface
 include("jutul_interface.jl")
 
-# Auto-conversion wrappers (StaticSparsityMatrixCSR → CSRMatrix)
-include("auto_convert.jl")
-
 # Public API
 export StaticSparsityMatrixCSR, static_sparsity_sparse, static_csr_from_csc
 export colvals, rowptr
 export CSRMatrix
-export AggregationCoarsening, PMISCoarsening, HMISCoarsening, AggressiveCoarsening, SmoothedAggregationCoarsening
+export AggregationCoarsening, PMISCoarsening, HMISCoarsening, AggressiveCoarsening
+export SmoothedAggregationCoarsening, RSCoarsening
 export DirectInterpolation, StandardInterpolation, ExtendedIInterpolation
 export AbsoluteStrength, SignedStrength
 export AMGConfig, AMGHierarchy, AMGLevel

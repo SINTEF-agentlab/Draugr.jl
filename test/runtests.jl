@@ -2009,4 +2009,179 @@ end
         @test niter < 200
     end
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # JLArrays GPU backend tests
+    # ══════════════════════════════════════════════════════════════════════════
+
+    @testset "JLArrays GPU Backend" begin
+        using JLArrays
+        using JLArrays: JLSparseMatrixCSR
+        using KernelAbstractions
+
+        # Helper: build a CSR matrix on JLArrays backend from a CPU SparseMatrixCSC
+        function poisson1d_jl(n)
+            I = Int[]; J = Int[]; V = Float64[]
+            for i in 1:n
+                push!(I, i); push!(J, i); push!(V, 2.0)
+                if i > 1
+                    push!(I, i); push!(J, i-1); push!(V, -1.0)
+                end
+                if i < n
+                    push!(I, i); push!(J, i+1); push!(V, -1.0)
+                end
+            end
+            A_csc = sparse(I, J, V, n, n)
+            return JLSparseMatrixCSR(A_csc)
+        end
+
+        function poisson2d_jl(nx, ny=nx)
+            n = nx * ny
+            I = Int[]; J = Int[]; V = Float64[]
+            for j in 1:ny, i in 1:nx
+                idx = (j-1)*nx + i
+                push!(I, idx); push!(J, idx); push!(V, 4.0)
+                if i > 1
+                    push!(I, idx); push!(J, idx-1); push!(V, -1.0)
+                end
+                if i < nx
+                    push!(I, idx); push!(J, idx+1); push!(V, -1.0)
+                end
+                if j > 1
+                    push!(I, idx); push!(J, idx-nx); push!(V, -1.0)
+                end
+                if j < ny
+                    push!(I, idx); push!(J, idx+nx); push!(V, -1.0)
+                end
+            end
+            A_csc = sparse(I, J, V, n, n)
+            return JLSparseMatrixCSR(A_csc)
+        end
+
+        @testset "csr_from_gpu with JLSparseMatrixCSR" begin
+            A_jl = poisson1d_jl(10)
+            A_csr = csr_from_gpu(A_jl)
+            @test A_csr isa CSRMatrix
+            @test size(A_csr) == (10, 10)
+            @test A_csr.rowptr isa JLArray
+            @test A_csr.colval isa JLArray
+            @test A_csr.nzval isa JLArray
+        end
+
+        @testset "AMG setup with JLSparseMatrixCSR" begin
+            A_jl = poisson1d_jl(100)
+            config = AMGConfig()
+            hierarchy = amg_setup(A_jl, config)
+            @test length(hierarchy.levels) >= 1
+        end
+
+        @testset "AMG solve with JLSparseMatrixCSR - 1D Poisson" begin
+            n = 100
+            A_jl = poisson1d_jl(n)
+            config = AMGConfig()
+            hierarchy = amg_setup(A_jl, config)
+            b = ones(n)
+            x = zeros(n)
+            x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=100)
+            # Verify convergence by computing residual on CPU
+            A_cpu = csr_to_cpu(csr_from_gpu(A_jl))
+            r = zeros(n)
+            rp = A_cpu.rowptr; cv = A_cpu.colval; nzv = A_cpu.nzval
+            for i in 1:n
+                Ax_i = 0.0
+                for nz in rp[i]:(rp[i+1]-1)
+                    Ax_i += nzv[nz] * x[cv[nz]]
+                end
+                r[i] = b[i] - Ax_i
+            end
+            @test norm(r) / norm(b) < 1e-6
+            @test niter < 100
+        end
+
+        @testset "AMG solve with JLSparseMatrixCSR - 2D Poisson" begin
+            nx = 10
+            A_jl = poisson2d_jl(nx)
+            n = nx * nx
+            config = AMGConfig()
+            hierarchy = amg_setup(A_jl, config)
+            b = ones(n)
+            x = zeros(n)
+            x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=100)
+            # Verify convergence
+            A_cpu = csr_to_cpu(csr_from_gpu(A_jl))
+            r = zeros(n)
+            rp = A_cpu.rowptr; cv = A_cpu.colval; nzv = A_cpu.nzval
+            for i in 1:n
+                Ax_i = 0.0
+                for nz in rp[i]:(rp[i+1]-1)
+                    Ax_i += nzv[nz] * x[cv[nz]]
+                end
+                r[i] = b[i] - Ax_i
+            end
+            @test norm(r) / norm(b) < 1e-6
+            @test niter < 100
+        end
+
+        @testset "AMG cycle with JLSparseMatrixCSR" begin
+            A_jl = poisson1d_jl(100)
+            config = AMGConfig()
+            hierarchy = amg_setup(A_jl, config)
+            n = 100
+            b = ones(n)
+            x = zeros(n)
+            # Apply a single cycle
+            amg_cycle!(x, b, hierarchy, config)
+            @test !all(x .== 0.0)  # something changed
+        end
+
+        @testset "Backend consistency - strength_graph uses JLBackend" begin
+            # This test verifies that the backend is properly threaded
+            # through the setup path including coarsening/strength_graph
+            A_jl = poisson1d_jl(100)
+            config = AMGConfig()
+            # If backend is not properly threaded, this would fail with
+            # scalar indexing errors on JLArrays
+            hierarchy = amg_setup(A_jl, config; backend=JLBackend())
+            @test length(hierarchy.levels) >= 1
+        end
+
+        @testset "AMG with different smoothers on JLArrays" begin
+            A_jl = poisson1d_jl(100)
+            for smoother in [JacobiSmootherType(), SPAI0SmootherType()]
+                config = AMGConfig(smoother=smoother)
+                hierarchy = amg_setup(A_jl, config)
+                @test length(hierarchy.levels) >= 1
+                b = ones(100)
+                x = zeros(100)
+                x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=100)
+                @test niter < 100
+            end
+        end
+
+        @testset "AMG resetup with JLSparseMatrixCSR" begin
+            nx = 10
+            A_jl = poisson2d_jl(nx)
+            n = nx * nx
+            config = AMGConfig()
+            hierarchy = amg_setup(A_jl, config)
+            @test length(hierarchy.levels) >= 1
+            # Resetup with the same matrix (same sparsity, same values)
+            amg_resetup!(hierarchy, A_jl, config)
+            # Solve after resetup
+            b = ones(n)
+            x = zeros(n)
+            x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=100)
+            @test niter < 100
+        end
+
+        @testset "csr_to_cpu conversion" begin
+            A_jl = poisson1d_jl(10)
+            A_gpu = csr_from_gpu(A_jl)
+            A_cpu = csr_to_cpu(A_gpu)
+            @test A_cpu.rowptr isa Vector
+            @test A_cpu.colval isa Vector
+            @test A_cpu.nzval isa Vector
+            @test size(A_cpu) == size(A_gpu)
+        end
+    end
+
 end

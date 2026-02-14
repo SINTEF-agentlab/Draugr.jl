@@ -35,34 +35,34 @@ end
 """
     amg_resetup!(hierarchy, A_new::CuSparseMatrixCSR, config)
 
-AMG resetup accepting a CUDA sparse CSR matrix. Unwraps the GPU arrays into
-a `CSRMatrix` and copies values into the existing hierarchy.
+AMG resetup accepting a CUDA sparse CSR matrix. Unwraps the GPU arrays,
+converts to CPU, and copies values into the existing hierarchy.
 """
 function ParallelAMG.amg_resetup!(hierarchy::AMGHierarchy{Tv, Ti},
                                   A_new::CuSparseMatrixCSR{Tv, Ti},
                                   config::AMGConfig=AMGConfig();
                                   backend=CUDABackend()) where {Tv, Ti}
-    A_csr = ParallelAMG.csr_from_gpu(A_new)
+    A_csr = ParallelAMG.csr_to_cpu(ParallelAMG.csr_from_gpu(A_new))
     block_size = config.block_size
     nlevels = length(hierarchy.levels)
     if nlevels == 0
-        ParallelAMG._update_coarse_solver!(hierarchy, A_csr; backend=backend, block_size=block_size)
+        ParallelAMG._update_coarse_solver!(hierarchy, A_csr; block_size=block_size)
         return hierarchy
     end
     # Copy nonzero values from new matrix into existing level 1
     level1 = hierarchy.levels[1]
-    ParallelAMG._copy_nzvals!(level1.A, A_csr; backend=backend, block_size=block_size)
-    ParallelAMG.update_smoother!(level1.smoother, level1.A; backend=backend, block_size=block_size)
+    ParallelAMG._copy_nzvals!(level1.A, A_csr; block_size=block_size)
+    ParallelAMG.update_smoother!(level1.smoother, level1.A; block_size=block_size)
     # Update subsequent levels via Galerkin products
     for lvl in 1:(nlevels - 1)
         level = hierarchy.levels[lvl]
         next_level = hierarchy.levels[lvl + 1]
-        ParallelAMG.galerkin_product!(next_level.A, level.A, level.P, level.R_map; backend=backend, block_size=block_size)
-        ParallelAMG.update_smoother!(next_level.smoother, next_level.A; backend=backend, block_size=block_size)
+        ParallelAMG.galerkin_product!(next_level.A, level.A, level.P, level.R_map; block_size=block_size)
+        ParallelAMG.update_smoother!(next_level.smoother, next_level.A; block_size=block_size)
     end
     # Recompute coarsest dense matrix and LU
     last_level = hierarchy.levels[nlevels]
-    ParallelAMG._recompute_coarsest_dense!(hierarchy, last_level; backend=backend)
+    ParallelAMG._recompute_coarsest_dense!(hierarchy, last_level)
     copyto!(hierarchy.coarse_lu, hierarchy.coarse_A)
     LinearAlgebra.LAPACK.getrf!(hierarchy.coarse_lu, hierarchy.coarse_ipiv)
     hierarchy.coarse_factor = LinearAlgebra.LU(hierarchy.coarse_lu, hierarchy.coarse_ipiv, 0)

@@ -221,7 +221,7 @@ function _build_interpolation(A::CSRMatrix{Tv, Ti}, cf::Vector{Int},
     n_fine = size(A, 1)
     cv = colvals(A)
     nzv = nonzeros(A)
-    is_strong = strength_graph(A, θ; backend=backend, block_size=block_size)
+    is_strong = strength_graph(A, θ)
 
     # First pass: count entries per row
     row_counts = zeros(Int, n_fine)
@@ -348,7 +348,7 @@ function _build_interpolation(A::CSRMatrix{Tv, Ti}, cf::Vector{Int},
     n_fine = size(A, 1)
     cv = colvals(A)
     nzv = nonzeros(A)
-    is_strong = strength_graph(A, θ; backend=backend, block_size=block_size)
+    is_strong = strength_graph(A, θ)
 
     # Build P using COO format, then convert to CSR
     I_p = Ti[]
@@ -444,7 +444,7 @@ function _build_interpolation(A::CSRMatrix{Tv, Ti}, cf::Vector{Int},
     n_fine = size(A, 1)
     cv = colvals(A)
     nzv = nonzeros(A)
-    is_strong = strength_graph(A, θ; backend=backend, block_size=block_size)
+    is_strong = strength_graph(A, θ)
 
     I_p = Ti[]
     J_p = Ti[]

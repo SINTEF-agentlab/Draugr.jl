@@ -164,13 +164,14 @@ abstract type AbstractSmoother end
 
 # ── Smoother types ────────────────────────────────────────────────────────────
 """
-    JacobiSmoother{Tv}
+    JacobiSmoother{Tv, V}
 
 Weighted Jacobi smoother.  Stores the inverse diagonal and a workspace vector.
+Vector type `V` matches the device (CPU `Vector` or GPU array type).
 """
-mutable struct JacobiSmoother{Tv} <: AbstractSmoother
-    invdiag::Vector{Tv}
-    tmp::Vector{Tv}
+mutable struct JacobiSmoother{Tv, V<:AbstractVector{Tv}} <: AbstractSmoother
+    invdiag::V
+    tmp::V
     ω::Tv      # damping factor
 end
 
@@ -189,15 +190,15 @@ mutable struct ColoredGaussSeidelSmoother{Tv, Ti} <: AbstractSmoother
 end
 
 """
-    SPAI0Smoother{Tv}
+    SPAI0Smoother{Tv, V}
 
 SPAI(0) smoother: diagonal sparse approximate inverse. M ≈ diag(A)⁻¹ where
 M[i,i] = A[i,i] / (A[i,:] ⋅ A[:,i]).  This is the minimizer of ‖I - M*A‖_F
 restricted to diagonal M.
 """
-mutable struct SPAI0Smoother{Tv} <: AbstractSmoother
-    m_diag::Vector{Tv}         # diagonal of sparse approximate inverse
-    tmp::Vector{Tv}            # workspace
+mutable struct SPAI0Smoother{Tv, V<:AbstractVector{Tv}} <: AbstractSmoother
+    m_diag::V         # diagonal of sparse approximate inverse
+    tmp::V            # workspace
 end
 
 """
@@ -214,28 +215,28 @@ mutable struct SPAI1Smoother{Tv, Ti} <: AbstractSmoother
 end
 
 """
-    L1JacobiSmoother{Tv}
+    L1JacobiSmoother{Tv, V}
 
 l1-Jacobi smoother: uses l1 row norms for diagonal scaling instead of just the
 diagonal entry.  More robust for matrices with large off-diagonal entries.
 m[i] = ω / (|a_{i,i}| + Σ_{j≠i} |a_{i,j}|)
 """
-mutable struct L1JacobiSmoother{Tv} <: AbstractSmoother
-    invdiag::Vector{Tv}        # 1 / l1_row_norm
-    tmp::Vector{Tv}
+mutable struct L1JacobiSmoother{Tv, V<:AbstractVector{Tv}} <: AbstractSmoother
+    invdiag::V        # 1 / l1_row_norm
+    tmp::V
     ω::Tv
 end
 
 """
-    ChebyshevSmoother{Tv}
+    ChebyshevSmoother{Tv, V}
 
 Chebyshev polynomial smoother. Uses eigenvalue estimates to construct an optimal
 polynomial iteration. Good for SPD problems. Does not require explicit diagonal info.
 """
-mutable struct ChebyshevSmoother{Tv} <: AbstractSmoother
-    invdiag::Vector{Tv}       # inverse diagonal (for preconditioning)
-    tmp1::Vector{Tv}
-    tmp2::Vector{Tv}
+mutable struct ChebyshevSmoother{Tv, V<:AbstractVector{Tv}} <: AbstractSmoother
+    invdiag::V       # inverse diagonal (for preconditioning)
+    tmp1::V
+    tmp2::V
     λ_min::Tv                 # estimated min eigenvalue
     λ_max::Tv                 # estimated max eigenvalue
     degree::Int               # polynomial degree
@@ -261,22 +262,28 @@ end
 
 # ── Prolongation info (stored implicitly) ─────────────────────────────────────
 """
-    ProlongationOp{Ti, Tv}
+    ProlongationOp{Ti, Tv, Vi, Vv}
 
 Stores the prolongation operator implicitly.
 - `rowptr`, `colval`, `nzval` define the sparse P in CSR layout.
 - `nrow` and `ncol` are the dimensions (n_fine × n_coarse).
+Vector types are parameterized to support GPU arrays.
 """
-mutable struct ProlongationOp{Ti<:Integer, Tv}
-    rowptr::Vector{Ti}
-    colval::Vector{Ti}
-    nzval::Vector{Tv}
+mutable struct ProlongationOp{Ti<:Integer, Tv, Vi<:AbstractVector{Ti}, Vv<:AbstractVector{Tv}}
+    rowptr::Vi
+    colval::Vi
+    nzval::Vv
     nrow::Int
     ncol::Int
 end
 
+# Convenience constructor for CPU vectors
+function ProlongationOp{Ti, Tv}(rowptr::Vector{Ti}, colval::Vector{Ti}, nzval::Vector{Tv}, nrow::Int, ncol::Int) where {Ti, Tv}
+    return ProlongationOp{Ti, Tv, Vector{Ti}, Vector{Tv}}(rowptr, colval, nzval, nrow, ncol)
+end
+
 """
-    TransposeMap{Ti}
+    TransposeMap{Ti, Vi}
 
 Pre-computed transpose structure for P, mapping coarse rows to fine rows.
 Enables atomic-free restriction (P^T * r) by parallelizing over coarse rows.
@@ -286,14 +293,14 @@ Enables atomic-free restriction (P^T * r) by parallelizing over coarse rows.
 - `fine_rows[k]` is the fine row index i where P[i, J] is nonzero.
 - `p_nz_idx[k]` is the index into P.nzval for the weight P[fine_rows[k], J].
 """
-struct TransposeMap{Ti<:Integer}
-    offsets::Vector{Ti}    # n_coarse + 1 entries
-    fine_rows::Vector{Ti}  # which fine rows map to each coarse row
-    p_nz_idx::Vector{Ti}   # index into P.nzval for the weight
+struct TransposeMap{Ti<:Integer, Vi<:AbstractVector{Ti}}
+    offsets::Vi    # n_coarse + 1 entries
+    fine_rows::Vi  # which fine rows map to each coarse row
+    p_nz_idx::Vi   # index into P.nzval for the weight
 end
 
 """
-    RestrictionMap{Ti}
+    RestrictionMap{Ti, Vi}
 
 Maps the Galerkin product triples to coarse matrix nonzero entries for in-place
 computation during resetup. Triples are grouped by their destination coarse NZ
@@ -305,11 +312,11 @@ thread per output entry) without atomics.
 - Each triple `t` represents the contribution:
   `P.nzval[triple_pi_idx[t]] * A.nzval[triple_anz_idx[t]] * P.nzval[triple_pj_idx[t]]`
 """
-struct RestrictionMap{Ti<:Integer}
-    nz_offsets::Vector{Ti}        # offset array: nnz_c + 1 entries
-    triple_pi_idx::Vector{Ti}     # P.nzval index for p_i weight (sorted by dest NZ)
-    triple_anz_idx::Vector{Ti}    # A.nzval index for a_ij value (sorted by dest NZ)
-    triple_pj_idx::Vector{Ti}     # P.nzval index for p_j weight (sorted by dest NZ)
+struct RestrictionMap{Ti<:Integer, Vi<:AbstractVector{Ti}}
+    nz_offsets::Vi        # offset array: nnz_c + 1 entries
+    triple_pi_idx::Vi     # P.nzval index for p_i weight (sorted by dest NZ)
+    triple_anz_idx::Vi    # A.nzval index for a_ij value (sorted by dest NZ)
+    triple_pj_idx::Vi     # P.nzval index for p_j weight (sorted by dest NZ)
 end
 
 # ── AMG Level ─────────────────────────────────────────────────────────────────
@@ -320,16 +327,19 @@ One level of the AMG hierarchy. The matrix `A` is stored internally as a
 `CSRMatrix` (raw CSR vectors), decoupled from Jutul's `StaticSparsityMatrixCSR`.
 Conversion from `StaticSparsityMatrixCSR` happens at the API boundary in
 `amg_setup` and `amg_resetup!`.
+
+Workspace vectors (`r`, `xc`, `bc`) are allocated on the same device as the
+matrix arrays to avoid host/device memory mixing in GPU kernels.
 """
 mutable struct AMGLevel{Tv, Ti<:Integer}
     A::CSRMatrix{Tv, Ti}
-    P::ProlongationOp{Ti, Tv}
-    Pt_map::TransposeMap{Ti}
-    R_map::RestrictionMap{Ti}
+    P::ProlongationOp
+    Pt_map::TransposeMap
+    R_map::RestrictionMap
     smoother::AbstractSmoother
-    r::Vector{Tv}      # residual workspace
-    xc::Vector{Tv}     # coarse solution workspace
-    bc::Vector{Tv}     # coarse RHS workspace
+    r::AbstractVector{Tv}      # residual workspace
+    xc::AbstractVector{Tv}     # coarse solution workspace
+    bc::AbstractVector{Tv}     # coarse RHS workspace
 end
 
 # ── AMG Hierarchy ─────────────────────────────────────────────────────────────
@@ -339,14 +349,18 @@ end
 Complete AMG hierarchy with multiple levels and a direct solver at the coarsest level.
 The coarse LU factorization uses high-level `lu` / `lu!` so that GPU backends
 (CUDA, Metal) can dispatch to their own implementations.
+
+The coarsest-level workspace (`coarse_x`, `coarse_b`) is always on CPU since
+LU direct solves use LAPACK. Level workspace and smoother arrays are allocated
+on the same device as the input matrix.
 """
 mutable struct AMGHierarchy{Tv, Ti<:Integer}
     levels::Vector{AMGLevel{Tv, Ti}}
     coarse_A::Matrix{Tv}       # dense coarse matrix (values recomputed each resetup)
     coarse_factor::Factorization{Tv}  # LU (or other) factorization of coarse_A
-    coarse_x::Vector{Tv}       # workspace for coarsest level
-    coarse_b::Vector{Tv}       # workspace for coarsest level
-    solve_r::Vector{Tv}        # residual buffer for amg_solve! (finest level size)
+    coarse_x::Vector{Tv}       # workspace for coarsest level (CPU for LU solve)
+    coarse_b::Vector{Tv}       # workspace for coarsest level (CPU for LU solve)
+    solve_r::AbstractVector{Tv}        # residual buffer for amg_solve! (finest level size)
 end
 
 # ── AMG Configuration ─────────────────────────────────────────────────────────

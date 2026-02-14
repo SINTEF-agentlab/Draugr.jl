@@ -605,7 +605,7 @@ function prolongate!(x_fine::AbstractVector, P::ProlongationOp, x_coarse::Abstra
                      backend=DEFAULT_BACKEND, block_size::Int=64)
     kernel! = prolongate_kernel!(backend, block_size)
     kernel!(x_fine, P.rowptr, P.colval, P.nzval, x_coarse; ndrange=P.nrow)
-    KernelAbstractions.synchronize(backend)
+    _synchronize(backend)
     return x_fine
 end
 
@@ -655,7 +655,7 @@ function build_transpose_map(P::ProlongationOp{Ti, Tv}) where {Ti, Tv}
             pos[J] += Ti(1)
         end
     end
-    return TransposeMap{Ti}(offsets, fine_rows, p_nz_idx)
+    return TransposeMap(offsets, fine_rows, p_nz_idx)
 end
 
 """
@@ -671,7 +671,7 @@ function restrict!(b_coarse::AbstractVector, Pt_map::TransposeMap,
     kernel! = restrict_kernel!(backend, block_size)
     kernel!(b_coarse, Pt_map.offsets, Pt_map.fine_rows,
             Pt_map.p_nz_idx, P.nzval, r_fine; ndrange=n_coarse)
-    KernelAbstractions.synchronize(backend)
+    _synchronize(backend)
     return b_coarse
 end
 

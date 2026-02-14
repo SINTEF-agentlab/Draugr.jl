@@ -56,6 +56,35 @@ function csr_to_cpu(A::CSRMatrix{Tv, Ti}) where {Tv, Ti}
 end
 
 """
+    _to_device(ref::CSRMatrix, v::AbstractVector)
+
+Copy a vector `v` to the same device as `ref`'s arrays.
+If `ref` is already on CPU, returns the vector as-is.
+"""
+function _to_device(ref::CSRMatrix{Tv, Ti, <:Array, <:Array, <:Array}, v::AbstractVector) where {Tv, Ti}
+    return v  # already CPU
+end
+
+function _to_device(ref::CSRMatrix, v::AbstractVector)
+    be = _get_backend(ref.nzval)
+    dev = KernelAbstractions.allocate(be, eltype(v), length(v))
+    copyto!(dev, v)
+    return dev
+end
+
+"""
+    _csr_to_device(ref, A_cpu) -> CSRMatrix
+
+Copy a CPU CSRMatrix to the same device as `ref`'s arrays.
+"""
+function _csr_to_device(ref::CSRMatrix, A_cpu::CSRMatrix)
+    rp = _to_device(ref, A_cpu.rowptr)
+    cv = _to_device(ref, A_cpu.colval)
+    nzv = _to_device(ref, A_cpu.nzval)
+    return CSRMatrix(rp, cv, nzv, A_cpu.nrow, A_cpu.ncol)
+end
+
+"""
     csr_from_static(A::StaticSparsityMatrixCSR) -> CSRMatrix
 
 Convert a Jutul `StaticSparsityMatrixCSR` to the internal `CSRMatrix`
@@ -82,7 +111,7 @@ function csr_copy_nzvals!(dest::CSRMatrix{Tv}, src::StaticSparsityMatrixCSR{Tv};
     n = length(nzv_d)
     kernel! = copy_kernel!(backend, block_size)
     kernel!(nzv_d, nzv_s; ndrange=n)
-    KernelAbstractions.synchronize(backend)
+    _synchronize(backend)
     return dest
 end
 
@@ -130,4 +159,26 @@ function _synchronize(backend)
         KernelAbstractions.synchronize(backend)
     end
     return nothing
+end
+
+"""
+    _allocate_vector(A::CSRMatrix, ::Type{Tv}, n) -> AbstractVector{Tv}
+
+Allocate a zero-filled vector of length `n` on the same device as the CSR matrix `A`.
+Uses `KernelAbstractions.zeros` with the backend inferred from the matrix arrays.
+"""
+function _allocate_vector(A::CSRMatrix, ::Type{Tv}, n::Int) where Tv
+    be = _get_backend(A.nzval)
+    return KernelAbstractions.zeros(be, Tv, n)
+end
+
+"""
+    _allocate_undef_vector(A::CSRMatrix, ::Type{Tv}, n) -> AbstractVector{Tv}
+
+Allocate an uninitialized vector of length `n` on the same device as the CSR matrix `A`.
+Uses `KernelAbstractions.allocate` with the backend inferred from the matrix arrays.
+"""
+function _allocate_undef_vector(A::CSRMatrix, ::Type{Tv}, n::Int) where Tv
+    be = _get_backend(A.nzval)
+    return KernelAbstractions.allocate(be, Tv, n)
 end

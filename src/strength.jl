@@ -28,7 +28,7 @@ function strength_graph(A::CSRMatrix{Tv, Ti}, θ::Real, ::AbsoluteStrength;
     kernel!(is_strong, nzv, cv, rp, Tv(θ); ndrange=n)
     KernelAbstractions.synchronize(backend)
     # Convert to CPU array for use by coarsening functions (scalar indexing)
-    return is_strong isa Vector ? is_strong : Array(is_strong)
+    return is_strong isa Array ? is_strong : Array(is_strong)
 end
 
 @kernel function absolute_strength_kernel!(is_strong, @Const(nzval), @Const(colval),
@@ -82,7 +82,7 @@ function strength_graph(A::CSRMatrix{Tv, Ti}, θ::Real, ::SignedStrength;
     kernel!(is_strong, nzv, cv, rp, Tv(θ); ndrange=n)
     KernelAbstractions.synchronize(backend)
     # Convert to CPU array for use by coarsening functions (scalar indexing)
-    return is_strong isa Vector ? is_strong : Array(is_strong)
+    return is_strong isa Array ? is_strong : Array(is_strong)
 end
 
 @kernel function signed_strength_kernel!(is_strong, @Const(nzval), @Const(colval),

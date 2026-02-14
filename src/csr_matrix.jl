@@ -47,7 +47,7 @@ rowptr(A::CSRMatrix) = A.rowptr
 Convert a CSRMatrix with GPU arrays to a CSRMatrix with CPU arrays.
 If the arrays are already CPU arrays, this is a no-op (returns same object).
 """
-function csr_to_cpu(A::CSRMatrix{Tv, Ti, <:Vector, <:Vector, <:Vector}) where {Tv, Ti}
+function csr_to_cpu(A::CSRMatrix{Tv, Ti, <:Array, <:Array, <:Array}) where {Tv, Ti}
     return A  # already CPU
 end
 

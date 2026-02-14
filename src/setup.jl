@@ -32,7 +32,7 @@ function amg_setup(A_csr::CSRMatrix{Tv, Ti}, config::AMGConfig=AMGConfig();
         # Select coarsening algorithm for this level
         coarsening_alg = _get_coarsening_for_level(config, lvl)
         # Coarsen and build prolongation, with automatic θ reduction on stall
-        P, n_coarse = _coarsen_with_fallback(A_current, coarsening_alg, config)
+        P, n_coarse = _coarsen_with_fallback(A_current, coarsening_alg, config; backend=backend, block_size=block_size)
         n_coarse >= n && break  # no coarsening progress
         n_coarse == 0 && break  # degenerate case
         # Compute coarse operator via Galerkin product
@@ -79,16 +79,17 @@ the common case where coarser-level matrices have sparser strong connectivity
 and the original θ is too aggressive.
 """
 function _coarsen_with_fallback(A::CSRMatrix, alg::CoarseningAlgorithm,
-                                config::AMGConfig)
+                                config::AMGConfig;
+                                backend=DEFAULT_BACKEND, block_size::Int=64)
     n = size(A, 1)
-    P, n_coarse = _coarsen_and_build_P(A, alg, config)
+    P, n_coarse = _coarsen_and_build_P(A, alg, config; backend=backend, block_size=block_size)
     # If coarsening is adequate, return
     (n_coarse < 0.8 * n || n <= config.max_coarse_size) && return P, n_coarse
     # Try reducing θ
     for attempt in 1:3
         reduced_alg = _reduce_theta(alg, 0.5^attempt)
         reduced_alg === nothing && return P, n_coarse  # no θ to reduce
-        P2, nc2 = _coarsen_and_build_P(A, reduced_alg, config)
+        P2, nc2 = _coarsen_and_build_P(A, reduced_alg, config; backend=backend, block_size=block_size)
         if nc2 < n_coarse
             P, n_coarse = P2, nc2
         end
@@ -115,10 +116,11 @@ whether the algorithm uses CF-splitting or aggregation.
 When max_row_sum is configured, strength computation uses a weakened matrix.
 """
 function _coarsen_and_build_P(A::CSRMatrix, alg::CoarseningAlgorithm,
-                              config::AMGConfig=AMGConfig())
+                              config::AMGConfig=AMGConfig();
+                              backend=DEFAULT_BACKEND, block_size::Int=64)
     if uses_cf_splitting(alg)
-        cf, coarse_map, n_coarse = coarsen_cf(A, alg, config)
-        P = build_cf_prolongation(A, cf, coarse_map, n_coarse, alg.interpolation, alg.θ)
+        cf, coarse_map, n_coarse = coarsen_cf(A, alg, config; backend=backend, block_size=block_size)
+        P = build_cf_prolongation(A, cf, coarse_map, n_coarse, alg.interpolation, alg.θ; backend=backend, block_size=block_size)
         # Apply interpolation truncation if configured
         tf = _get_trunc_factor(alg.interpolation)
         if tf > 0
@@ -126,7 +128,7 @@ function _coarsen_and_build_P(A::CSRMatrix, alg::CoarseningAlgorithm,
         end
         return P, n_coarse
     else
-        agg, n_coarse = coarsen(A, alg, config)
+        agg, n_coarse = coarsen(A, alg, config; backend=backend, block_size=block_size)
         P = build_prolongation(A, agg, n_coarse)
         # Apply filtering if requested
         if _has_filtering(alg) && alg.filtering
@@ -137,8 +139,9 @@ function _coarsen_and_build_P(A::CSRMatrix, alg::CoarseningAlgorithm,
 end
 
 function _coarsen_and_build_P(A::CSRMatrix, alg::SmoothedAggregationCoarsening,
-                              config::AMGConfig=AMGConfig())
-    agg, n_coarse = coarsen(A, AggregationCoarsening(alg.θ), config)
+                              config::AMGConfig=AMGConfig();
+                              backend=DEFAULT_BACKEND, block_size::Int=64)
+    agg, n_coarse = coarsen(A, AggregationCoarsening(alg.θ), config; backend=backend, block_size=block_size)
     P_tent = build_prolongation(A, agg, n_coarse)
     # Smooth: P = (I - ω D⁻¹ A) P_tent
     P = _smooth_prolongation(A, P_tent, alg.ω)
@@ -159,18 +162,19 @@ When `base=:pmis` with no interpolation specified, falls back to aggregation-bas
 aggressive coarsening.
 """
 function _coarsen_and_build_P(A::CSRMatrix, alg::AggressiveCoarsening,
-                              config::AMGConfig=AMGConfig())
+                              config::AMGConfig=AMGConfig();
+                              backend=DEFAULT_BACKEND, block_size::Int=64)
     if alg.base == :hmis
-        cf, coarse_map, n_coarse = coarsen_aggressive_cf(A, alg.θ, :hmis; config=config)
-        P = build_cf_prolongation(A, cf, coarse_map, n_coarse, alg.interpolation, alg.θ)
+        cf, coarse_map, n_coarse = coarsen_aggressive_cf(A, alg.θ, :hmis; config=config, backend=backend, block_size=block_size)
+        P = build_cf_prolongation(A, cf, coarse_map, n_coarse, alg.interpolation, alg.θ; backend=backend, block_size=block_size)
         tf = _get_trunc_factor(alg.interpolation)
         if tf > 0
             P = _truncate_interpolation(P, tf)
         end
         return P, n_coarse
     elseif alg.base == :pmis
-        cf, coarse_map, n_coarse = coarsen_aggressive_cf(A, alg.θ, :pmis; config=config)
-        P = build_cf_prolongation(A, cf, coarse_map, n_coarse, alg.interpolation, alg.θ)
+        cf, coarse_map, n_coarse = coarsen_aggressive_cf(A, alg.θ, :pmis; config=config, backend=backend, block_size=block_size)
+        P = build_cf_prolongation(A, cf, coarse_map, n_coarse, alg.interpolation, alg.θ; backend=backend, block_size=block_size)
         tf = _get_trunc_factor(alg.interpolation)
         if tf > 0
             P = _truncate_interpolation(P, tf)
@@ -178,7 +182,7 @@ function _coarsen_and_build_P(A::CSRMatrix, alg::AggressiveCoarsening,
         return P, n_coarse
     else
         # Legacy: aggregation-based aggressive coarsening
-        agg, n_coarse = coarsen(A, alg, config)
+        agg, n_coarse = coarsen(A, alg, config; backend=backend, block_size=block_size)
         P = build_prolongation(A, agg, n_coarse)
         return P, n_coarse
     end

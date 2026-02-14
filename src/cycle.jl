@@ -53,7 +53,7 @@ function compute_residual!(r::AbstractVector, A::CSRMatrix,
     rp = rowptr(A)
     kernel! = residual_kernel!(backend, block_size)
     kernel!(r, b, x, nzv, cv, rp; ndrange=n)
-    KernelAbstractions.synchronize(backend)
+    _synchronize(backend)
     return r
 end
 

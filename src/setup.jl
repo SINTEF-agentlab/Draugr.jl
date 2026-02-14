@@ -1,3 +1,42 @@
+# ── Device conversion helpers for AMG structures ─────────────────────────────
+
+"""
+    _prolongation_to_device(ref, P) -> ProlongationOp
+
+Copy a ProlongationOp to the same device as `ref`'s arrays.
+"""
+function _prolongation_to_device(ref::CSRMatrix, P::ProlongationOp)
+    rp = _to_device(ref, P.rowptr)
+    cv = _to_device(ref, P.colval)
+    nzv = _to_device(ref, P.nzval)
+    return ProlongationOp(rp, cv, nzv, P.nrow, P.ncol)
+end
+
+"""
+    _transpose_map_to_device(ref, Pt_map) -> TransposeMap
+
+Copy a TransposeMap to the same device as `ref`'s arrays.
+"""
+function _transpose_map_to_device(ref::CSRMatrix, Pt_map::TransposeMap)
+    offsets = _to_device(ref, Pt_map.offsets)
+    fine_rows = _to_device(ref, Pt_map.fine_rows)
+    p_nz_idx = _to_device(ref, Pt_map.p_nz_idx)
+    return TransposeMap(offsets, fine_rows, p_nz_idx)
+end
+
+"""
+    _restriction_map_to_device(ref, r_map) -> RestrictionMap
+
+Copy a RestrictionMap to the same device as `ref`'s arrays.
+"""
+function _restriction_map_to_device(ref::CSRMatrix, r_map::RestrictionMap)
+    nz_offsets = _to_device(ref, r_map.nz_offsets)
+    triple_pi_idx = _to_device(ref, r_map.triple_pi_idx)
+    triple_anz_idx = _to_device(ref, r_map.triple_anz_idx)
+    triple_pj_idx = _to_device(ref, r_map.triple_pj_idx)
+    return RestrictionMap(nz_offsets, triple_pi_idx, triple_anz_idx, triple_pj_idx)
+end
+
 """
     amg_setup(A::StaticSparsityMatrixCSR, config; backend) -> AMGHierarchy
 
@@ -26,6 +65,8 @@ function amg_setup(A_csr::CSRMatrix{Tv, Ti}, config::AMGConfig=AMGConfig();
     A_current = A_csr
     n_finest = size(A_csr, 1)
     block_size = config.block_size
+    # Determine if we need GPU-resident arrays (infer from input matrix)
+    is_gpu = !(A_csr.nzval isa Array)
     for lvl in 1:(config.max_levels - 1)
         n = size(A_current, 1)
         n <= config.max_coarse_size && break
@@ -40,13 +81,27 @@ function amg_setup(A_csr::CSRMatrix{Tv, Ti}, config::AMGConfig=AMGConfig();
         A_coarse, r_map = compute_coarse_sparsity(A_cpu, P, n_coarse)
         # Build transpose map for atomic-free restriction
         Pt_map = build_transpose_map(P)
-        # Build smoother (uses CPU arrays for workspace)
-        smoother = build_smoother(A_cpu, config.smoother, config.jacobi_omega; backend=backend, block_size=block_size)
-        # Workspace
-        r = Vector{Tv}(undef, n)
-        xc = Vector{Tv}(undef, n_coarse)
-        bc = Vector{Tv}(undef, n_coarse)
-        level = AMGLevel{Tv, Ti}(A_cpu, P, Pt_map, r_map, smoother, r, xc, bc)
+        if is_gpu
+            # Copy level structures to GPU device so kernels can access them
+            A_dev = _csr_to_device(A_csr, A_cpu)
+            P_dev = _prolongation_to_device(A_csr, P)
+            Pt_map_dev = _transpose_map_to_device(A_csr, Pt_map)
+            r_map_dev = _restriction_map_to_device(A_csr, r_map)
+            # Build smoother on device arrays
+            smoother = build_smoother(A_dev, config.smoother, config.jacobi_omega; backend=backend, block_size=block_size)
+            # Workspace on device
+            r = _allocate_vector(A_csr, Tv, n)
+            xc = _allocate_vector(A_csr, Tv, n_coarse)
+            bc = _allocate_vector(A_csr, Tv, n_coarse)
+            level = AMGLevel{Tv, Ti}(A_dev, P_dev, Pt_map_dev, r_map_dev, smoother, r, xc, bc)
+        else
+            # CPU path: use arrays as-is
+            smoother = build_smoother(A_cpu, config.smoother, config.jacobi_omega; backend=backend, block_size=block_size)
+            r = Vector{Tv}(undef, n)
+            xc = Vector{Tv}(undef, n_coarse)
+            bc = Vector{Tv}(undef, n_coarse)
+            level = AMGLevel{Tv, Ti}(A_cpu, P, Pt_map, r_map, smoother, r, xc, bc)
+        end
         push!(levels, level)
         A_current = A_coarse
     end
@@ -56,11 +111,15 @@ function amg_setup(A_csr::CSRMatrix{Tv, Ti}, config::AMGConfig=AMGConfig();
     coarse_dense = Matrix{Tv}(undef, n_coarse, n_coarse)
     _csr_to_dense!(coarse_dense, A_cpu)
     coarse_factor = lu(coarse_dense)
-    # Workspace buffers for coarsest-level direct solve (populated during solve phase)
+    # Workspace buffers for coarsest-level direct solve (always CPU for LU)
     coarse_x = Vector{Tv}(undef, n_coarse)
     coarse_b = Vector{Tv}(undef, n_coarse)
-    # Pre-allocate residual buffer for amg_solve! (populated during solve phase)
-    solve_r = Vector{Tv}(undef, n_finest)
+    # Pre-allocate residual buffer for amg_solve! (same device as input)
+    if is_gpu
+        solve_r = _allocate_vector(A_csr, Tv, n_finest)
+    else
+        solve_r = Vector{Tv}(undef, n_finest)
+    end
     hierarchy = AMGHierarchy{Tv, Ti}(levels, coarse_dense,
                                       coarse_factor, coarse_x, coarse_b, solve_r)
     t_setup = time() - t_setup
@@ -317,7 +376,7 @@ function _csr_to_dense!(M::Matrix{Tv}, A::CSRMatrix{Tv};
     rp = rowptr(A)
     kernel! = csr_to_dense_kernel!(backend, block_size)
     kernel!(M, nzv, cv, rp; ndrange=n)
-    KernelAbstractions.synchronize(backend)
+    _synchronize(backend)
     return M
 end
 

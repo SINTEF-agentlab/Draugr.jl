@@ -34,19 +34,25 @@ function amg_resetup!(hierarchy::AMGHierarchy{Tv, Ti},
 end
 
 """
-    _copy_nzvals!(dest, src; backend=DEFAULT_BACKEND, block_size=64)
+    _copy_nzvals!(dest, src; backend, block_size)
 
-Copy nonzero values from `src` CSRMatrix into `dest` (same sparsity pattern),
-using a KA kernel for parallelism.
+Copy nonzero values from `src` CSRMatrix into `dest` (same sparsity pattern).
+When arrays are on the same device, uses a KA kernel. When arrays are on different
+devices, falls back to `copyto!`.
 """
 function _copy_nzvals!(dest::CSRMatrix, src::CSRMatrix;
-                       backend=DEFAULT_BACKEND, block_size::Int=64)
+                       backend=_get_backend(nonzeros(dest)), block_size::Int=64)
     nzv_d = nonzeros(dest)
     nzv_s = nonzeros(src)
     n = length(nzv_d)
-    kernel! = copy_kernel!(backend, block_size)
-    kernel!(nzv_d, nzv_s; ndrange=n)
-    KernelAbstractions.synchronize(backend)
+    # If source and dest are on different devices, use copyto!
+    if typeof(nzv_d) != typeof(nzv_s)
+        copyto!(nzv_d, nzv_s isa Array ? nzv_s : Array(nzv_s))
+    else
+        kernel! = copy_kernel!(backend, block_size)
+        kernel!(nzv_d, nzv_s; ndrange=n)
+        _synchronize(backend)
+    end
     return dest
 end
 
@@ -62,22 +68,26 @@ function _recompute_coarsest_dense!(hierarchy::AMGHierarchy{Tv, Ti},
                                     backend=DEFAULT_BACKEND) where {Tv, Ti}
     M = hierarchy.coarse_A
     fill!(M, zero(Tv))
-    n_fine = size(level.A, 1)
-    cv_a = colvals(level.A)
-    nzv_a = nonzeros(level.A)
-    P = level.P
-    rp_a = rowptr(level.A)
+    # Convert to CPU for scalar indexing (dense matrix is always CPU)
+    A_cpu = csr_to_cpu(level.A)
+    n_fine = size(A_cpu, 1)
+    cv_a = colvals(A_cpu)
+    nzv_a = nonzeros(A_cpu)
+    rp_a = rowptr(A_cpu)
+    P_rowptr = level.P.rowptr isa Array ? level.P.rowptr : Array(level.P.rowptr)
+    P_colval = level.P.colval isa Array ? level.P.colval : Array(level.P.colval)
+    P_nzval = level.P.nzval isa Array ? level.P.nzval : Array(level.P.nzval)
     # Write directly into dense matrix - iterate over fine rows
     @inbounds for i in 1:n_fine
-        for pnz_i in P.rowptr[i]:(P.rowptr[i+1]-1)
-            I = P.colval[pnz_i]
-            p_i = P.nzval[pnz_i]
+        for pnz_i in P_rowptr[i]:(P_rowptr[i+1]-1)
+            I = P_colval[pnz_i]
+            p_i = P_nzval[pnz_i]
             for anz in rp_a[i]:(rp_a[i+1]-1)
                 j = cv_a[anz]
                 a_ij = nzv_a[anz]
-                for pnz_j in P.rowptr[j]:(P.rowptr[j+1]-1)
-                    J = P.colval[pnz_j]
-                    p_j = P.nzval[pnz_j]
+                for pnz_j in P_rowptr[j]:(P_rowptr[j+1]-1)
+                    J = P_colval[pnz_j]
+                    p_j = P_nzval[pnz_j]
                     M[I, J] += p_i * a_ij * p_j
                 end
             end

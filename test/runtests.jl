@@ -2072,21 +2072,23 @@ end
             A_jl = poisson1d_jl(n)
             config = AMGConfig()
             hierarchy = amg_setup(A_jl, config)
-            b = ones(n)
-            x = zeros(n)
-            x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=100)
+            b = JLArray(ones(n))
+            x = JLArray(zeros(n))
+            x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=100, backend=JLBackend())
             # Verify convergence by computing residual on CPU
+            x_cpu = Array(x)
+            b_cpu = Array(b)
             A_cpu = csr_to_cpu(csr_from_gpu(A_jl))
             r = zeros(n)
             rp = A_cpu.rowptr; cv = A_cpu.colval; nzv = A_cpu.nzval
             for i in 1:n
                 Ax_i = 0.0
                 for nz in rp[i]:(rp[i+1]-1)
-                    Ax_i += nzv[nz] * x[cv[nz]]
+                    Ax_i += nzv[nz] * x_cpu[cv[nz]]
                 end
-                r[i] = b[i] - Ax_i
+                r[i] = b_cpu[i] - Ax_i
             end
-            @test norm(r) / norm(b) < 1e-6
+            @test norm(r) / norm(b_cpu) < 1e-6
             @test niter < 100
         end
 
@@ -2096,21 +2098,23 @@ end
             n = nx * nx
             config = AMGConfig()
             hierarchy = amg_setup(A_jl, config)
-            b = ones(n)
-            x = zeros(n)
-            x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=100)
+            b = JLArray(ones(n))
+            x = JLArray(zeros(n))
+            x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=100, backend=JLBackend())
             # Verify convergence
+            x_cpu = Array(x)
+            b_cpu = Array(b)
             A_cpu = csr_to_cpu(csr_from_gpu(A_jl))
             r = zeros(n)
             rp = A_cpu.rowptr; cv = A_cpu.colval; nzv = A_cpu.nzval
             for i in 1:n
                 Ax_i = 0.0
                 for nz in rp[i]:(rp[i+1]-1)
-                    Ax_i += nzv[nz] * x[cv[nz]]
+                    Ax_i += nzv[nz] * x_cpu[cv[nz]]
                 end
-                r[i] = b[i] - Ax_i
+                r[i] = b_cpu[i] - Ax_i
             end
-            @test norm(r) / norm(b) < 1e-6
+            @test norm(r) / norm(b_cpu) < 1e-6
             @test niter < 100
         end
 
@@ -2119,11 +2123,11 @@ end
             config = AMGConfig()
             hierarchy = amg_setup(A_jl, config)
             n = 100
-            b = ones(n)
-            x = zeros(n)
+            b = JLArray(ones(n))
+            x = JLArray(zeros(n))
             # Apply a single cycle
-            amg_cycle!(x, b, hierarchy, config)
-            @test !all(x .== 0.0)  # something changed
+            amg_cycle!(x, b, hierarchy, config; backend=JLBackend())
+            @test !all(Array(x) .== 0.0)  # something changed
         end
 
         @testset "Backend consistency - strength_graph uses JLBackend" begin
@@ -2143,9 +2147,9 @@ end
                 config = AMGConfig(smoother=smoother)
                 hierarchy = amg_setup(A_jl, config)
                 @test length(hierarchy.levels) >= 1
-                b = ones(100)
-                x = zeros(100)
-                x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=100)
+                b = JLArray(ones(100))
+                x = JLArray(zeros(100))
+                x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=100, backend=JLBackend())
                 @test niter < 100
             end
         end
@@ -2160,9 +2164,9 @@ end
             # Resetup with the same matrix (same sparsity, same values)
             amg_resetup!(hierarchy, A_jl, config)
             # Solve after resetup
-            b = ones(n)
-            x = zeros(n)
-            x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=100)
+            b = JLArray(ones(n))
+            x = JLArray(zeros(n))
+            x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=100, backend=JLBackend())
             @test niter < 100
         end
 

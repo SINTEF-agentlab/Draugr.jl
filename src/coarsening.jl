@@ -11,13 +11,14 @@ aggregates to prevent singleton-dominated coarsening at deeper levels.
 Returns `agg::Vector{Int}` where `agg[i]` is the aggregate index (1-based) that
 node `i` belongs to, and `n_coarse` the number of aggregates.
 """
-function coarsen_aggregation(A::CSRMatrix{Tv, Ti}, θ::Real) where {Tv, Ti}
+function coarsen_aggregation(A::CSRMatrix{Tv, Ti}, θ::Real;
+                             backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
     n = size(A, 1)
     # Edge case: trivial system
     if n <= 1
         return ones(Int, n), n
     end
-    is_strong = strength_graph(A, θ)
+    is_strong = strength_graph(A, θ; backend=backend, block_size=block_size)
     cv = colvals(A)
     nzv = nonzeros(A)
     agg = zeros(Int, n)  # 0 = unassigned
@@ -196,12 +197,13 @@ Returns `cf::Vector{Int}` where `cf[i] = 1` for coarse points and `cf[i] = -1`
 for fine points, `coarse_map::Vector{Int}`, and `n_coarse`.
 """
 function coarsen_pmis(A::CSRMatrix{Tv, Ti}, θ::Real;
-                      rng=Random.default_rng()) where {Tv, Ti}
+                      rng=Random.default_rng(),
+                      backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
     n = size(A, 1)
     if n <= 1
         return ones(Int, n), collect(1:n), n
     end
-    is_strong = strength_graph(A, θ)
+    is_strong = strength_graph(A, θ; backend=backend, block_size=block_size)
     cv = colvals(A)
     # Use column-based measure: how many nodes strongly depend on i
     st_count = _compute_strong_transpose_count(A, is_strong)
@@ -317,12 +319,13 @@ selection. Uses column-based measure. Includes second pass for strong-connection
 property.
 """
 function coarsen_hmis(A::CSRMatrix{Tv, Ti}, θ::Real;
-                      rng=Random.default_rng()) where {Tv, Ti}
+                      rng=Random.default_rng(),
+                      backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
     n = size(A, 1)
     if n <= 1
         return ones(Int, n), collect(1:n), n
     end
-    is_strong = strength_graph(A, θ)
+    is_strong = strength_graph(A, θ; backend=backend, block_size=block_size)
     cv = colvals(A)
     is_strong_sym = _symmetrize_strength(A, is_strong)
     # Column-based measure on the symmetric graph
@@ -460,12 +463,13 @@ from C-points through strong connections).
 This produces reliable coarsening ratios and is the classical AMG standard.
 """
 function coarsen_rs(A::CSRMatrix{Tv, Ti}, θ::Real;
-                    rng=Random.default_rng()) where {Tv, Ti}
+                    rng=Random.default_rng(),
+                    backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
     n = size(A, 1)
     if n <= 1
         return ones(Int, n), collect(1:n), n
     end
-    is_strong = strength_graph(A, θ)
+    is_strong = strength_graph(A, θ; backend=backend, block_size=block_size)
     cv = colvals(A)
     # Compute λ_i = number of points that strongly depend on i (transpose measure)
     λ = _compute_strong_transpose_count(A, is_strong)
@@ -550,11 +554,12 @@ splitting, then the coarse grid's strength-of-connection graph is used for a sec
 PMIS pass, merging the results. Returns `agg, n_coarse` like aggregation.
 """
 function coarsen_aggressive(A::CSRMatrix{Tv, Ti}, θ::Real;
-                            rng=Random.default_rng()) where {Tv, Ti}
+                            rng=Random.default_rng(),
+                            backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
     n = size(A, 1)
     # First pass: standard PMIS
-    cf, coarse_map, nc1 = coarsen_pmis(A, θ; rng=rng)
-    is_strong = strength_graph(A, θ)
+    cf, coarse_map, nc1 = coarsen_pmis(A, θ; rng=rng, backend=backend, block_size=block_size)
+    is_strong = strength_graph(A, θ; backend=backend, block_size=block_size)
     cv = colvals(A)
     agg = zeros(Int, n)
     agg_count = 0
@@ -668,7 +673,8 @@ as fine than standard HMIS/PMIS alone.
 """
 function coarsen_aggressive_cf(A::CSRMatrix{Tv, Ti}, θ::Real, base::Symbol;
                                config::AMGConfig=AMGConfig(),
-                               rng=Random.default_rng()) where {Tv, Ti}
+                               rng=Random.default_rng(),
+                               backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
     n = size(A, 1)
     if n <= 1
         return ones(Int, n), collect(1:n), n
@@ -676,13 +682,13 @@ function coarsen_aggressive_cf(A::CSRMatrix{Tv, Ti}, θ::Real, base::Symbol;
     # First pass: standard CF-splitting using base algorithm
     A_eff = config.max_row_sum > 0 ? _apply_max_row_sum(A, config.max_row_sum) : A
     if base == :hmis
-        cf1, _, nc1 = coarsen_hmis(A_eff, θ; rng=rng)
+        cf1, _, nc1 = coarsen_hmis(A_eff, θ; rng=rng, backend=backend, block_size=block_size)
     else  # :pmis
-        cf1, _, nc1 = coarsen_pmis(A_eff, θ; rng=rng)
+        cf1, _, nc1 = coarsen_pmis(A_eff, θ; rng=rng, backend=backend, block_size=block_size)
     end
     # Second pass: among C-points from first pass, do another CF-splitting
     # using distance-2 strong connections to further reduce the coarse set.
-    is_strong = strength_graph(A_eff, θ)
+    is_strong = strength_graph(A_eff, θ; backend=backend, block_size=block_size)
     cv = colvals(A_eff)
 
     # Build distance-2 strong connection graph among C-points:
@@ -793,21 +799,23 @@ end
 # ── Dispatch coarsening by type ──────────────────────────────────────────────
 
 function coarsen(A::CSRMatrix, alg::AggregationCoarsening,
-                config::AMGConfig=AMGConfig())
+                config::AMGConfig=AMGConfig();
+                backend=DEFAULT_BACKEND, block_size::Int=64)
     if config.max_row_sum > 0
         A_weak = _apply_max_row_sum(A, config.max_row_sum)
-        return coarsen_aggregation(A_weak, alg.θ)
+        return coarsen_aggregation(A_weak, alg.θ; backend=backend, block_size=block_size)
     end
-    return coarsen_aggregation(A, alg.θ)
+    return coarsen_aggregation(A, alg.θ; backend=backend, block_size=block_size)
 end
 
 function coarsen(A::CSRMatrix, alg::AggressiveCoarsening,
-                config::AMGConfig=AMGConfig())
+                config::AMGConfig=AMGConfig();
+                backend=DEFAULT_BACKEND, block_size::Int=64)
     if config.max_row_sum > 0
         A_weak = _apply_max_row_sum(A, config.max_row_sum)
-        return coarsen_aggressive(A_weak, alg.θ)
+        return coarsen_aggressive(A_weak, alg.θ; backend=backend, block_size=block_size)
     end
-    return coarsen_aggressive(A, alg.θ)
+    return coarsen_aggressive(A, alg.θ; backend=backend, block_size=block_size)
 end
 
 """
@@ -828,30 +836,33 @@ uses_cf_splitting(::RSCoarsening) = true
 Perform CF-splitting coarsening. Returns `(cf, coarse_map, n_coarse)`.
 """
 function coarsen_cf(A::CSRMatrix, alg::PMISCoarsening,
-                    config::AMGConfig=AMGConfig())
+                    config::AMGConfig=AMGConfig();
+                    backend=DEFAULT_BACKEND, block_size::Int=64)
     if config.max_row_sum > 0
         A_weak = _apply_max_row_sum(A, config.max_row_sum)
-        return coarsen_pmis(A_weak, alg.θ)
+        return coarsen_pmis(A_weak, alg.θ; backend=backend, block_size=block_size)
     end
-    return coarsen_pmis(A, alg.θ)
+    return coarsen_pmis(A, alg.θ; backend=backend, block_size=block_size)
 end
 
 function coarsen_cf(A::CSRMatrix, alg::HMISCoarsening,
-                    config::AMGConfig=AMGConfig())
+                    config::AMGConfig=AMGConfig();
+                    backend=DEFAULT_BACKEND, block_size::Int=64)
     if config.max_row_sum > 0
         A_weak = _apply_max_row_sum(A, config.max_row_sum)
-        return coarsen_hmis(A_weak, alg.θ)
+        return coarsen_hmis(A_weak, alg.θ; backend=backend, block_size=block_size)
     end
-    return coarsen_hmis(A, alg.θ)
+    return coarsen_hmis(A, alg.θ; backend=backend, block_size=block_size)
 end
 
 function coarsen_cf(A::CSRMatrix, alg::RSCoarsening,
-                    config::AMGConfig=AMGConfig())
+                    config::AMGConfig=AMGConfig();
+                    backend=DEFAULT_BACKEND, block_size::Int=64)
     if config.max_row_sum > 0
         A_weak = _apply_max_row_sum(A, config.max_row_sum)
-        return coarsen_rs(A_weak, alg.θ)
+        return coarsen_rs(A_weak, alg.θ; backend=backend, block_size=block_size)
     end
-    return coarsen_rs(A, alg.θ)
+    return coarsen_rs(A, alg.θ; backend=backend, block_size=block_size)
 end
 
 """

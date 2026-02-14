@@ -193,8 +193,9 @@ Build a prolongation operator from a CF-splitting using the specified interpolat
 """
 function build_cf_prolongation(A::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                                coarse_map::Vector{Int}, n_coarse::Int,
-                               interp::InterpolationType, θ::Real=0.25) where {Tv, Ti}
-    return _build_interpolation(A, cf, coarse_map, n_coarse, interp, θ)
+                               interp::InterpolationType, θ::Real=0.25;
+                               backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
+    return _build_interpolation(A, cf, coarse_map, n_coarse, interp, θ; backend=backend, block_size=block_size)
 end
 
 # ── Direct interpolation ─────────────────────────────────────────────────────
@@ -215,11 +216,12 @@ d_i = a_{i,i} + Σ_{k ∈ weak ∪ F_i^s ∪ same_sign} a_{i,k}.
 """
 function _build_interpolation(A::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                               coarse_map::Vector{Int}, n_coarse::Int,
-                              ::DirectInterpolation, θ::Real=0.25) where {Tv, Ti}
+                              ::DirectInterpolation, θ::Real=0.25;
+                              backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
     n_fine = size(A, 1)
     cv = colvals(A)
     nzv = nonzeros(A)
-    is_strong = strength_graph(A, θ)
+    is_strong = strength_graph(A, θ; backend=backend, block_size=block_size)
 
     # First pass: count entries per row
     row_counts = zeros(Int, n_fine)
@@ -341,11 +343,12 @@ where d_i = a_{i,i} + Σ_{k∈weak} a_{i,k}
 """
 function _build_interpolation(A::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                               coarse_map::Vector{Int}, n_coarse::Int,
-                              ::StandardInterpolation, θ::Real=0.25) where {Tv, Ti}
+                              ::StandardInterpolation, θ::Real=0.25;
+                              backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
     n_fine = size(A, 1)
     cv = colvals(A)
     nzv = nonzeros(A)
-    is_strong = strength_graph(A, θ)
+    is_strong = strength_graph(A, θ; backend=backend, block_size=block_size)
 
     # Build P using COO format, then convert to CSR
     I_p = Ti[]
@@ -436,11 +439,12 @@ interpolation targets, resulting in a larger but more accurate interpolation ste
 """
 function _build_interpolation(A::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                               coarse_map::Vector{Int}, n_coarse::Int,
-                              ::ExtendedIInterpolation, θ::Real=0.25) where {Tv, Ti}
+                              ::ExtendedIInterpolation, θ::Real=0.25;
+                              backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
     n_fine = size(A, 1)
     cv = colvals(A)
     nzv = nonzeros(A)
-    is_strong = strength_graph(A, θ)
+    is_strong = strength_graph(A, θ; backend=backend, block_size=block_size)
 
     I_p = Ti[]
     J_p = Ti[]

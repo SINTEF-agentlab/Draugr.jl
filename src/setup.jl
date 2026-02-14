@@ -25,6 +25,7 @@ function amg_setup(A_csr::CSRMatrix{Tv, Ti}, config::AMGConfig=AMGConfig();
     levels = AMGLevel{Tv, Ti}[]
     A_current = A_csr
     n_finest = size(A_csr, 1)
+    block_size = config.block_size
     for lvl in 1:(config.max_levels - 1)
         n = size(A_current, 1)
         n <= config.max_coarse_size && break
@@ -39,7 +40,7 @@ function amg_setup(A_csr::CSRMatrix{Tv, Ti}, config::AMGConfig=AMGConfig();
         # Build transpose map for atomic-free restriction
         Pt_map = build_transpose_map(P)
         # Build smoother
-        smoother = build_smoother(A_current, config.smoother, config.jacobi_omega; backend=backend)
+        smoother = build_smoother(A_current, config.smoother, config.jacobi_omega; backend=backend, block_size=block_size)
         # Workspace
         r = KernelAbstractions.zeros(backend, Tv, n)
         xc = KernelAbstractions.zeros(backend, Tv, n_coarse)
@@ -304,13 +305,13 @@ _smoother_name(::ILU0Smoother) = "ILU(0)"
 Convert a CSRMatrix to a dense matrix using a KA kernel.
 """
 function _csr_to_dense!(M::Matrix{Tv}, A::CSRMatrix{Tv};
-                        backend=DEFAULT_BACKEND) where {Tv}
+                        backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv}
     fill!(M, zero(Tv))
     n = size(A, 1)
     cv = colvals(A)
     nzv = nonzeros(A)
     rp = rowptr(A)
-    kernel! = csr_to_dense_kernel!(backend, 64)
+    kernel! = csr_to_dense_kernel!(backend, block_size)
     kernel!(M, nzv, cv, rp; ndrange=n)
     KernelAbstractions.synchronize(backend)
     return M

@@ -589,8 +589,8 @@ Apply prolongation: x_fine += P * x_coarse.
 Uses KernelAbstractions for parallel execution over fine rows.
 """
 function prolongate!(x_fine::AbstractVector, P::ProlongationOp, x_coarse::AbstractVector;
-                     backend=DEFAULT_BACKEND)
-    kernel! = prolongate_kernel!(backend, 64)
+                     backend=DEFAULT_BACKEND, block_size::Int=64)
+    kernel! = prolongate_kernel!(backend, block_size)
     kernel!(x_fine, P.rowptr, P.colval, P.nzval, x_coarse; ndrange=P.nrow)
     KernelAbstractions.synchronize(backend)
     return x_fine
@@ -653,9 +653,9 @@ Uses the pre-computed TransposeMap to parallelize over coarse rows without atomi
 """
 function restrict!(b_coarse::AbstractVector, Pt_map::TransposeMap,
                    P::ProlongationOp, r_fine::AbstractVector;
-                   backend=DEFAULT_BACKEND)
+                   backend=DEFAULT_BACKEND, block_size::Int=64)
     n_coarse = P.ncol
-    kernel! = restrict_kernel!(backend, 64)
+    kernel! = restrict_kernel!(backend, block_size)
     kernel!(b_coarse, Pt_map.offsets, Pt_map.fine_rows,
             Pt_map.p_nz_idx, P.nzval, r_fine; ndrange=n_coarse)
     KernelAbstractions.synchronize(backend)

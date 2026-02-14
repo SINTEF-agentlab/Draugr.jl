@@ -6,42 +6,53 @@ Returns a boolean CSR matrix `S` where `S[i,j] = true` if j is a strong connecti
 
 A connection (i,j) is strong if |A[i,j]| ≥ θ * max_{k≠i} |A[i,k]|
 """
-function strength_graph(A::CSRMatrix{Tv, Ti}, θ::Real) where {Tv, Ti}
-    return strength_graph(A, θ, AbsoluteStrength())
+function strength_graph(A::CSRMatrix{Tv, Ti}, θ::Real;
+                        backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
+    return strength_graph(A, θ, AbsoluteStrength(); backend=backend, block_size=block_size)
 end
 
 """
     strength_graph(A, θ, ::AbsoluteStrength)
 
 Absolute-value strength: |a_{i,j}| ≥ θ * max_{k≠i} |a_{i,k}|.
+Uses a KA kernel for GPU compatibility.
 """
-function strength_graph(A::CSRMatrix{Tv, Ti}, θ::Real, ::AbsoluteStrength) where {Tv, Ti}
+function strength_graph(A::CSRMatrix{Tv, Ti}, θ::Real, ::AbsoluteStrength;
+                        backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
     n = size(A, 1)
     nzv = nonzeros(A)
     cv = colvals(A)
-    is_strong = Vector{Bool}(undef, nnz(A))
-    @inbounds for row in 1:n
-        rng = nzrange(A, row)
+    rp = rowptr(A)
+    is_strong = KernelAbstractions.zeros(backend, Bool, nnz(A))
+    kernel! = absolute_strength_kernel!(backend, block_size)
+    kernel!(is_strong, nzv, cv, rp, Tv(θ); ndrange=n)
+    KernelAbstractions.synchronize(backend)
+    return is_strong
+end
+
+@kernel function absolute_strength_kernel!(is_strong, @Const(nzval), @Const(colval),
+                                           @Const(rp), θ)
+    row = @index(Global)
+    @inbounds begin
         # Find maximum off-diagonal magnitude
-        max_offdiag = zero(real(Tv))
-        for nz in rng
-            col = cv[nz]
+        max_offdiag = zero(real(eltype(nzval)))
+        for nz in rp[row]:(rp[row+1]-1)
+            col = colval[nz]
             if col != row
-                max_offdiag = max(max_offdiag, abs(nzv[nz]))
+                max_offdiag = max(max_offdiag, abs(nzval[nz]))
             end
         end
         threshold = θ * max_offdiag
         # Mark strong connections
-        for nz in rng
-            col = cv[nz]
+        for nz in rp[row]:(rp[row+1]-1)
+            col = colval[nz]
             if col != row
-                is_strong[nz] = abs(nzv[nz]) >= threshold
+                is_strong[nz] = abs(nzval[nz]) >= threshold
             else
                 is_strong[nz] = false
             end
         end
     end
-    return is_strong
 end
 
 """
@@ -57,67 +68,77 @@ A connection (i,j) is strong if:
 
 If all off-diagonals have the same sign as the diagonal (no "proper" connections),
 falls back to absolute-value strength for that row.
+Uses a KA kernel for GPU compatibility.
 """
-function strength_graph(A::CSRMatrix{Tv, Ti}, θ::Real, ::SignedStrength) where {Tv, Ti}
+function strength_graph(A::CSRMatrix{Tv, Ti}, θ::Real, ::SignedStrength;
+                        backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
     n = size(A, 1)
     nzv = nonzeros(A)
     cv = colvals(A)
-    is_strong = Vector{Bool}(undef, nnz(A))
-    @inbounds for row in 1:n
-        rng = nzrange(A, row)
+    rp = rowptr(A)
+    is_strong = KernelAbstractions.zeros(backend, Bool, nnz(A))
+    kernel! = signed_strength_kernel!(backend, block_size)
+    kernel!(is_strong, nzv, cv, rp, Tv(θ); ndrange=n)
+    KernelAbstractions.synchronize(backend)
+    return is_strong
+end
+
+@kernel function signed_strength_kernel!(is_strong, @Const(nzval), @Const(colval),
+                                         @Const(rp), θ)
+    row = @index(Global)
+    @inbounds begin
         # Find diagonal
-        a_ii = zero(Tv)
-        for nz in rng
-            if cv[nz] == row
-                a_ii = nzv[nz]
+        a_ii = zero(eltype(nzval))
+        for nz in rp[row]:(rp[row+1]-1)
+            if colval[nz] == row
+                a_ii = nzval[nz]
                 break
             end
         end
         diag_sign = sign(real(a_ii))
         if diag_sign == 0
-            diag_sign = one(real(Tv))  # default to positive if zero diagonal
+            diag_sign = one(real(eltype(nzval)))
         end
         # Find max magnitude among opposite-sign off-diagonals
-        max_opposite = zero(real(Tv))
+        max_opposite = zero(real(eltype(nzval)))
         has_opposite = false
-        for nz in rng
-            col = cv[nz]
-            if col != row && sign(real(nzv[nz])) != diag_sign
-                max_opposite = max(max_opposite, abs(nzv[nz]))
+        for nz in rp[row]:(rp[row+1]-1)
+            col = colval[nz]
+            if col != row && sign(real(nzval[nz])) != diag_sign
+                max_opposite = max(max_opposite, abs(nzval[nz]))
                 has_opposite = true
             end
         end
         if has_opposite
             threshold = θ * max_opposite
-            for nz in rng
-                col = cv[nz]
-                if col != row && sign(real(nzv[nz])) != diag_sign
-                    is_strong[nz] = abs(nzv[nz]) >= threshold
+            for nz in rp[row]:(rp[row+1]-1)
+                col = colval[nz]
+                if col != row && sign(real(nzval[nz])) != diag_sign
+                    is_strong[nz] = abs(nzval[nz]) >= threshold
                 else
                     is_strong[nz] = false
                 end
             end
         else
             # Fallback: no opposite-sign connections, use absolute value
-            max_offdiag = zero(real(Tv))
-            for nz in rng
-                col = cv[nz]
+            max_offdiag = zero(real(eltype(nzval)))
+            for nz in rp[row]:(rp[row+1]-1)
+                col = colval[nz]
                 if col != row
-                    max_offdiag = max(max_offdiag, abs(nzv[nz]))
+                    max_offdiag = max(max_offdiag, abs(nzval[nz]))
                 end
             end
             threshold = θ * max_offdiag
-            for nz in rng
-                col = cv[nz]
+            for nz in rp[row]:(rp[row+1]-1)
+                col = colval[nz]
                 if col != row
-                    is_strong[nz] = abs(nzv[nz]) >= threshold
+                    is_strong[nz] = abs(nzval[nz]) >= threshold
                 else
                     is_strong[nz] = false
                 end
             end
         end
     end
-    return is_strong
 end
 
 """
@@ -125,8 +146,9 @@ end
 
 Dispatch strength computation based on config's strength_type.
 """
-function strength_graph(A::CSRMatrix, θ::Real, config::AMGConfig)
-    return strength_graph(A, θ, config.strength_type)
+function strength_graph(A::CSRMatrix, θ::Real, config::AMGConfig;
+                        backend=DEFAULT_BACKEND)
+    return strength_graph(A, θ, config.strength_type; backend=backend, block_size=config.block_size)
 end
 
 """
@@ -134,7 +156,7 @@ end
 
 Return an iterator of strongly connected column indices for a given row.
 """
-function strong_neighbors(A::CSRMatrix, is_strong::Vector{Bool}, row::Integer)
+function strong_neighbors(A::CSRMatrix, is_strong::AbstractVector{Bool}, row::Integer)
     cv = colvals(A)
     return (cv[nz] for nz in nzrange(A, row) if is_strong[nz])
 end

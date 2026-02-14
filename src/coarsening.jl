@@ -172,7 +172,7 @@ Compute for each node i the number of nodes j that strongly depend on i,
 i.e., the number of strong connections in the TRANSPOSE graph. This is the
 column-based measure used by hypre for better PMIS coarsening.
 """
-function _compute_strong_transpose_count(A::CSRMatrix{Tv, Ti}, is_strong::Vector{Bool}) where {Tv, Ti}
+function _compute_strong_transpose_count(A::CSRMatrix{Tv, Ti}, is_strong::AbstractVector{Bool}) where {Tv, Ti}
     n = size(A, 1)
     cv = colvals(A)
     st_count = zeros(Int, n)
@@ -282,7 +282,7 @@ end
 Second pass: any F-point that has no strong C-neighbor is promoted to C.
 This guarantees the strong-connection property needed for interpolation.
 """
-function _ensure_fine_have_coarse_neighbor!(cf::Vector{Int}, A::CSRMatrix, is_strong::Vector{Bool})
+function _ensure_fine_have_coarse_neighbor!(cf::Vector{Int}, A::CSRMatrix, is_strong::AbstractVector{Bool})
     n = size(A, 1)
     cv = colvals(A)
     changed = true
@@ -422,7 +422,7 @@ end
 Build a symmetrized strength indicator: is_strong_sym[nz] = true iff the
 connection (i,j) is strong AND (j,i) is also strong in the CSR structure.
 """
-function _symmetrize_strength(A::CSRMatrix{Tv, Ti}, is_strong::Vector{Bool}) where {Tv, Ti}
+function _symmetrize_strength(A::CSRMatrix{Tv, Ti}, is_strong::AbstractVector{Bool}) where {Tv, Ti}
     n = size(A, 1)
     cv = colvals(A)
     is_strong_sym = copy(is_strong)

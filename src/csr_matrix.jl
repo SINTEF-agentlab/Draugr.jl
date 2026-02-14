@@ -62,11 +62,11 @@ Copy nonzero values from a `StaticSparsityMatrixCSR` into an existing
 `CSRMatrix` with the same sparsity pattern.
 """
 function csr_copy_nzvals!(dest::CSRMatrix{Tv}, src::StaticSparsityMatrixCSR{Tv};
-                          backend=DEFAULT_BACKEND) where Tv
+                          backend=DEFAULT_BACKEND, block_size::Int=64) where Tv
     nzv_d = nonzeros(dest)
     nzv_s = nonzeros(src)
     n = length(nzv_d)
-    kernel! = copy_kernel!(backend, 64)
+    kernel! = copy_kernel!(backend, block_size)
     kernel!(nzv_d, nzv_s; ndrange=n)
     KernelAbstractions.synchronize(backend)
     return dest

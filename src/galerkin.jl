@@ -122,12 +122,12 @@ function galerkin_product!(A_coarse::CSRMatrix{Tv, Ti},
                            A_fine::CSRMatrix{Tv, Ti},
                            P::ProlongationOp{Ti, Tv},
                            r_map::RestrictionMap{Ti};
-                           backend=DEFAULT_BACKEND) where {Tv, Ti}
+                           backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
     nzv_c = nonzeros(A_coarse)
     nzv_f = nonzeros(A_fine)
     nnz_c = length(nzv_c)
     if nnz_c > 0
-        kernel! = galerkin_nz_kernel!(backend, 64)
+        kernel! = galerkin_nz_kernel!(backend, block_size)
         kernel!(nzv_c, nzv_f, P.nzval,
                 r_map.nz_offsets, r_map.triple_pi_idx,
                 r_map.triple_anz_idx, r_map.triple_pj_idx; ndrange=nnz_c)

@@ -1,45 +1,49 @@
-module ParallelAMGMetalExt
+module ParallelAMGJLArraysExt
 
 using ParallelAMG
-using Metal
+using JLArrays
+using JLArrays: JLSparseMatrixCSR
 using KernelAbstractions
+using LinearAlgebra
 
 """
-    amg_setup(A::CSRMatrix{Tv, Ti, <:MtlVector, <:MtlVector, <:MtlVector}, config; backend) -> AMGHierarchy
+    csr_from_gpu(A::JLSparseMatrixCSR) -> CSRMatrix
 
-AMG setup for a `CSRMatrix` backed by Metal `MtlVector` arrays.
-Automatically uses `MetalBackend()` as the default backend.
-
-Since Metal does not have a native sparse CSR type, users should construct the
-`CSRMatrix` directly from `MtlVector`s:
-
-```julia
-using Metal
-rp = MtlVector(rowptr_cpu)
-cv = MtlVector(colval_cpu)
-nzv = MtlVector(nzval_cpu)
-A = CSRMatrix(rp, cv, nzv, nrow, ncol)
-hierarchy = amg_setup(A, config)
-```
+Convert a JLArrays `JLSparseMatrixCSR` to the internal `CSRMatrix` representation
+by extracting its raw GPU arrays. The resulting `CSRMatrix` is backed by
+`JLVector`s and can be used directly with KernelAbstractions kernels.
 """
-function ParallelAMG.amg_setup(A::CSRMatrix{Tv, Ti, <:MtlVector, <:MtlVector, <:MtlVector},
-                               config::AMGConfig=AMGConfig();
-                               backend=MetalBackend()) where {Tv, Ti}
-    return invoke(ParallelAMG.amg_setup, Tuple{CSRMatrix{Tv, Ti}, AMGConfig},
-                  A, config; backend=backend)
+function ParallelAMG.csr_from_gpu(A::JLSparseMatrixCSR{Tv, Ti}) where {Tv, Ti}
+    rp = A.rowPtr
+    cv = A.colVal
+    nzv = A.nzVal
+    return CSRMatrix(rp, cv, nzv, size(A, 1), size(A, 2))
 end
 
 """
-    amg_resetup!(hierarchy, A_new::CSRMatrix{Tv, Ti, <:MtlVector, <:MtlVector, <:MtlVector}, config)
+    amg_setup(A::JLSparseMatrixCSR, config; backend) -> AMGHierarchy
 
-AMG resetup for a `CSRMatrix` backed by Metal `MtlVector` arrays.
-Converts to CPU and copies values into the existing hierarchy.
+AMG setup accepting a JLArrays sparse CSR matrix. Unwraps the GPU arrays into
+a `CSRMatrix` and forwards to the standard setup with `JLBackend()`.
+"""
+function ParallelAMG.amg_setup(A::JLSparseMatrixCSR{Tv, Ti},
+                               config::AMGConfig=AMGConfig();
+                               backend=JLBackend()) where {Tv, Ti}
+    A_csr = ParallelAMG.csr_from_gpu(A)
+    return ParallelAMG.amg_setup(A_csr, config; backend=backend)
+end
+
+"""
+    amg_resetup!(hierarchy, A_new::JLSparseMatrixCSR, config)
+
+AMG resetup accepting a JLArrays sparse CSR matrix. Unwraps the GPU arrays into
+a `CSRMatrix`, converts to CPU, and copies values into the existing hierarchy.
 """
 function ParallelAMG.amg_resetup!(hierarchy::AMGHierarchy{Tv, Ti},
-                                  A_new::CSRMatrix{Tv, Ti, <:MtlVector, <:MtlVector, <:MtlVector},
+                                  A_new::JLSparseMatrixCSR{Tv, Ti},
                                   config::AMGConfig=AMGConfig();
-                                  backend=MetalBackend()) where {Tv, Ti}
-    A_csr = ParallelAMG.csr_to_cpu(A_new)
+                                  backend=JLBackend()) where {Tv, Ti}
+    A_csr = ParallelAMG.csr_to_cpu(ParallelAMG.csr_from_gpu(A_new))
     block_size = config.block_size
     nlevels = length(hierarchy.levels)
     if nlevels == 0

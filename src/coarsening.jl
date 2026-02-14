@@ -18,7 +18,7 @@ function coarsen_aggregation(A::CSRMatrix{Tv, Ti}, θ::Real;
     if n <= 1
         return ones(Int, n), n
     end
-    is_strong = strength_graph(A, θ; backend=backend, block_size=block_size)
+    is_strong = strength_graph(A, θ)
     cv = colvals(A)
     nzv = nonzeros(A)
     agg = zeros(Int, n)  # 0 = unassigned
@@ -203,7 +203,7 @@ function coarsen_pmis(A::CSRMatrix{Tv, Ti}, θ::Real;
     if n <= 1
         return ones(Int, n), collect(1:n), n
     end
-    is_strong = strength_graph(A, θ; backend=backend, block_size=block_size)
+    is_strong = strength_graph(A, θ)
     cv = colvals(A)
     # Use column-based measure: how many nodes strongly depend on i
     st_count = _compute_strong_transpose_count(A, is_strong)
@@ -325,7 +325,7 @@ function coarsen_hmis(A::CSRMatrix{Tv, Ti}, θ::Real;
     if n <= 1
         return ones(Int, n), collect(1:n), n
     end
-    is_strong = strength_graph(A, θ; backend=backend, block_size=block_size)
+    is_strong = strength_graph(A, θ)
     cv = colvals(A)
     is_strong_sym = _symmetrize_strength(A, is_strong)
     # Column-based measure on the symmetric graph
@@ -469,7 +469,7 @@ function coarsen_rs(A::CSRMatrix{Tv, Ti}, θ::Real;
     if n <= 1
         return ones(Int, n), collect(1:n), n
     end
-    is_strong = strength_graph(A, θ; backend=backend, block_size=block_size)
+    is_strong = strength_graph(A, θ)
     cv = colvals(A)
     # Compute λ_i = number of points that strongly depend on i (transpose measure)
     λ = _compute_strong_transpose_count(A, is_strong)
@@ -558,8 +558,8 @@ function coarsen_aggressive(A::CSRMatrix{Tv, Ti}, θ::Real;
                             backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
     n = size(A, 1)
     # First pass: standard PMIS
-    cf, coarse_map, nc1 = coarsen_pmis(A, θ; rng=rng, backend=backend, block_size=block_size)
-    is_strong = strength_graph(A, θ; backend=backend, block_size=block_size)
+    cf, coarse_map, nc1 = coarsen_pmis(A, θ; rng=rng)
+    is_strong = strength_graph(A, θ)
     cv = colvals(A)
     agg = zeros(Int, n)
     agg_count = 0
@@ -682,13 +682,13 @@ function coarsen_aggressive_cf(A::CSRMatrix{Tv, Ti}, θ::Real, base::Symbol;
     # First pass: standard CF-splitting using base algorithm
     A_eff = config.max_row_sum > 0 ? _apply_max_row_sum(A, config.max_row_sum) : A
     if base == :hmis
-        cf1, _, nc1 = coarsen_hmis(A_eff, θ; rng=rng, backend=backend, block_size=block_size)
+        cf1, _, nc1 = coarsen_hmis(A_eff, θ; rng=rng)
     else  # :pmis
-        cf1, _, nc1 = coarsen_pmis(A_eff, θ; rng=rng, backend=backend, block_size=block_size)
+        cf1, _, nc1 = coarsen_pmis(A_eff, θ; rng=rng)
     end
     # Second pass: among C-points from first pass, do another CF-splitting
     # using distance-2 strong connections to further reduce the coarse set.
-    is_strong = strength_graph(A_eff, θ; backend=backend, block_size=block_size)
+    is_strong = strength_graph(A_eff, θ)
     cv = colvals(A_eff)
 
     # Build distance-2 strong connection graph among C-points:

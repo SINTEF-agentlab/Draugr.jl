@@ -61,7 +61,7 @@ function csr_from_gpu end
 # Public API
 export StaticSparsityMatrixCSR, static_sparsity_sparse, static_csr_from_csc
 export colvals, rowptr
-export CSRMatrix, csr_from_gpu
+export CSRMatrix, csr_from_gpu, csr_to_cpu
 export AggregationCoarsening, PMISCoarsening, HMISCoarsening, AggressiveCoarsening
 export SmoothedAggregationCoarsening, RSCoarsening
 export DirectInterpolation, StandardInterpolation, ExtendedIInterpolation

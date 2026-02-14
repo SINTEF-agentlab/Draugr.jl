@@ -42,6 +42,20 @@ colvals(A::CSRMatrix) = A.colval
 rowptr(A::CSRMatrix) = A.rowptr
 
 """
+    csr_to_cpu(A::CSRMatrix) -> CSRMatrix
+
+Convert a CSRMatrix with GPU arrays to a CSRMatrix with CPU arrays.
+If the arrays are already CPU arrays, this is a no-op (returns same object).
+"""
+function csr_to_cpu(A::CSRMatrix{Tv, Ti, <:Vector, <:Vector, <:Vector}) where {Tv, Ti}
+    return A  # already CPU
+end
+
+function csr_to_cpu(A::CSRMatrix{Tv, Ti}) where {Tv, Ti}
+    return CSRMatrix(Array(A.rowptr), Array(A.colval), Array(A.nzval), A.nrow, A.ncol)
+end
+
+"""
     csr_from_static(A::StaticSparsityMatrixCSR) -> CSRMatrix
 
 Convert a Jutul `StaticSparsityMatrixCSR` to the internal `CSRMatrix`

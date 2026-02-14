@@ -3,7 +3,7 @@ module ParallelAMGCUDAExt
 using ParallelAMG
 using CUDA
 using CUDA.CUSPARSE: CuSparseMatrixCSR
-using KernelAbstractions
+using KernelAbstractions, LinearAlgebra
 
 """
     csr_from_gpu(A::CuSparseMatrixCSR) -> CSRMatrix

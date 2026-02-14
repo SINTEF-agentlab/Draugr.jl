@@ -372,6 +372,8 @@ Fields:
 - `cycle_type`: AMG cycle type, `:V` for V-cycle or `:W` for W-cycle (default: `:V`)
 - `strength_type`: Strength of connection algorithm (default: `AbsoluteStrength()`).
   Use `SignedStrength()` for non-M-matrices with positive off-diagonals.
+- `block_size`: Block size for KernelAbstractions kernels (default: 64). Can be tuned for
+  different GPU backends (e.g., 256 for CUDA, 64 for Metal).
 """
 struct AMGConfig
     coarsening::CoarseningAlgorithm
@@ -387,6 +389,7 @@ struct AMGConfig
     max_row_sum::Float64
     cycle_type::Symbol
     strength_type::StrengthType
+    block_size::Int
 end
 
 function AMGConfig(;
@@ -403,6 +406,7 @@ function AMGConfig(;
     max_row_sum::Float64 = 0.0,
     cycle_type::Symbol = :V,
     strength_type::StrengthType = AbsoluteStrength(),
+    block_size::Int = 64,
     # Deprecated: accepted but ignored for backward compatibility
     min_coarse_ratio::Float64 = 0.5,
     max_stall_levels::Int = 2,
@@ -411,7 +415,7 @@ function AMGConfig(;
     return AMGConfig(coarsening, smoother, max_levels, max_coarse_size,
                      pre_smoothing_steps, post_smoothing_steps, jacobi_omega, verbose,
                      initial_coarsening, initial_coarsening_levels,
-                     max_row_sum, cycle_type, strength_type)
+                     max_row_sum, cycle_type, strength_type, block_size)
 end
 
 """

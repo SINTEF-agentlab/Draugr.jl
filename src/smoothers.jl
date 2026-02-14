@@ -620,7 +620,7 @@ function build_chebyshev_smoother(A::CSRMatrix{Tv, Ti};
     n = size(A, 1)
     invdiag = _allocate_undef_vector(A, Tv, n)
     compute_inverse_diagonal!(invdiag, A)
-    # Spectral radius estimation must use CPU arrays
+    # Spectral radius estimation uses scalar indexing and mul!, which require CPU arrays
     invdiag_cpu = invdiag isa Array ? invdiag : Array(invdiag)
     A_cpu = csr_to_cpu(A)
     ρ = _estimate_spectral_radius(A_cpu, invdiag_cpu)

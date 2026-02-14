@@ -65,7 +65,8 @@ function amg_setup(A_csr::CSRMatrix{Tv, Ti}, config::AMGConfig=AMGConfig();
     A_current = A_csr
     n_finest = size(A_csr, 1)
     block_size = config.block_size
-    # Determine if we need GPU-resident arrays (infer from input matrix)
+    # Determine if we need GPU-resident arrays: any non-CPU array type
+    # (CuArray, JLArray, MtlArray, etc.) triggers GPU-resident hierarchy
     is_gpu = !(A_csr.nzval isa Array)
     for lvl in 1:(config.max_levels - 1)
         n = size(A_current, 1)

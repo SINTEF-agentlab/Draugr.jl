@@ -278,6 +278,7 @@ mutable struct ProlongationOp{Ti<:Integer, Tv, Vi<:AbstractVector{Ti}, Vv<:Abstr
 end
 
 # Convenience constructor for CPU vectors
+# Convenience constructor for CPU vectors (used during setup which runs on CPU)
 function ProlongationOp{Ti, Tv}(rowptr::Vector{Ti}, colval::Vector{Ti}, nzval::Vector{Tv}, nrow::Int, ncol::Int) where {Ti, Tv}
     return ProlongationOp{Ti, Tv, Vector{Ti}, Vector{Tv}}(rowptr, colval, nzval, nrow, ncol)
 end

@@ -45,9 +45,11 @@ function _copy_nzvals!(dest::CSRMatrix, src::CSRMatrix;
     nzv_d = nonzeros(dest)
     nzv_s = nonzeros(src)
     n = length(nzv_d)
-    # If source and dest are on different devices, use copyto!
-    if typeof(nzv_d) != typeof(nzv_s)
-        copyto!(nzv_d, nzv_s isa Array ? nzv_s : Array(nzv_s))
+    # If source and dest are on different devices, use copyto! for cross-device transfer
+    src_on_cpu = nzv_s isa Array
+    dst_on_cpu = nzv_d isa Array
+    if src_on_cpu != dst_on_cpu
+        copyto!(nzv_d, src_on_cpu ? nzv_s : Array(nzv_s))
     else
         kernel! = copy_kernel!(backend, block_size)
         kernel!(nzv_d, nzv_s; ndrange=n)

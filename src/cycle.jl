@@ -20,7 +20,7 @@ function amg_cycle!(x::AbstractVector{Tv}, b::AbstractVector{Tv},
         return x
     end
     # V-cycle: descend
-    _vcycle_descend!(x, b, hierarchy, config, 1; backend=backend)
+    _vcycle_descend!(x, b, hierarchy, config, 1; backend=backend, block_size=config.block_size)
     return x
 end
 
@@ -40,18 +40,18 @@ end
 end
 
 """
-    compute_residual!(r, A, x, b; backend=DEFAULT_BACKEND)
+    compute_residual!(r, A, x, b; backend=DEFAULT_BACKEND, block_size=64)
 
 Compute residual r = b - A*x using a KA kernel. No allocations.
 """
 function compute_residual!(r::AbstractVector, A::CSRMatrix,
                            x::AbstractVector, b::AbstractVector;
-                           backend=DEFAULT_BACKEND)
+                           backend=DEFAULT_BACKEND, block_size::Int=64)
     n = size(A, 1)
     nzv = nonzeros(A)
     cv = colvals(A)
     rp = rowptr(A)
-    kernel! = residual_kernel!(backend, 64)
+    kernel! = residual_kernel!(backend, block_size)
     kernel!(r, b, x, nzv, cv, rp; ndrange=n)
     KernelAbstractions.synchronize(backend)
     return r
@@ -60,7 +60,7 @@ end
 function _vcycle_descend!(x::AbstractVector{Tv}, b::AbstractVector{Tv},
                           hierarchy::AMGHierarchy{Tv, Ti},
                           config::AMGConfig, lvl::Int;
-                          backend=DEFAULT_BACKEND) where {Tv, Ti}
+                          backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
     nlevels = length(hierarchy.levels)
     level = hierarchy.levels[lvl]
     A = level.A
@@ -69,18 +69,18 @@ function _vcycle_descend!(x::AbstractVector{Tv}, b::AbstractVector{Tv},
     xc = level.xc
     bc = level.bc
     # Pre-smoothing
-    smooth!(x, A, b, level.smoother; steps=config.pre_smoothing_steps, backend=backend)
+    smooth!(x, A, b, level.smoother; steps=config.pre_smoothing_steps, backend=backend, block_size=block_size)
     # Compute residual: r = b - A*x (parallelized, no allocations)
-    compute_residual!(r, A, x, b; backend=backend)
+    compute_residual!(r, A, x, b; backend=backend, block_size=block_size)
     # Restrict residual to coarse grid
-    restrict!(bc, level.Pt_map, P, r; backend=backend)
+    restrict!(bc, level.Pt_map, P, r; backend=backend, block_size=block_size)
     # Solve on coarse grid
     fill!(xc, zero(Tv))
     if lvl < nlevels
         # Recurse (W-cycle: recurse twice, V-cycle: once)
         n_recurse = config.cycle_type == :W ? 2 : 1
         for _ in 1:n_recurse
-            _vcycle_descend!(xc, bc, hierarchy, config, lvl + 1; backend=backend)
+            _vcycle_descend!(xc, bc, hierarchy, config, lvl + 1; backend=backend, block_size=block_size)
         end
     else
         # Direct solve at coarsest level
@@ -89,9 +89,9 @@ function _vcycle_descend!(x::AbstractVector{Tv}, b::AbstractVector{Tv},
         copyto!(xc, hierarchy.coarse_x)
     end
     # Prolongate and correct: x += P * xc
-    prolongate!(x, P, xc; backend=backend)
+    prolongate!(x, P, xc; backend=backend, block_size=block_size)
     # Post-smoothing
-    smooth!(x, A, b, level.smoother; steps=config.post_smoothing_steps, backend=backend)
+    smooth!(x, A, b, level.smoother; steps=config.post_smoothing_steps, backend=backend, block_size=block_size)
     return x
 end
 
@@ -123,13 +123,14 @@ function amg_solve!(x::AbstractVector{Tv}, b::AbstractVector{Tv},
         copyto!(x, hierarchy.coarse_x)
         return x, 1
     end
+    block_size = config.block_size
     # Use pre-allocated residual buffer (no allocations!)
     r = hierarchy.solve_r
     rnorm = bnorm
     for iter in 1:maxiter
         amg_cycle!(x, b, hierarchy, config; backend=backend)
         # Check convergence using parallelized residual computation
-        compute_residual!(r, A, x, b; backend=backend)
+        compute_residual!(r, A, x, b; backend=backend, block_size=block_size)
         rnorm = norm(r)
         if rnorm / bnorm < tol
             if config.verbose

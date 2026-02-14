@@ -8,22 +8,23 @@ function amg_resetup!(hierarchy::AMGHierarchy{Tv, Ti},
                       A_new::StaticSparsityMatrixCSR{Tv, Ti},
                       config::AMGConfig=AMGConfig();
                       backend=DEFAULT_BACKEND) where {Tv, Ti}
+    block_size = config.block_size
     nlevels = length(hierarchy.levels)
     if nlevels == 0
         A_csr = csr_from_static(A_new)
-        _update_coarse_solver!(hierarchy, A_csr; backend=backend)
+        _update_coarse_solver!(hierarchy, A_csr; backend=backend, block_size=block_size)
         return hierarchy
     end
     # Update first level's matrix (copy values from A_new into existing CSRMatrix)
     level1 = hierarchy.levels[1]
-    csr_copy_nzvals!(level1.A, A_new; backend=backend)
-    update_smoother!(level1.smoother, level1.A; backend=backend)
+    csr_copy_nzvals!(level1.A, A_new; backend=backend, block_size=block_size)
+    update_smoother!(level1.smoother, level1.A; backend=backend, block_size=block_size)
     # Update subsequent levels via Galerkin products
     for lvl in 1:(nlevels - 1)
         level = hierarchy.levels[lvl]
         next_level = hierarchy.levels[lvl + 1]
-        galerkin_product!(next_level.A, level.A, level.P, level.R_map; backend=backend)
-        update_smoother!(next_level.smoother, next_level.A; backend=backend)
+        galerkin_product!(next_level.A, level.A, level.P, level.R_map; backend=backend, block_size=block_size)
+        update_smoother!(next_level.smoother, next_level.A; backend=backend, block_size=block_size)
     end
     # Recompute coarsest dense matrix
     last_level = hierarchy.levels[nlevels]
@@ -35,17 +36,17 @@ function amg_resetup!(hierarchy::AMGHierarchy{Tv, Ti},
 end
 
 """
-    _copy_nzvals!(dest, src; backend=DEFAULT_BACKEND)
+    _copy_nzvals!(dest, src; backend=DEFAULT_BACKEND, block_size=64)
 
 Copy nonzero values from `src` CSRMatrix into `dest` (same sparsity pattern),
 using a KA kernel for parallelism.
 """
 function _copy_nzvals!(dest::CSRMatrix, src::CSRMatrix;
-                       backend=DEFAULT_BACKEND)
+                       backend=DEFAULT_BACKEND, block_size::Int=64)
     nzv_d = nonzeros(dest)
     nzv_s = nonzeros(src)
     n = length(nzv_d)
-    kernel! = copy_kernel!(backend, 64)
+    kernel! = copy_kernel!(backend, block_size)
     kernel!(nzv_d, nzv_s; ndrange=n)
     KernelAbstractions.synchronize(backend)
     return dest
@@ -93,8 +94,8 @@ end
 Update the direct solver at the coarsest level using in-place LU refactorization.
 """
 function _update_coarse_solver!(hierarchy::AMGHierarchy{Tv}, A::CSRMatrix{Tv};
-                                backend=DEFAULT_BACKEND) where {Tv}
-    _csr_to_dense!(hierarchy.coarse_A, A; backend=backend)
+                                backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv}
+    _csr_to_dense!(hierarchy.coarse_A, A; backend=backend, block_size=block_size)
     copyto!(hierarchy.coarse_lu, hierarchy.coarse_A)
     LinearAlgebra.LAPACK.getrf!(hierarchy.coarse_lu, hierarchy.coarse_ipiv)
     hierarchy.coarse_factor = LU(hierarchy.coarse_lu, hierarchy.coarse_ipiv, 0)

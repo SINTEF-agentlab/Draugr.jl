@@ -43,21 +43,22 @@ function ParallelAMG.amg_resetup!(hierarchy::AMGHierarchy{Tv, Ti},
                                   config::AMGConfig=AMGConfig();
                                   backend=CUDABackend()) where {Tv, Ti}
     A_csr = ParallelAMG.csr_from_gpu(A_new)
+    block_size = config.block_size
     nlevels = length(hierarchy.levels)
     if nlevels == 0
-        ParallelAMG._update_coarse_solver!(hierarchy, A_csr; backend=backend)
+        ParallelAMG._update_coarse_solver!(hierarchy, A_csr; backend=backend, block_size=block_size)
         return hierarchy
     end
     # Copy nonzero values from new matrix into existing level 1
     level1 = hierarchy.levels[1]
-    ParallelAMG._copy_nzvals!(level1.A, A_csr; backend=backend)
-    ParallelAMG.update_smoother!(level1.smoother, level1.A; backend=backend)
+    ParallelAMG._copy_nzvals!(level1.A, A_csr; backend=backend, block_size=block_size)
+    ParallelAMG.update_smoother!(level1.smoother, level1.A; backend=backend, block_size=block_size)
     # Update subsequent levels via Galerkin products
     for lvl in 1:(nlevels - 1)
         level = hierarchy.levels[lvl]
         next_level = hierarchy.levels[lvl + 1]
-        ParallelAMG.galerkin_product!(next_level.A, level.A, level.P, level.R_map; backend=backend)
-        ParallelAMG.update_smoother!(next_level.smoother, next_level.A; backend=backend)
+        ParallelAMG.galerkin_product!(next_level.A, level.A, level.P, level.R_map; backend=backend, block_size=block_size)
+        ParallelAMG.update_smoother!(next_level.smoother, next_level.A; backend=backend, block_size=block_size)
     end
     # Recompute coarsest dense matrix and LU
     last_level = hierarchy.levels[nlevels]

@@ -59,9 +59,10 @@ function amg_setup(A_csr::CSRMatrix{Tv, Ti}, config::AMGConfig=AMGConfig();
     coarse_ipiv = Vector{LinearAlgebra.BlasInt}(undef, n_coarse)
     LinearAlgebra.LAPACK.getrf!(coarse_lu, coarse_ipiv)
     coarse_factor = LU(coarse_lu, coarse_ipiv, 0)  # 0 = successful factorization info
+    # Workspace buffers for coarsest-level direct solve (populated during solve phase)
     coarse_x = Vector{Tv}(undef, n_coarse)
     coarse_b = Vector{Tv}(undef, n_coarse)
-    # Pre-allocate residual buffer for amg_solve! at finest level size
+    # Pre-allocate residual buffer for amg_solve! (populated during solve phase)
     solve_r = Vector{Tv}(undef, n_finest)
     hierarchy = AMGHierarchy{Tv, Ti}(levels, coarse_dense, coarse_lu, coarse_ipiv,
                                       coarse_factor, coarse_x, coarse_b, solve_r)

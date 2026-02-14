@@ -108,12 +108,13 @@ function LinearAlgebra.mul!(y::AbstractVector, A::CSRMatrix, x::AbstractVector)
 end
 
 """
-    _get_backend(arr, default_backend)
+    _get_backend(arr)
 
-Infer the KernelAbstractions backend from an array. Uses `KernelAbstractions.get_backend`
-to detect GPU arrays; falls back to the provided default for CPU arrays.
+Infer the KernelAbstractions backend from an array using `KernelAbstractions.get_backend`.
+Returns the appropriate backend for GPU arrays (e.g., CUDABackend, MetalBackend, JLBackend)
+or CPU backend for regular Arrays.
 """
-function _get_backend(arr::AbstractVector, default_backend=DEFAULT_BACKEND)
+function _get_backend(arr::AbstractVector)
     return KernelAbstractions.get_backend(arr)
 end
 

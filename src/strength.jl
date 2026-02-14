@@ -5,6 +5,9 @@ Compute strength-of-connection for matrix `A` using threshold `θ`.
 Returns a boolean CSR matrix `S` where `S[i,j] = true` if j is a strong connection of i.
 
 A connection (i,j) is strong if |A[i,j]| ≥ θ * max_{k≠i} |A[i,k]|
+
+The backend is inferred from the array type of A's data, so GPU arrays
+will use GPU kernels automatically.
 """
 function strength_graph(A::CSRMatrix{Tv, Ti}, θ::Real;
                         backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
@@ -15,7 +18,8 @@ end
     strength_graph(A, θ, ::AbsoluteStrength)
 
 Absolute-value strength: |a_{i,j}| ≥ θ * max_{k≠i} |a_{i,k}|.
-Uses a KA kernel for GPU compatibility.
+Uses a KA kernel for GPU compatibility. The result array type matches the
+backend (GPU arrays for GPU backends, CPU arrays for CPU backends).
 """
 function strength_graph(A::CSRMatrix{Tv, Ti}, θ::Real, ::AbsoluteStrength;
                         backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
@@ -23,12 +27,12 @@ function strength_graph(A::CSRMatrix{Tv, Ti}, θ::Real, ::AbsoluteStrength;
     nzv = nonzeros(A)
     cv = colvals(A)
     rp = rowptr(A)
-    is_strong = KernelAbstractions.zeros(backend, Bool, nnz(A))
-    kernel! = absolute_strength_kernel!(backend, block_size)
+    be = _get_backend(nzv, backend)
+    is_strong = KernelAbstractions.zeros(be, Bool, nnz(A))
+    kernel! = absolute_strength_kernel!(be, block_size)
     kernel!(is_strong, nzv, cv, rp, Tv(θ); ndrange=n)
-    KernelAbstractions.synchronize(backend)
-    # Convert to CPU array for use by coarsening functions (scalar indexing)
-    return is_strong isa Array ? is_strong : Array(is_strong)
+    _synchronize(be)
+    return is_strong
 end
 
 @kernel function absolute_strength_kernel!(is_strong, @Const(nzval), @Const(colval),
@@ -77,12 +81,12 @@ function strength_graph(A::CSRMatrix{Tv, Ti}, θ::Real, ::SignedStrength;
     nzv = nonzeros(A)
     cv = colvals(A)
     rp = rowptr(A)
-    is_strong = KernelAbstractions.zeros(backend, Bool, nnz(A))
-    kernel! = signed_strength_kernel!(backend, block_size)
+    be = _get_backend(nzv, backend)
+    is_strong = KernelAbstractions.zeros(be, Bool, nnz(A))
+    kernel! = signed_strength_kernel!(be, block_size)
     kernel!(is_strong, nzv, cv, rp, Tv(θ); ndrange=n)
-    KernelAbstractions.synchronize(backend)
-    # Convert to CPU array for use by coarsening functions (scalar indexing)
-    return is_strong isa Array ? is_strong : Array(is_strong)
+    _synchronize(be)
+    return is_strong
 end
 
 @kernel function signed_strength_kernel!(is_strong, @Const(nzval), @Const(colval),

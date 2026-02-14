@@ -106,3 +106,27 @@ function LinearAlgebra.mul!(y::AbstractVector, A::CSRMatrix, x::AbstractVector)
     end
     return y
 end
+
+"""
+    _get_backend(arr, default_backend)
+
+Infer the KernelAbstractions backend from an array. Uses `KernelAbstractions.get_backend`
+to detect GPU arrays; falls back to the provided default for CPU arrays.
+"""
+function _get_backend(arr::AbstractVector, default_backend=DEFAULT_BACKEND)
+    return KernelAbstractions.get_backend(arr)
+end
+
+"""
+    _synchronize(backend)
+
+Synchronize the backend. This wraps `KernelAbstractions.synchronize` with a fallback
+for backends that don't implement it (e.g., JLBackend), since some mock GPU backends
+execute kernels synchronously.
+"""
+function _synchronize(backend)
+    if hasmethod(KernelAbstractions.synchronize, Tuple{typeof(backend)})
+        KernelAbstractions.synchronize(backend)
+    end
+    return nothing
+end

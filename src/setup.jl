@@ -31,40 +31,37 @@ function amg_setup(A_csr::CSRMatrix{Tv, Ti}, config::AMGConfig=AMGConfig();
         n <= config.max_coarse_size && break
         # Select coarsening algorithm for this level
         coarsening_alg = _get_coarsening_for_level(config, lvl)
-        # Coarsen and build prolongation on CPU (graph algorithms need scalar indexing)
-        A_cpu = csr_to_cpu(A_current)
-        P, n_coarse = _coarsen_with_fallback(A_cpu, coarsening_alg, config; backend=backend, block_size=block_size)
+        # Coarsen and build prolongation (coarsening converts to CPU internally)
+        P, n_coarse = _coarsen_with_fallback(A_current, coarsening_alg, config; backend=backend, block_size=block_size)
         n_coarse >= n && break  # no coarsening progress
         n_coarse == 0 && break  # degenerate case
-        # Compute coarse operator via Galerkin product (on CPU)
+        # Compute coarse operator via Galerkin product (CPU — inherently sequential)
+        A_cpu = csr_to_cpu(A_current)
         A_coarse, r_map = compute_coarse_sparsity(A_cpu, P, n_coarse)
         # Build transpose map for atomic-free restriction
         Pt_map = build_transpose_map(P)
-        # Build smoother
+        # Build smoother (uses CPU arrays for workspace)
         smoother = build_smoother(A_cpu, config.smoother, config.jacobi_omega; backend=backend, block_size=block_size)
         # Workspace
-        r = KernelAbstractions.zeros(backend, Tv, n)
-        xc = KernelAbstractions.zeros(backend, Tv, n_coarse)
-        bc = KernelAbstractions.zeros(backend, Tv, n_coarse)
+        r = Vector{Tv}(undef, n)
+        xc = Vector{Tv}(undef, n_coarse)
+        bc = Vector{Tv}(undef, n_coarse)
         level = AMGLevel{Tv, Ti}(A_cpu, P, Pt_map, r_map, smoother, r, xc, bc)
         push!(levels, level)
         A_current = A_coarse
     end
-    # Set up direct solver at coarsest level with in-place LU buffer
+    # Set up direct solver at coarsest level using high-level lu()
     A_cpu = csr_to_cpu(A_current)
     n_coarse = size(A_cpu, 1)
     coarse_dense = Matrix{Tv}(undef, n_coarse, n_coarse)
     _csr_to_dense!(coarse_dense, A_cpu)
-    coarse_lu = copy(coarse_dense)
-    coarse_ipiv = Vector{LinearAlgebra.BlasInt}(undef, n_coarse)
-    LinearAlgebra.LAPACK.getrf!(coarse_lu, coarse_ipiv)
-    coarse_factor = LU(coarse_lu, coarse_ipiv, 0)  # 0 = successful factorization info
+    coarse_factor = lu(coarse_dense)
     # Workspace buffers for coarsest-level direct solve (populated during solve phase)
     coarse_x = Vector{Tv}(undef, n_coarse)
     coarse_b = Vector{Tv}(undef, n_coarse)
     # Pre-allocate residual buffer for amg_solve! (populated during solve phase)
     solve_r = Vector{Tv}(undef, n_finest)
-    hierarchy = AMGHierarchy{Tv, Ti}(levels, coarse_dense, coarse_lu, coarse_ipiv,
+    hierarchy = AMGHierarchy{Tv, Ti}(levels, coarse_dense,
                                       coarse_factor, coarse_x, coarse_b, solve_r)
     t_setup = time() - t_setup
     if config.verbose

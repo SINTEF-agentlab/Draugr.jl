@@ -819,26 +819,19 @@ end
         N = n*n
         config = AMGConfig(coarsening=AggregationCoarsening())
         hierarchy = amg_setup(A, config)
-        # Check that LU buffer is separate from coarse_A
-        @test hierarchy.coarse_lu !== hierarchy.coarse_A
-        @test size(hierarchy.coarse_lu) == size(hierarchy.coarse_A)
-        # Check that ipiv is pre-allocated
-        @test length(hierarchy.coarse_ipiv) == size(hierarchy.coarse_A, 1)
+        # Check that coarse_factor is a valid factorization
+        @test hierarchy.coarse_factor isa Factorization
         # Solve, then resetup with scaled matrix and solve again
         b = rand(N)
         x1 = zeros(N)
         x1, _ = amg_solve!(x1, b, hierarchy, config; tol=1e-8, maxiter=200)
         r1 = b - sparse(A.At') * x1
         @test norm(r1) / norm(b) < 1e-8
-        # Track the LU buffer memory address
-        lu_ptr = pointer(hierarchy.coarse_lu)
-        ipiv_ptr = pointer(hierarchy.coarse_ipiv)
         # Resetup
         nonzeros(A) .*= 2.0
         amg_resetup!(hierarchy, A, config)
-        # Verify buffers were reused (same memory)
-        @test pointer(hierarchy.coarse_lu) == lu_ptr
-        @test pointer(hierarchy.coarse_ipiv) == ipiv_ptr
+        # Verify factorization was updated
+        @test hierarchy.coarse_factor isa Factorization
         # Solve with updated matrix
         x2 = zeros(N)
         x2, _ = amg_solve!(x2, b, hierarchy, config; tol=1e-8, maxiter=200)

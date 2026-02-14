@@ -337,15 +337,13 @@ end
     AMGHierarchy{Tv, Ti}
 
 Complete AMG hierarchy with multiple levels and a direct solver at the coarsest level.
-The coarse LU factorization uses a pre-allocated buffer and pivot vector for
-in-place refactorization during resetup.
+The coarse LU factorization uses high-level `lu` / `lu!` so that GPU backends
+(CUDA, Metal) can dispatch to their own implementations.
 """
 mutable struct AMGHierarchy{Tv, Ti<:Integer}
     levels::Vector{AMGLevel{Tv, Ti}}
     coarse_A::Matrix{Tv}       # dense coarse matrix (values recomputed each resetup)
-    coarse_lu::Matrix{Tv}      # separate buffer for LU factorization (overwritten by getrf!)
-    coarse_ipiv::Vector{LinearAlgebra.BlasInt}  # pivot vector (reused across resetups)
-    coarse_factor::LU{Tv, Matrix{Tv}, Vector{LinearAlgebra.BlasInt}}  # LU wrapper (references lu/ipiv)
+    coarse_factor::Factorization{Tv}  # LU (or other) factorization of coarse_A
     coarse_x::Vector{Tv}       # workspace for coarsest level
     coarse_b::Vector{Tv}       # workspace for coarsest level
     solve_r::Vector{Tv}        # residual buffer for amg_solve! (finest level size)

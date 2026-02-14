@@ -60,9 +60,7 @@ function ParallelAMG.amg_resetup!(hierarchy::AMGHierarchy{Tv, Ti},
     # Recompute coarsest dense matrix and LU
     last_level = hierarchy.levels[nlevels]
     ParallelAMG._recompute_coarsest_dense!(hierarchy, last_level)
-    copyto!(hierarchy.coarse_lu, hierarchy.coarse_A)
-    LinearAlgebra.LAPACK.getrf!(hierarchy.coarse_lu, hierarchy.coarse_ipiv)
-    hierarchy.coarse_factor = LinearAlgebra.LU(hierarchy.coarse_lu, hierarchy.coarse_ipiv, 0)
+    hierarchy.coarse_factor = lu(hierarchy.coarse_A)
     return hierarchy
 end
 

@@ -214,14 +214,17 @@ P[i, coarse_map[i]] = 1 for coarse points.
 P[i, coarse_map[j]] = -a_{i,j} / d_i for fine points, where j ∈ C_i^s and
 d_i = a_{i,i} + Σ_{k ∈ weak ∪ F_i^s ∪ same_sign} a_{i,k}.
 """
-function _build_interpolation(A::CSRMatrix{Tv, Ti}, cf::Vector{Int},
+function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                               coarse_map::Vector{Int}, n_coarse::Int,
                               ::DirectInterpolation, θ::Real=0.25;
                               backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
+    # Compute strength on GPU if available, then convert to CPU for graph algorithms
+    is_strong_raw = strength_graph(A_in, θ; backend=backend, block_size=block_size)
+    is_strong = is_strong_raw isa Array ? is_strong_raw : Array(is_strong_raw)
+    A = csr_to_cpu(A_in)
     n_fine = size(A, 1)
     cv = colvals(A)
     nzv = nonzeros(A)
-    is_strong = strength_graph(A, θ)
 
     # First pass: count entries per row
     row_counts = zeros(Int, n_fine)
@@ -341,14 +344,17 @@ Standard (classical Ruge-Stüben) interpolation. For each fine point i:
 w_j = -(a_{i,j} + Σ_{k∈F_i^s} a_{i,k} * a_{k,j} / Σ_{m∈C_i} a_{k,m}) / d_i
 where d_i = a_{i,i} + Σ_{k∈weak} a_{i,k}
 """
-function _build_interpolation(A::CSRMatrix{Tv, Ti}, cf::Vector{Int},
+function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                               coarse_map::Vector{Int}, n_coarse::Int,
                               ::StandardInterpolation, θ::Real=0.25;
                               backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
+    # Compute strength on GPU if available, then convert to CPU for graph algorithms
+    is_strong_raw = strength_graph(A_in, θ; backend=backend, block_size=block_size)
+    is_strong = is_strong_raw isa Array ? is_strong_raw : Array(is_strong_raw)
+    A = csr_to_cpu(A_in)
     n_fine = size(A, 1)
     cv = colvals(A)
     nzv = nonzeros(A)
-    is_strong = strength_graph(A, θ)
 
     # Build P using COO format, then convert to CSR
     I_p = Ti[]
@@ -437,14 +443,17 @@ Extended+i interpolation. Extends standard interpolation by including distance-2
 coarse points (coarse points connected through fine neighbors) as direct
 interpolation targets, resulting in a larger but more accurate interpolation stencil.
 """
-function _build_interpolation(A::CSRMatrix{Tv, Ti}, cf::Vector{Int},
+function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                               coarse_map::Vector{Int}, n_coarse::Int,
                               ::ExtendedIInterpolation, θ::Real=0.25;
                               backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
+    # Compute strength on GPU if available, then convert to CPU for graph algorithms
+    is_strong_raw = strength_graph(A_in, θ; backend=backend, block_size=block_size)
+    is_strong = is_strong_raw isa Array ? is_strong_raw : Array(is_strong_raw)
+    A = csr_to_cpu(A_in)
     n_fine = size(A, 1)
     cv = colvals(A)
     nzv = nonzeros(A)
-    is_strong = strength_graph(A, θ)
 
     I_p = Ti[]
     J_p = Ti[]

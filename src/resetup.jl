@@ -29,9 +29,7 @@ function amg_resetup!(hierarchy::AMGHierarchy{Tv, Ti},
     # Recompute coarsest dense matrix
     last_level = hierarchy.levels[nlevels]
     _recompute_coarsest_dense!(hierarchy, last_level; backend=backend)
-    copyto!(hierarchy.coarse_lu, hierarchy.coarse_A)
-    LinearAlgebra.LAPACK.getrf!(hierarchy.coarse_lu, hierarchy.coarse_ipiv)
-    hierarchy.coarse_factor = LU(hierarchy.coarse_lu, hierarchy.coarse_ipiv, 0)
+    hierarchy.coarse_factor = lu(hierarchy.coarse_A)
     return hierarchy
 end
 
@@ -91,13 +89,11 @@ end
 """
     _update_coarse_solver!(hierarchy, A; backend=DEFAULT_BACKEND)
 
-Update the direct solver at the coarsest level using in-place LU refactorization.
+Update the direct solver at the coarsest level using high-level lu().
 """
 function _update_coarse_solver!(hierarchy::AMGHierarchy{Tv}, A::CSRMatrix{Tv};
                                 backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv}
     _csr_to_dense!(hierarchy.coarse_A, A; backend=backend, block_size=block_size)
-    copyto!(hierarchy.coarse_lu, hierarchy.coarse_A)
-    LinearAlgebra.LAPACK.getrf!(hierarchy.coarse_lu, hierarchy.coarse_ipiv)
-    hierarchy.coarse_factor = LU(hierarchy.coarse_lu, hierarchy.coarse_ipiv, 0)
+    hierarchy.coarse_factor = lu(hierarchy.coarse_A)
     return hierarchy
 end

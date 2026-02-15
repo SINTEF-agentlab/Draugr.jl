@@ -1,3 +1,18 @@
+# ── Block-aware helpers ───────────────────────────────────────────────────────
+# For scalars, _frobenius_norm2 is just abs2(v). For block matrices (SMatrix),
+# it computes the squared Frobenius norm: sum of abs2 of all elements = tr(v' * v).
+_frobenius_norm2(v::Number) = abs2(v)
+_frobenius_norm2(v) = real(LinearAlgebra.dot(v, v))
+
+# For scalars, _entry_norm is abs(v). For block matrices, it returns the
+# Frobenius norm (a scalar). Used for threshold comparisons.
+_entry_norm(v::Number) = abs(v)
+_entry_norm(v) = sqrt(real(LinearAlgebra.dot(v, v)))
+
+# For scalars, isfinite check. For block types, checks all elements are finite.
+_is_finite_entry(v::Number) = isfinite(v)
+_is_finite_entry(v) = all(isfinite, v)
+
 """
     build_jacobi_smoother(A, ω)
 
@@ -35,13 +50,13 @@ end
         diag_val = zero(eltype(invdiag))
         row_norm = zero(real(eltype(invdiag)))
         for nz in rp[i]:(rp[i+1]-1)
-            row_norm += abs(nzval[nz])
+            row_norm += _entry_norm(nzval[nz])
             if colval[nz] == i
                 diag_val = nzval[nz]
             end
         end
         # Safe inverse: avoid Inf/NaN for zero or near-zero diagonals
-        abs_d = abs(diag_val)
+        abs_d = _entry_norm(diag_val)
         threshold = eps(real(eltype(invdiag))) * max(one(real(eltype(invdiag))), row_norm)
         invdiag[i] = abs_d > threshold ? inv(diag_val) : zero(eltype(invdiag))
     end
@@ -260,15 +275,15 @@ end
     i = @index(Global)
     @inbounds begin
         diag_val = zero(eltype(m_diag))
-        row_norm_sq = zero(eltype(m_diag))
+        row_norm_sq = zero(real(eltype(nzval)))
         for nz in rp[i]:(rp[i+1]-1)
             v = nzval[nz]
-            row_norm_sq += v * v
+            row_norm_sq += _frobenius_norm2(v)
             if colval[nz] == i
                 diag_val = v
             end
         end
-        m_diag[i] = row_norm_sq > zero(eltype(m_diag)) ? diag_val / row_norm_sq : zero(eltype(m_diag))
+        m_diag[i] = row_norm_sq > zero(row_norm_sq) ? diag_val / row_norm_sq : zero(eltype(m_diag))
     end
 end
 
@@ -553,9 +568,10 @@ end
     @inbounds begin
         l1_norm = zero(real(eltype(invdiag)))
         for nz in rp[i]:(rp[i+1]-1)
-            l1_norm += abs(nzval[nz])
+            l1_norm += _entry_norm(nzval[nz])
         end
-        # Safe inverse
+        # Safe inverse: for scalars inv(l1_norm) is 1/l1_norm,
+        # for block systems this gives a scalar inverse which scales the identity.
         invdiag[i] = l1_norm > eps(real(eltype(invdiag))) ? inv(l1_norm) : zero(eltype(invdiag))
     end
 end
@@ -819,26 +835,32 @@ function _ilu0_factorize!(L_nzval::Vector{Tv}, U_nzval::Vector{Tv},
     # Maximum factor growth for ILU entries
     const_max_ilu_factor = Tv(1e8)
 
+    # Precompute row norms to avoid redundant recomputation in inner loop
+    row_norms = Vector{real(Tv)}(undef, n)
+    @inbounds for i in 1:n
+        s = zero(real(Tv))
+        for nz in rp[i]:(rp[i+ti_one]-ti_one)
+            s += _entry_norm(nzv[nz])
+        end
+        row_norms[i] = s
+    end
+
     @inbounds for i in 1:n
         # Process row i: for each k < i in row i's lower triangle
         for nz in rp[i]:(diag_idx[i]-ti_one)
             k = cv[nz]
-            # L[i,k] = U[i,k] / U[k,k]
+            # L[i,k] = U[i,k] * U[k,k]⁻¹ (right division for block compatibility)
             u_kk = U_nzval[diag_idx[k]]
-            # Use original row k's norm as reference scale for zero check
-            row_k_norm = zero(real(Tv))
-            for nz_k in rp[k]:(rp[k+ti_one]-ti_one)
-                row_k_norm += abs(nzv[nz_k])
-            end
-            if abs(u_kk) < _safe_threshold(Tv, row_k_norm)
+            if _entry_norm(u_kk) < _safe_threshold(Tv, row_norms[k])
                 L_nzval[nz] = zero(Tv)
                 U_nzval[nz] = zero(Tv)
                 continue
             end
             l_ik = U_nzval[nz] / u_kk
             # Clamp to prevent growth
-            if abs(l_ik) > const_max_ilu_factor
-                l_ik = sign(l_ik) * const_max_ilu_factor
+            l_ik_norm = _entry_norm(l_ik)
+            if l_ik_norm > const_max_ilu_factor
+                l_ik = l_ik * (const_max_ilu_factor / l_ik_norm)
             end
             L_nzval[nz] = l_ik
             U_nzval[nz] = zero(Tv)  # Clear lower triangle in U
@@ -855,12 +877,8 @@ function _ilu0_factorize!(L_nzval::Vector{Tv}, U_nzval::Vector{Tv},
         end
         # Diagonal safeguard: if U[i,i] became zero or near-zero, perturb it
         u_ii = U_nzval[diag_idx[i]]
-        row_norm = zero(real(Tv))
-        for nz in rp[i]:(rp[i+ti_one]-ti_one)
-            row_norm += abs(nzv[nz])
-        end
-        safe_thresh = _safe_threshold(Tv, row_norm)
-        if abs(u_ii) < safe_thresh
+        safe_thresh = _safe_threshold(Tv, row_norms[i])
+        if _entry_norm(u_ii) < safe_thresh
             U_nzval[diag_idx[i]] = safe_thresh
         end
     end
@@ -948,13 +966,13 @@ function smooth!(x::AbstractVector, A::CSRMatrix{Tv, Ti}, b::AbstractVector,
                 tmp[i] -= smoother.U_nzval[nz] * tmp[j]
             end
             u_ii = smoother.U_nzval[smoother.diag_idx[i]]
-            tmp[i] = abs(u_ii) > eps(real(Tv)) ? tmp[i] / u_ii : zero(Tv)
+            tmp[i] = _entry_norm(u_ii) > eps(real(Tv)) ? u_ii \ tmp[i] : zero(Tv)
         end
 
         # Update: x += dx (with NaN protection)
         @inbounds for i in 1:n
             v = tmp[i]
-            if isfinite(v)
+            if _is_finite_entry(v)
                 x_cpu[i] += v
             end
         end
@@ -969,4 +987,59 @@ end
 
 function build_smoother(A::CSRMatrix, ::ILU0SmootherType, ω::Real; backend=DEFAULT_BACKEND, block_size::Int=64)
     return build_ilu0_smoother(A)
+end
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Standalone smoother API
+# ══════════════════════════════════════════════════════════════════════════════
+
+"""
+    build_smoother(A::StaticSparsityMatrixCSR, smoother_type::SmootherType; ω=2/3, backend, block_size)
+
+Build a smoother from a `StaticSparsityMatrixCSR` matrix. This is the public API
+for using smoothers independently of the AMG hierarchy.
+
+# Arguments
+- `A`: The matrix to build the smoother for
+- `smoother_type`: Type tag selecting the smoother algorithm
+- `ω`: Damping factor (used by Jacobi and l1-Jacobi smoothers, default: 2/3)
+- `backend`: KernelAbstractions backend (default: CPU)
+- `block_size`: Kernel launch block size (default: 64)
+
+# Example
+```julia
+A = static_sparsity_sparse(I, J, V, n, n)
+smoother = build_smoother(A, JacobiSmootherType())
+x = zeros(n)
+smooth!(x, A, ones(n), smoother; steps=5)
+```
+"""
+function build_smoother(A::StaticSparsityMatrixCSR, smoother_type::SmootherType;
+                        ω::Real=2.0/3.0, backend=DEFAULT_BACKEND, block_size::Int=64)
+    A_csr = csr_from_static(A)
+    return build_smoother(A_csr, smoother_type, ω; backend=backend, block_size=block_size)
+end
+
+"""
+    update_smoother!(smoother::AbstractSmoother, A::StaticSparsityMatrixCSR; backend, block_size)
+
+Update the smoother for new matrix values (same sparsity pattern). This is
+the public API for updating smoothers with `StaticSparsityMatrixCSR` matrices.
+"""
+function update_smoother!(smoother::AbstractSmoother, A::StaticSparsityMatrixCSR;
+                          backend=DEFAULT_BACKEND, block_size::Int=64)
+    A_csr = csr_from_static(A)
+    return update_smoother!(smoother, A_csr; backend=backend, block_size=block_size)
+end
+
+"""
+    smooth!(x, A::StaticSparsityMatrixCSR, b, smoother; steps=1, backend, block_size)
+
+Apply smoother iterations to solve `Ax = b` using a `StaticSparsityMatrixCSR` matrix.
+This is the public API for applying smoothers with `StaticSparsityMatrixCSR` matrices.
+"""
+function smooth!(x::AbstractVector, A::StaticSparsityMatrixCSR, b::AbstractVector,
+                 smoother::AbstractSmoother; steps::Int=1, backend=DEFAULT_BACKEND, block_size::Int=64)
+    A_csr = csr_from_static(A)
+    return smooth!(x, A_csr, b, smoother; steps=steps, backend=backend, block_size=block_size)
 end

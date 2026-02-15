@@ -433,11 +433,8 @@ function _rs_first_pass!(A::CSRMatrix{Tv, Ti}, is_strong::AbstractVector{Bool};
         end
     end
 
-    # Build bucket structure for greedy RS first pass
-    max_λ_val = maximum(λ; init=0)
-    bucket_head = fill(0, max(max_λ_val + 1, 1))
-    bucket_next = zeros(Int, n)
-    bucket_prev = zeros(Int, n)
+    # Process zero-measure nodes first: mark them with f_pnt and
+    # increment λ for their strong neighbors.
     @inbounds for i in 1:n
         cf[i] != 0 && continue
         if λ[i] == 0
@@ -450,32 +447,19 @@ function _rs_first_pass!(A::CSRMatrix{Tv, Ti}, is_strong::AbstractVector{Bool};
                     λ[j] += 1
                 end
             end
-        else
-            k = λ[i] + 1
-            old_head = bucket_head[k]
-            bucket_head[k] = i
-            bucket_next[i] = old_head
-            bucket_prev[i] = 0
-            if old_head != 0
-                bucket_prev[old_head] = i
-            end
         end
     end
 
-    # Rebuild buckets: the λ increments above may have changed values for nodes
-    # that were already inserted into buckets at their old λ positions.
-    fill!(bucket_head, 0)
-    fill!(bucket_next, 0)
-    fill!(bucket_prev, 0)
+    # Build bucket structure for greedy RS first pass.
+    # Done after zero-measure processing so λ values are final.
     max_λ_val = 0
     @inbounds for i in 1:n
         cf[i] != 0 && continue
         max_λ_val = max(max_λ_val, λ[i])
     end
-    if max_λ_val + 1 > length(bucket_head)
-        resize!(bucket_head, max_λ_val + 1)
-        fill!(bucket_head, 0)
-    end
+    bucket_head = fill(0, max(max_λ_val + 1, 1))
+    bucket_next = zeros(Int, n)
+    bucket_prev = zeros(Int, n)
     @inbounds for i in 1:n
         cf[i] != 0 && continue
         k = λ[i] + 1

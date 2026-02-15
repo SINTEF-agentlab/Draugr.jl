@@ -38,11 +38,13 @@ memory use on large models.
 function _smooth_prolongation(A::CSRMatrix{Tv, Ti},
                               P_tent::ProlongationOp{Ti, Tv},
                               ω::Real) where {Tv, Ti}
+    # Convert to CPU for scalar indexing operations
+    A_cpu = csr_to_cpu(A)
     n_fine = P_tent.nrow
     n_coarse = P_tent.ncol
-    cv_a = colvals(A)
-    nzv_a = nonzeros(A)
-    rp_a = rowptr(A)
+    cv_a = colvals(A_cpu)
+    nzv_a = nonzeros(A_cpu)
+    rp_a = rowptr(A_cpu)
 
     # Compute inverse diagonal of A
     invdiag = Vector{Tv}(undef, n_fine)
@@ -193,8 +195,9 @@ Build a prolongation operator from a CF-splitting using the specified interpolat
 """
 function build_cf_prolongation(A::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                                coarse_map::Vector{Int}, n_coarse::Int,
-                               interp::InterpolationType, θ::Real=0.25) where {Tv, Ti}
-    return _build_interpolation(A, cf, coarse_map, n_coarse, interp, θ)
+                               interp::InterpolationType, θ::Real=0.25;
+                               backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
+    return _build_interpolation(A, cf, coarse_map, n_coarse, interp, θ; backend=backend, block_size=block_size)
 end
 
 # ── Direct interpolation ─────────────────────────────────────────────────────
@@ -213,13 +216,17 @@ P[i, coarse_map[i]] = 1 for coarse points.
 P[i, coarse_map[j]] = -a_{i,j} / d_i for fine points, where j ∈ C_i^s and
 d_i = a_{i,i} + Σ_{k ∈ weak ∪ F_i^s ∪ same_sign} a_{i,k}.
 """
-function _build_interpolation(A::CSRMatrix{Tv, Ti}, cf::Vector{Int},
+function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                               coarse_map::Vector{Int}, n_coarse::Int,
-                              ::DirectInterpolation, θ::Real=0.25) where {Tv, Ti}
+                              ::DirectInterpolation, θ::Real=0.25;
+                              backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
+    # Compute strength on GPU if available, then convert to CPU for graph algorithms
+    is_strong_raw = strength_graph(A_in, θ; backend=backend, block_size=block_size)
+    is_strong = is_strong_raw isa Array ? is_strong_raw : Array(is_strong_raw)
+    A = csr_to_cpu(A_in)
     n_fine = size(A, 1)
     cv = colvals(A)
     nzv = nonzeros(A)
-    is_strong = strength_graph(A, θ)
 
     # First pass: count entries per row
     row_counts = zeros(Int, n_fine)
@@ -339,13 +346,17 @@ Standard (classical Ruge-Stüben) interpolation. For each fine point i:
 w_j = -(a_{i,j} + Σ_{k∈F_i^s} a_{i,k} * a_{k,j} / Σ_{m∈C_i} a_{k,m}) / d_i
 where d_i = a_{i,i} + Σ_{k∈weak} a_{i,k}
 """
-function _build_interpolation(A::CSRMatrix{Tv, Ti}, cf::Vector{Int},
+function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                               coarse_map::Vector{Int}, n_coarse::Int,
-                              ::StandardInterpolation, θ::Real=0.25) where {Tv, Ti}
+                              ::StandardInterpolation, θ::Real=0.25;
+                              backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
+    # Compute strength on GPU if available, then convert to CPU for graph algorithms
+    is_strong_raw = strength_graph(A_in, θ; backend=backend, block_size=block_size)
+    is_strong = is_strong_raw isa Array ? is_strong_raw : Array(is_strong_raw)
+    A = csr_to_cpu(A_in)
     n_fine = size(A, 1)
     cv = colvals(A)
     nzv = nonzeros(A)
-    is_strong = strength_graph(A, θ)
 
     # Build P using COO format, then convert to CSR
     I_p = Ti[]
@@ -434,13 +445,17 @@ Extended+i interpolation. Extends standard interpolation by including distance-2
 coarse points (coarse points connected through fine neighbors) as direct
 interpolation targets, resulting in a larger but more accurate interpolation stencil.
 """
-function _build_interpolation(A::CSRMatrix{Tv, Ti}, cf::Vector{Int},
+function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                               coarse_map::Vector{Int}, n_coarse::Int,
-                              ::ExtendedIInterpolation, θ::Real=0.25) where {Tv, Ti}
+                              ::ExtendedIInterpolation, θ::Real=0.25;
+                              backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
+    # Compute strength on GPU if available, then convert to CPU for graph algorithms
+    is_strong_raw = strength_graph(A_in, θ; backend=backend, block_size=block_size)
+    is_strong = is_strong_raw isa Array ? is_strong_raw : Array(is_strong_raw)
+    A = csr_to_cpu(A_in)
     n_fine = size(A, 1)
     cv = colvals(A)
     nzv = nonzeros(A)
-    is_strong = strength_graph(A, θ)
 
     I_p = Ti[]
     J_p = Ti[]
@@ -589,10 +604,10 @@ Apply prolongation: x_fine += P * x_coarse.
 Uses KernelAbstractions for parallel execution over fine rows.
 """
 function prolongate!(x_fine::AbstractVector, P::ProlongationOp, x_coarse::AbstractVector;
-                     backend=DEFAULT_BACKEND)
-    kernel! = prolongate_kernel!(backend, 64)
+                     backend=DEFAULT_BACKEND, block_size::Int=64)
+    kernel! = prolongate_kernel!(backend, block_size)
     kernel!(x_fine, P.rowptr, P.colval, P.nzval, x_coarse; ndrange=P.nrow)
-    KernelAbstractions.synchronize(backend)
+    _synchronize(backend)
     return x_fine
 end
 
@@ -642,7 +657,7 @@ function build_transpose_map(P::ProlongationOp{Ti, Tv}) where {Ti, Tv}
             pos[J] += Ti(1)
         end
     end
-    return TransposeMap{Ti}(offsets, fine_rows, p_nz_idx)
+    return TransposeMap(offsets, fine_rows, p_nz_idx)
 end
 
 """
@@ -653,12 +668,12 @@ Uses the pre-computed TransposeMap to parallelize over coarse rows without atomi
 """
 function restrict!(b_coarse::AbstractVector, Pt_map::TransposeMap,
                    P::ProlongationOp, r_fine::AbstractVector;
-                   backend=DEFAULT_BACKEND)
+                   backend=DEFAULT_BACKEND, block_size::Int=64)
     n_coarse = P.ncol
-    kernel! = restrict_kernel!(backend, 64)
+    kernel! = restrict_kernel!(backend, block_size)
     kernel!(b_coarse, Pt_map.offsets, Pt_map.fine_rows,
             Pt_map.p_nz_idx, P.nzval, r_fine; ndrange=n_coarse)
-    KernelAbstractions.synchronize(backend)
+    _synchronize(backend)
     return b_coarse
 end
 

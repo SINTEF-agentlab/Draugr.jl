@@ -25,11 +25,11 @@ Base.size(A::CSRMatrix) = (A.nrow, A.ncol)
 Base.size(A::CSRMatrix, d::Int) = d == 1 ? A.nrow : (d == 2 ? A.ncol : 1)
 SparseArrays.nnz(A::CSRMatrix) = length(A.nzval)
 SparseArrays.nonzeros(A::CSRMatrix) = A.nzval
-SparseArrays.nzrange(A::CSRMatrix, row::Integer) = A.rowptr[row]:(A.rowptr[row+1]-1)
+SparseArrays.nzrange(A::CSRMatrix, row::Integer) = A.rowptr[row]:(A.rowptr[row+1]-one(eltype(A.rowptr)))
 
 function Base.getindex(A::CSRMatrix{Tv}, i::Integer, j::Integer) where Tv
     @boundscheck (1 <= i <= A.nrow && 1 <= j <= A.ncol) || throw(BoundsError(A, (i, j)))
-    for nz in A.rowptr[i]:(A.rowptr[i+1]-1)
+    for nz in nzrange(A, i)
         @inbounds A.colval[nz] == j && return A.nzval[nz]
     end
     return zero(Tv)
@@ -40,6 +40,49 @@ colvals(A::CSRMatrix) = A.colval
 
 """Return the row-pointer vector for CSRMatrix."""
 rowptr(A::CSRMatrix) = A.rowptr
+
+"""
+    csr_to_cpu(A::CSRMatrix) -> CSRMatrix
+
+Convert a CSRMatrix with GPU arrays to a CSRMatrix with CPU arrays.
+If the arrays are already CPU arrays, this is a no-op (returns same object).
+"""
+function csr_to_cpu(A::CSRMatrix{Tv, Ti, <:Array, <:Array, <:Array}) where {Tv, Ti}
+    return A  # already CPU
+end
+
+function csr_to_cpu(A::CSRMatrix{Tv, Ti}) where {Tv, Ti}
+    return CSRMatrix(Array(A.rowptr), Array(A.colval), Array(A.nzval), A.nrow, A.ncol)
+end
+
+"""
+    _to_device(ref::CSRMatrix, v::AbstractVector)
+
+Copy a vector `v` to the same device as `ref`'s arrays.
+If `ref` is already on CPU, returns the vector as-is.
+"""
+function _to_device(ref::CSRMatrix{Tv, Ti, <:Array, <:Array, <:Array}, v::AbstractVector) where {Tv, Ti}
+    return v  # already CPU
+end
+
+function _to_device(ref::CSRMatrix, v::AbstractVector)
+    be = _get_backend(ref.nzval)
+    dev = KernelAbstractions.allocate(be, eltype(v), length(v))
+    copyto!(dev, v)
+    return dev
+end
+
+"""
+    _csr_to_device(ref, A_cpu) -> CSRMatrix
+
+Copy a CPU CSRMatrix to the same device as `ref`'s arrays.
+"""
+function _csr_to_device(ref::CSRMatrix, A_cpu::CSRMatrix)
+    rp = _to_device(ref, A_cpu.rowptr)
+    cv = _to_device(ref, A_cpu.colval)
+    nzv = _to_device(ref, A_cpu.nzval)
+    return CSRMatrix(rp, cv, nzv, A_cpu.nrow, A_cpu.ncol)
+end
 
 """
     csr_from_static(A::StaticSparsityMatrixCSR) -> CSRMatrix
@@ -62,13 +105,13 @@ Copy nonzero values from a `StaticSparsityMatrixCSR` into an existing
 `CSRMatrix` with the same sparsity pattern.
 """
 function csr_copy_nzvals!(dest::CSRMatrix{Tv}, src::StaticSparsityMatrixCSR{Tv};
-                          backend=DEFAULT_BACKEND) where Tv
+                          backend=DEFAULT_BACKEND, block_size::Int=64) where Tv
     nzv_d = nonzeros(dest)
     nzv_s = nonzeros(src)
     n = length(nzv_d)
-    kernel! = copy_kernel!(backend, 64)
+    kernel! = copy_kernel!(backend, block_size)
     kernel!(nzv_d, nzv_s; ndrange=n)
-    KernelAbstractions.synchronize(backend)
+    _synchronize(backend)
     return dest
 end
 
@@ -91,4 +134,62 @@ function LinearAlgebra.mul!(y::AbstractVector, A::CSRMatrix, x::AbstractVector)
         y[i] = s
     end
     return y
+end
+
+"""
+    _get_backend(arr)
+
+Infer the KernelAbstractions backend from an array using `KernelAbstractions.get_backend`.
+Returns the appropriate backend for GPU arrays (e.g., CUDABackend, MetalBackend, JLBackend)
+or CPU backend for regular Arrays.
+"""
+function _get_backend(arr::AbstractVector)
+    return KernelAbstractions.get_backend(arr)
+end
+
+"""
+    _synchronize(backend)
+
+Synchronize the backend. This wraps `KernelAbstractions.synchronize` with a fallback
+for backends that don't implement it (e.g., JLBackend), since some mock GPU backends
+execute kernels synchronously.
+"""
+function _synchronize(backend)
+    if hasmethod(KernelAbstractions.synchronize, Tuple{typeof(backend)})
+        KernelAbstractions.synchronize(backend)
+    end
+    return nothing
+end
+
+"""
+    _allocate_vector(A::CSRMatrix, ::Type{Tv}, n) -> AbstractVector{Tv}
+
+Allocate a zero-filled vector of length `n` on the same device as the CSR matrix `A`.
+Uses `KernelAbstractions.zeros` with the backend inferred from the matrix arrays.
+"""
+function _allocate_vector(A::CSRMatrix, ::Type{Tv}, n::Int) where Tv
+    be = _get_backend(A.nzval)
+    return KernelAbstractions.zeros(be, Tv, n)
+end
+
+"""
+    _allocate_undef_vector(A::CSRMatrix, ::Type{Tv}, n) -> AbstractVector{Tv}
+
+Allocate an uninitialized vector of length `n` on the same device as the CSR matrix `A`.
+Uses `KernelAbstractions.allocate` with the backend inferred from the matrix arrays.
+"""
+function _allocate_undef_vector(A::CSRMatrix, ::Type{Tv}, n::Int) where Tv
+    be = _get_backend(A.nzval)
+    return KernelAbstractions.allocate(be, Tv, n)
+end
+
+"""
+    _allocate_dense_matrix(A::CSRMatrix, ::Type{Tv}, m, n) -> AbstractMatrix{Tv}
+
+Allocate a zero-filled m×n dense matrix on the same device as the CSR matrix `A`.
+Uses `KernelAbstractions.zeros` with the backend inferred from the matrix arrays.
+"""
+function _allocate_dense_matrix(A::CSRMatrix, ::Type{Tv}, m::Int, n::Int) where Tv
+    be = _get_backend(A.nzval)
+    return KernelAbstractions.zeros(be, Tv, m, n)
 end

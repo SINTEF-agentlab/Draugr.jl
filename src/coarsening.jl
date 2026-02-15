@@ -319,10 +319,15 @@ end
 """
     coarsen_hmis(A, θ; rng=Random.default_rng())
 
-Hybrid Modified Independent Set (HMIS) coarsening. Like PMIS but uses the
-symmetrized strength graph (intersection of S and S^T) for the independent set
-selection. Uses column-based measure. Includes second pass for strong-connection
-property.
+Hybrid Modified Independent Set (HMIS) coarsening matching hypre's implementation.
+HMIS = Ruge-Stüben first pass (greedy, bucket-based) followed by PMIS on remaining
+undecided points. The RS first pass does aggressive greedy coarsening using the
+transpose strength measure, then PMIS finalizes the splitting for remaining
+undecided points.
+
+This matches hypre's `hypre_BoomerAMGCoarsenHMIS` which calls
+`hypre_BoomerAMGCoarsenRuge(S, A, measure_type, 10, ...)` (first pass only,
+with f_pnt=Z_PT) followed by `hypre_BoomerAMGCoarsenPMIS(S, A, 1, ...)`.
 """
 function coarsen_hmis(A_in::CSRMatrix{Tv, Ti}, θ::Real;
                       rng=Random.default_rng(),
@@ -336,87 +341,52 @@ function coarsen_hmis(A_in::CSRMatrix{Tv, Ti}, θ::Real;
     is_strong = is_strong_raw isa Array ? is_strong_raw : Array(is_strong_raw)
     A = csr_to_cpu(A_in)
     cv = colvals(A)
-    is_strong_sym = _symmetrize_strength(A, is_strong)
-    # Column-based measure on the symmetric graph
-    st_count = zeros(Int, n)
+
+    # ── Phase 1: RS first pass (greedy bucket-based coarsening) ──
+    # This matches hypre's CoarsenRuge with coarsen_type=10 (first pass only).
+    # In hypre, coarsen_type=10 sets f_pnt=Z_PT=-2 and uses coarsen_type=11
+    # (returns after first pass, no second pass).
+    # Zero-measure nodes during initialization get Z_PT=-2 (tentative fine).
+    # Nodes marked fine in the main RS loop get F_PT=-1 (permanent fine).
+    # C-points are permanent.
+    cf = _rs_first_pass!(A, is_strong; use_zpt=true)
+
+    # ── Phase 2: PMIS on remaining undecided points ──
+    # This matches hypre's CF_init=1 path in CoarsenPMIS.
+    # C-points (1) from RS stay as C. F-points (-1) from RS stay as F.
+    # Z_PT (-2) points get re-evaluated: those with measure >= 1 or strong
+    # connections become undecided (0) for PMIS; others become F.
+    st_count_pmis = _compute_strong_transpose_count(A, is_strong)
+    pmis_measure = zeros(Float64, n)
     @inbounds for i in 1:n
-        for nz in nzrange(A, i)
-            j = cv[nz]
-            if j != i && is_strong_sym[nz]
-                st_count[j] += 1
-            end
-        end
+        pmis_measure[i] = Float64(st_count_pmis[i]) + rand(rng)
     end
-    measure = zeros(Float64, n)
+
+    # Re-evaluate Z_PT nodes (matching hypre's CF_init=1 logic)
     @inbounds for i in 1:n
-        measure[i] = Float64(st_count[i]) + rand(rng)
-    end
-    # Mark isolated nodes
-    cf = zeros(Int, n)
-    @inbounds for i in 1:n
-        has_strong = false
-        for nz in nzrange(A, i)
-            j = cv[nz]
-            if j != i && is_strong_sym[nz]
-                has_strong = true
-                break
-            end
-        end
-        if !has_strong
-            # Check if also isolated in unsymmetrized graph
-            has_any_strong = false
+        if cf[i] == -2  # Z_PT from RS first pass
+            has_strong_diag = false
             for nz in nzrange(A, i)
                 j = cv[nz]
                 if j != i && is_strong[nz]
-                    has_any_strong = true
+                    has_strong_diag = true
                     break
                 end
             end
-            if !has_any_strong && st_count[i] == 0
-                cf[i] = 1  # isolated → coarse
+            if pmis_measure[i] >= 1.0 || has_strong_diag
+                cf[i] = 0  # undecided, will be handled by PMIS
+            else
+                cf[i] = -1  # no influence, make final F
             end
         end
     end
-    # CF splitting using symmetrized strength for IS selection
-    max_iter = n + 1
-    for iter in 1:max_iter
-        all_decided = true
-        @inbounds for i in 1:n
-            cf[i] != 0 && continue
-            all_decided = false
-            is_max = true
-            for nz in nzrange(A, i)
-                j = cv[nz]
-                if is_strong_sym[nz] && j != i && cf[j] != -1
-                    if measure[j] > measure[i]
-                        is_max = false
-                        break
-                    end
-                end
-            end
-            if is_max
-                cf[i] = 1
-            end
-        end
-        @inbounds for i in 1:n
-            cf[i] != 0 && continue
-            for nz in nzrange(A, i)
-                j = cv[nz]
-                if is_strong_sym[nz] && cf[j] == 1
-                    cf[i] = -1
-                    break
-                end
-            end
-        end
-        all_decided && break
-    end
-    @inbounds for i in 1:n
-        if cf[i] == 0
-            cf[i] = 1
-        end
-    end
-    # Second pass using the full (non-symmetric) strength graph
+
+    # PMIS iterations on remaining undecided nodes
+    _pmis_on_undecided!(cf, A, is_strong, pmis_measure)
+
+    # Ensure every F-point has at least one strong C-neighbor
     _ensure_fine_have_coarse_neighbor!(cf, A, is_strong)
+
     n_coarse = 0
     coarse_map = zeros(Int, n)
     @inbounds for i in 1:n
@@ -426,6 +396,236 @@ function coarsen_hmis(A_in::CSRMatrix{Tv, Ti}, θ::Real;
         end
     end
     return cf, coarse_map, n_coarse
+end
+
+"""
+    _rs_first_pass!(A, is_strong; use_zpt=false)
+
+Run the Ruge-Stüben first pass (greedy bucket-based coarsening).
+When `use_zpt=true`, nodes that become fine during initialization (zero-measure
+nodes) are marked as Z_PT=-2 instead of F_PT=-1. This is used by HMIS
+(matching hypre's coarsen_type=10 which sets f_pnt=Z_PT).
+Nodes marked fine in the main RS greedy loop are always marked as F_PT=-1.
+Returns the cf array with states: 0=undecided (shouldn't remain), 1=C, -1=F, -2=Z_PT.
+"""
+function _rs_first_pass!(A::CSRMatrix{Tv, Ti}, is_strong::AbstractVector{Bool};
+                          use_zpt::Bool=false) where {Tv, Ti}
+    n = size(A, 1)
+    cv = colvals(A)
+    f_pnt = use_zpt ? -2 : -1  # Z_PT or F_PT for zero-measure initialization
+
+    λ = _compute_strong_transpose_count(A, is_strong)
+    st_offsets, st_sources = _build_strong_transpose_adj(A, is_strong)
+
+    cf = zeros(Int, n)
+    # Mark isolated nodes (no strong connections at all)
+    @inbounds for i in 1:n
+        has_strong = false
+        for nz in nzrange(A, i)
+            j = cv[nz]
+            if j != i && is_strong[nz]
+                has_strong = true
+                break
+            end
+        end
+        if !has_strong && λ[i] == 0
+            cf[i] = 1  # isolated → coarse
+        end
+    end
+
+    # Process zero-measure nodes first: mark them with f_pnt and
+    # increment λ for their strong neighbors.
+    @inbounds for i in 1:n
+        cf[i] != 0 && continue
+        if λ[i] == 0
+            # Zero measure → mark with f_pnt (Z_PT for HMIS, F_PT for RS)
+            cf[i] = f_pnt
+            # When a node becomes F, increment λ for its strong neighbors
+            for nz in nzrange(A, i)
+                j = cv[nz]
+                if j != i && is_strong[nz] && cf[j] == 0
+                    λ[j] += 1
+                end
+            end
+        end
+    end
+
+    # Build bucket structure for greedy RS first pass.
+    # Done after zero-measure processing so λ values are final.
+    max_λ_val = 0
+    @inbounds for i in 1:n
+        cf[i] != 0 && continue
+        max_λ_val = max(max_λ_val, λ[i])
+    end
+    bucket_head = fill(0, max(max_λ_val + 1, 1))
+    bucket_next = zeros(Int, n)
+    bucket_prev = zeros(Int, n)
+    @inbounds for i in 1:n
+        cf[i] != 0 && continue
+        k = λ[i] + 1
+        old_head = bucket_head[k]
+        bucket_head[k] = i
+        bucket_next[i] = old_head
+        bucket_prev[i] = 0
+        if old_head != 0
+            bucket_prev[old_head] = i
+        end
+    end
+    top_bucket = max_λ_val
+
+    @inline function _bkt_remove!(i)
+        @inbounds begin
+            k = λ[i] + 1
+            p = bucket_prev[i]
+            nx = bucket_next[i]
+            if p != 0
+                bucket_next[p] = nx
+            else
+                bucket_head[k] = nx
+            end
+            if nx != 0
+                bucket_prev[nx] = p
+            end
+            bucket_next[i] = 0
+            bucket_prev[i] = 0
+        end
+    end
+    @inline function _bkt_update!(i, new_λ)
+        @inbounds begin
+            _bkt_remove!(i)
+            λ[i] = new_λ
+            k = new_λ + 1
+            old_len = length(bucket_head)
+            if k > old_len
+                resize!(bucket_head, k)
+                for idx in (old_len + 1):k
+                    bucket_head[idx] = 0
+                end
+            end
+            old_head = bucket_head[k]
+            bucket_head[k] = i
+            bucket_next[i] = old_head
+            bucket_prev[i] = 0
+            if old_head != 0
+                bucket_prev[old_head] = i
+            end
+        end
+    end
+
+    # Main RS first pass greedy loop
+    while true
+        while top_bucket >= 0 && bucket_head[top_bucket + 1] == 0
+            top_bucket -= 1
+        end
+        top_bucket < 0 && break
+        best_i = bucket_head[top_bucket + 1]
+        best_i == 0 && break
+        _bkt_remove!(best_i)
+        cf[best_i] = 1  # C-point
+
+        # For each undecided node j that strongly depends on best_i (S^T neighbors):
+        # mark as F-point (F_PT=-1, not Z_PT, matching hypre's main loop behavior)
+        @inbounds for idx in st_offsets[best_i]:(st_offsets[best_i + 1] - 1)
+            j = st_sources[idx]
+            cf[j] != 0 && continue
+            _bkt_remove!(j)
+            cf[j] = -1  # F-point (permanent)
+            # Increment λ for undecided nodes that j strongly depends on
+            for nz2 in nzrange(A, j)
+                k = cv[nz2]
+                if k != j && is_strong[nz2] && cf[k] == 0
+                    new_val = λ[k] + 1
+                    _bkt_update!(k, new_val)
+                    if new_val > top_bucket
+                        top_bucket = new_val
+                    end
+                end
+            end
+        end
+        # Decrement λ for undecided nodes that best_i strongly depends on
+        @inbounds for nz in nzrange(A, best_i)
+            j = cv[nz]
+            if j != best_i && is_strong[nz] && cf[j] == 0
+                new_val = max(0, λ[j] - 1)
+                _bkt_update!(j, new_val)
+                if new_val == 0
+                    # Node has no more undecided dependents → mark with f_pnt
+                    _bkt_remove!(j)
+                    cf[j] = f_pnt  # Z_PT for HMIS, F_PT for RS
+                    # Increment λ for its undecided strong neighbors
+                    for nz2 in nzrange(A, j)
+                        k = cv[nz2]
+                        if k != j && is_strong[nz2] && cf[k] == 0
+                            new_val2 = λ[k] + 1
+                            _bkt_update!(k, new_val2)
+                            if new_val2 > top_bucket
+                                top_bucket = new_val2
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    return cf
+end
+
+"""
+    _pmis_on_undecided!(cf, A, is_strong, measure)
+
+Run PMIS iterations on undecided nodes (cf[i] == 0). Nodes with cf[i] == 1 (C)
+or cf[i] == -1 (F) are not modified. This is used as the second phase of HMIS.
+"""
+function _pmis_on_undecided!(cf::Vector{Int}, A::CSRMatrix{Tv, Ti},
+                              is_strong::AbstractVector{Bool},
+                              measure::Vector{Float64}) where {Tv, Ti}
+    n = size(A, 1)
+    cv = colvals(A)
+    max_iter = n + 1
+    for iter in 1:max_iter
+        all_decided = true
+        # Identify local maxima as candidate C-points
+        @inbounds for i in 1:n
+            cf[i] != 0 && continue
+            all_decided = false
+            if measure[i] < 1.0
+                cf[i] = -1  # no influence → F
+                continue
+            end
+            is_max = true
+            for nz in nzrange(A, i)
+                j = cv[nz]
+                if j != i && is_strong[nz] && cf[j] != -1
+                    if measure[j] > measure[i]
+                        is_max = false
+                        break
+                    end
+                end
+            end
+            if is_max
+                cf[i] = 1  # C-point
+            end
+        end
+        # Mark undecided nodes adjacent to C-points as F
+        @inbounds for i in 1:n
+            cf[i] != 0 && continue
+            for nz in nzrange(A, i)
+                j = cv[nz]
+                if is_strong[nz] && cf[j] == 1
+                    cf[i] = -1
+                    break
+                end
+            end
+        end
+        all_decided && break
+    end
+    # Any remaining undecided → F
+    @inbounds for i in 1:n
+        if cf[i] == 0
+            cf[i] = -1
+        end
+    end
 end
 
 """

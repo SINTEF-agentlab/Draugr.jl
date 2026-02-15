@@ -699,6 +699,28 @@ end
         @test sum(cf .== 1) == nc
     end
 
+    @testset "HMIS Coarsening ratio - 2D" begin
+        # Verify HMIS produces good coarsening ratios (matching hypre behavior).
+        # HMIS uses RS first pass + PMIS, yielding aggressive coarsening.
+        A = poisson2d_csr(20)
+        Ac = to_csr(A)
+        n = size(Ac, 1)
+        cf, cmap, nc = ParallelAMG.coarsen_hmis(Ac, 0.5)
+        ratio = nc / n
+        @test ratio < 0.6  # hypre typically achieves ~0.45 for 2D Poisson with θ=0.5
+        @test all(abs.(cf) .== 1)  # all points decided as C (1) or F (-1)
+    end
+
+    @testset "HMIS Hierarchy depth - 2D" begin
+        # Verify HMIS produces a shallow hierarchy matching hypre's behavior
+        # (should produce ~5-8 levels for 100x100 2D Poisson, not 20)
+        A = poisson2d_csr(50)
+        config = AMGConfig(coarsening=HMISCoarsening(0.5, ExtendedIInterpolation()))
+        hierarchy = amg_setup(A, config)
+        nlevels = length(hierarchy.levels) + 1
+        @test nlevels <= 10
+    end
+
     @testset "AMG Setup - HMIS" begin
         A = poisson2d_csr(10)
         config = AMGConfig(coarsening=HMISCoarsening())

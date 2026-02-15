@@ -2109,6 +2109,13 @@ end
         @test ParallelAMG._is_finite_entry(1.0) == true
         @test ParallelAMG._is_finite_entry(Inf) == false
         @test ParallelAMG._is_finite_entry(NaN) == false
+        # Test block-aware helpers with small matrices (simulating SMatrix behavior)
+        M = [1.0 2.0; 3.0 4.0]
+        @test ParallelAMG._frobenius_norm2(M) ≈ 1.0 + 4.0 + 9.0 + 16.0  # sum of squares
+        @test ParallelAMG._entry_norm(M) ≈ sqrt(30.0)
+        @test ParallelAMG._is_finite_entry(M) == true
+        M_inf = [1.0 Inf; 0.0 1.0]
+        @test ParallelAMG._is_finite_entry(M_inf) == false
     end
 
     # ══════════════════════════════════════════════════════════════════════════

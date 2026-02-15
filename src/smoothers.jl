@@ -858,8 +858,9 @@ function _ilu0_factorize!(L_nzval::Vector{Tv}, U_nzval::Vector{Tv},
             end
             l_ik = U_nzval[nz] / u_kk
             # Clamp to prevent growth
-            if _entry_norm(l_ik) > const_max_ilu_factor
-                l_ik = l_ik * (const_max_ilu_factor / _entry_norm(l_ik))
+            l_ik_norm = _entry_norm(l_ik)
+            if l_ik_norm > const_max_ilu_factor
+                l_ik = l_ik * (const_max_ilu_factor / l_ik_norm)
             end
             L_nzval[nz] = l_ik
             U_nzval[nz] = zero(Tv)  # Clear lower triangle in U

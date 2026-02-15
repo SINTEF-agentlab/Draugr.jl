@@ -109,8 +109,8 @@ function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
     tmp = smoother.tmp
     src = x
     dst = tmp
+    kernel! = jacobi_kernel!(backend, block_size)
     for _ in 1:steps
-        kernel! = jacobi_kernel!(backend, block_size)
         kernel!(dst, src, b, nzv, cv, rp, smoother.invdiag, smoother.ω; ndrange=n)
         _synchronize(backend)
         src, dst = dst, src
@@ -226,18 +226,114 @@ function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
     nzv = nonzeros(A)
     cv = colvals(A)
     rp = rowptr(A)
+    kernel! = gs_color_kernel!(backend, block_size)
     for _ in 1:steps
         for c in 1:smoother.num_colors
             start = smoother.color_offsets[c]
             count = smoother.color_offsets[c+1] - start
             count == 0 && continue
-            kernel! = gs_color_kernel!(backend, block_size)
             kernel!(x, b, nzv, cv, rp, smoother.invdiag,
                     smoother.color_order, start - 1; ndrange=count)
             _synchronize(backend)
         end
     end
     return x
+end
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Serial (non-threaded) Gauss-Seidel Smoother
+# ══════════════════════════════════════════════════════════════════════════════
+
+"""
+    build_serial_gs_smoother(A)
+
+Build a serial Gauss-Seidel smoother. All data is stored on CPU.
+No graph coloring, threading, or KernelAbstractions are used.
+"""
+function build_serial_gs_smoother(A::CSRMatrix{Tv, Ti}) where {Tv, Ti}
+    A_cpu = csr_to_cpu(A)
+    n = size(A_cpu, 1)
+    nzv = nonzeros(A_cpu)
+    cv = colvals(A_cpu)
+    rp = rowptr(A_cpu)
+    invdiag = Vector{Tv}(undef, n)
+    @inbounds for i in 1:n
+        d = zero(Tv)
+        for nz in rp[i]:(rp[i+1]-one(Ti))
+            if cv[nz] == i
+                d = nzv[nz]
+                break
+            end
+        end
+        abs_d = _entry_norm(d)
+        invdiag[i] = abs_d > eps(real(Tv)) ? inv(d) : zero(Tv)
+    end
+    return SerialGaussSeidelSmoother{Tv, Ti}(invdiag, A_cpu)
+end
+
+function update_smoother!(smoother::SerialGaussSeidelSmoother{Tv, Ti}, A::CSRMatrix;
+                          backend=_get_backend(nonzeros(A)), block_size::Int=64) where {Tv, Ti}
+    A_cpu = csr_to_cpu(A)
+    copyto!(smoother.A_cpu.nzval, A_cpu.nzval)
+    n = size(A_cpu, 1)
+    nzv = nonzeros(smoother.A_cpu)
+    cv = colvals(smoother.A_cpu)
+    rp = rowptr(smoother.A_cpu)
+    @inbounds for i in 1:n
+        d = zero(Tv)
+        for nz in rp[i]:(rp[i+1]-one(Ti))
+            if cv[nz] == i
+                d = nzv[nz]
+                break
+            end
+        end
+        abs_d = _entry_norm(d)
+        smoother.invdiag[i] = abs_d > eps(real(Tv)) ? inv(d) : zero(Tv)
+    end
+    return smoother
+end
+
+"""
+    smooth!(x, A, b, smoother::SerialGaussSeidelSmoother; steps=1)
+
+Apply serial Gauss-Seidel smoothing. Performs a sequential forward sweep
+over all rows without threading or KernelAbstractions. For GPU arrays,
+copies data to CPU, applies GS, and copies back.
+"""
+function smooth!(x::AbstractVector, A::CSRMatrix{Tv, Ti}, b::AbstractVector,
+                 smoother::SerialGaussSeidelSmoother; steps::Int=1, backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
+    n = size(A, 1)
+    is_gpu = !(x isa Array)
+    if is_gpu
+        x_cpu = Array(x)
+        b_cpu = Array(b)
+    else
+        x_cpu = x
+        b_cpu = b
+    end
+    nzv = nonzeros(smoother.A_cpu)
+    cv = colvals(smoother.A_cpu)
+    rp = rowptr(smoother.A_cpu)
+    invdiag = smoother.invdiag
+    ti_one = one(Ti)
+    for _ in 1:steps
+        @inbounds for i in 1:n
+            r_i = b_cpu[i]
+            for nz in rp[i]:(rp[i+ti_one]-ti_one)
+                j = cv[nz]
+                r_i -= nzv[nz] * x_cpu[j]
+            end
+            x_cpu[i] += invdiag[i] * r_i
+        end
+    end
+    if is_gpu
+        copyto!(x, x_cpu)
+    end
+    return x
+end
+
+function build_smoother(A::CSRMatrix, ::SerialGaussSeidelType, ω::Real; backend=DEFAULT_BACKEND, block_size::Int=64)
+    return build_serial_gs_smoother(A)
 end
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -321,8 +417,8 @@ function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
     tmp = smoother.tmp
     src = x
     dst = tmp
+    kernel! = spai0_smooth_kernel!(backend, block_size)
     for _ in 1:steps
-        kernel! = spai0_smooth_kernel!(backend, block_size)
         kernel!(dst, src, b, nzv, cv, rp, smoother.m_diag; ndrange=n)
         _synchronize(backend)
         src, dst = dst, src
@@ -496,13 +592,13 @@ function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
     cv = colvals(A)
     rp = rowptr(A)
     tmp = smoother.tmp
+    kernel1! = spai1_smooth_kernel!(backend, block_size)
+    kernel2! = spai1_apply_kernel!(backend, block_size)
     for _ in 1:steps
         # Pass 1: compute residual r = b - A*x into tmp
-        kernel1! = spai1_smooth_kernel!(backend, block_size)
         kernel1!(tmp, x, b, nzv, cv, rp, smoother.nzval; ndrange=n)
         _synchronize(backend)
         # Pass 2: x += M * r
-        kernel2! = spai1_apply_kernel!(backend, block_size)
         kernel2!(x, tmp, smoother.nzval, cv, rp; ndrange=n)
         _synchronize(backend)
     end
@@ -591,8 +687,8 @@ function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
     tmp = smoother.tmp
     src = x
     dst = tmp
+    kernel! = jacobi_kernel!(backend, block_size)
     for _ in 1:steps
-        kernel! = jacobi_kernel!(backend, block_size)
         kernel!(dst, src, b, nzv, cv, rp, smoother.invdiag, smoother.ω; ndrange=n)
         _synchronize(backend)
         src, dst = dst, src
@@ -707,13 +803,14 @@ function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
     θ = (smoother.λ_max + smoother.λ_min) / 2
     δ = (smoother.λ_max - smoother.λ_min) / 2
 
+    rkernel! = residual_kernel_smoother!(backend, block_size)
+    init_kernel! = chebyshev_init_kernel!(backend, block_size)
+    iter_kernel! = chebyshev_iter_kernel!(backend, block_size)
     for _ in 1:steps
         # Iteration 0: r = b - A*x, d = (1/θ) * D⁻¹ * r, x += d
-        rkernel! = residual_kernel_smoother!(backend, block_size)
         rkernel!(r, b, x, nzv, cv, rp; ndrange=n)
         _synchronize(backend)
 
-        init_kernel! = chebyshev_init_kernel!(backend, block_size)
         init_kernel!(d, x, smoother.invdiag, r, Tv(1) / θ; ndrange=n)
         _synchronize(backend)
 
@@ -726,7 +823,6 @@ function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
             σ_new = one(Tv) / (Tv(2) * θ / δ - σ_old)
             scale_r = Tv(2) * σ_new / δ
             scale_d = σ_new * σ_old
-            iter_kernel! = chebyshev_iter_kernel!(backend, block_size)
             iter_kernel!(d, x, smoother.invdiag, r, scale_r, scale_d; ndrange=n)
             _synchronize(backend)
             σ_old = σ_new

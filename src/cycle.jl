@@ -131,11 +131,17 @@ function amg_solve!(x::AbstractVector{Tv}, b::AbstractVector{Tv},
     end
     # Use pre-allocated residual buffer (no allocations!)
     r = hierarchy.solve_r
+    n = size(A, 1)
+    nzv = nonzeros(A)
+    cv = colvals(A)
+    rp = rowptr(A)
+    rkernel! = residual_kernel!(backend, block_size)
     rnorm = bnorm
     for iter in 1:maxiter
         amg_cycle!(x, b, hierarchy, config)
-        # Check convergence using parallelized residual computation
-        compute_residual!(r, A, x, b; backend=backend, block_size=block_size)
+        # Check convergence using parallelized residual computation (kernel pre-built)
+        rkernel!(r, b, x, nzv, cv, rp; ndrange=n)
+        _synchronize(backend)
         rnorm = norm(r)
         rel_norm = rnorm / bnorm
         if config.verbose >= 2

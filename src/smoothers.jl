@@ -245,21 +245,15 @@ end
 # ══════════════════════════════════════════════════════════════════════════════
 
 """
-    build_serial_gs_smoother(A)
+    _serial_gs_compute_invdiag!(invdiag, nzv, cv, rp, n)
 
-Build a serial Gauss-Seidel smoother. All data is stored on CPU.
-No graph coloring, threading, or KernelAbstractions are used.
+Function barrier for computing inverse diagonal. Takes concrete array types
+as arguments to ensure type stability in the inner loop.
 """
-function build_serial_gs_smoother(A::CSRMatrix{Tv, Ti}) where {Tv, Ti}
-    A_cpu = csr_to_cpu(A)
-    n = size(A_cpu, 1)
-    nzv = nonzeros(A_cpu)
-    cv = colvals(A_cpu)
-    rp = rowptr(A_cpu)
-    invdiag = Vector{Tv}(undef, n)
+function _serial_gs_compute_invdiag!(invdiag::Vector{Tv}, nzv, cv, rp, n::Int) where {Tv}
     @inbounds for i in 1:n
         d = zero(Tv)
-        for nz in rp[i]:(rp[i+1]-one(Ti))
+        for nz in rp[i]:(rp[i+1]-1)
             if cv[nz] == i
                 d = nzv[nz]
                 break
@@ -268,6 +262,40 @@ function build_serial_gs_smoother(A::CSRMatrix{Tv, Ti}) where {Tv, Ti}
         abs_d = _entry_norm(d)
         invdiag[i] = abs_d > eps(real(Tv)) ? inv(d) : zero(Tv)
     end
+    return invdiag
+end
+
+"""
+    _serial_gs_sweep!(x, b, nzv, cv, rp, invdiag, n, steps)
+
+Function barrier for the Gauss-Seidel forward sweep. Takes concrete array types
+as arguments to ensure type stability in the inner loop.
+"""
+function _serial_gs_sweep!(x, b, nzv, cv, rp, invdiag, n::Int, steps::Int)
+    for _ in 1:steps
+        @inbounds for i in 1:n
+            r_i = b[i]
+            for nz in rp[i]:(rp[i+1]-1)
+                j = cv[nz]
+                r_i -= nzv[nz] * x[j]
+            end
+            x[i] += invdiag[i] * r_i
+        end
+    end
+    return x
+end
+
+"""
+    build_serial_gs_smoother(A)
+
+Build a serial Gauss-Seidel smoother. All data is stored on CPU.
+No graph coloring, threading, or KernelAbstractions are used.
+"""
+function build_serial_gs_smoother(A::CSRMatrix{Tv, Ti}) where {Tv, Ti}
+    A_cpu = csr_to_cpu(A)
+    n = size(A_cpu, 1)
+    invdiag = Vector{Tv}(undef, n)
+    _serial_gs_compute_invdiag!(invdiag, nonzeros(A_cpu), colvals(A_cpu), rowptr(A_cpu), n)
     return SerialGaussSeidelSmoother{Tv, Ti}(invdiag, A_cpu)
 end
 
@@ -276,20 +304,7 @@ function update_smoother!(smoother::SerialGaussSeidelSmoother{Tv, Ti}, A::CSRMat
     A_cpu = csr_to_cpu(A)
     copyto!(smoother.A_cpu.nzval, A_cpu.nzval)
     n = size(A_cpu, 1)
-    nzv = nonzeros(smoother.A_cpu)
-    cv = colvals(smoother.A_cpu)
-    rp = rowptr(smoother.A_cpu)
-    @inbounds for i in 1:n
-        d = zero(Tv)
-        for nz in rp[i]:(rp[i+1]-one(Ti))
-            if cv[nz] == i
-                d = nzv[nz]
-                break
-            end
-        end
-        abs_d = _entry_norm(d)
-        smoother.invdiag[i] = abs_d > eps(real(Tv)) ? inv(d) : zero(Tv)
-    end
+    _serial_gs_compute_invdiag!(smoother.invdiag, nonzeros(smoother.A_cpu), colvals(smoother.A_cpu), rowptr(smoother.A_cpu), n)
     return smoother
 end
 
@@ -311,21 +326,8 @@ function smooth!(x::AbstractVector, A::CSRMatrix{Tv, Ti}, b::AbstractVector,
         x_cpu = x
         b_cpu = b
     end
-    nzv = nonzeros(smoother.A_cpu)
-    cv = colvals(smoother.A_cpu)
-    rp = rowptr(smoother.A_cpu)
-    invdiag = smoother.invdiag
-    ti_one = one(Ti)
-    for _ in 1:steps
-        @inbounds for i in 1:n
-            r_i = b_cpu[i]
-            for nz in rp[i]:(rp[i+ti_one]-ti_one)
-                j = cv[nz]
-                r_i -= nzv[nz] * x_cpu[j]
-            end
-            x_cpu[i] += invdiag[i] * r_i
-        end
-    end
+    _serial_gs_sweep!(x_cpu, b_cpu, nonzeros(smoother.A_cpu), colvals(smoother.A_cpu),
+                      rowptr(smoother.A_cpu), smoother.invdiag, n, steps)
     if is_gpu
         copyto!(x, x_cpu)
     end

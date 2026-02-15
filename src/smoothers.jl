@@ -431,12 +431,7 @@ function update_smoother!(smoother::SPAI1Smoother, A::CSRMatrix;
     A_cpu = csr_to_cpu(A)
     nzval_cpu = Vector{eltype(smoother.nzval)}(undef, nnz(A))
     _compute_spai1!(nzval_cpu, A_cpu)
-    # Copy back to device if needed
-    if smoother.nzval isa Array
-        copyto!(smoother.nzval, nzval_cpu)
-    else
-        copyto!(smoother.nzval, nzval_cpu)
-    end
+    copyto!(smoother.nzval, nzval_cpu)
     return smoother
 end
 

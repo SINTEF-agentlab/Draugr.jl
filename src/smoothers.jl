@@ -754,6 +754,7 @@ function build_ilu0_smoother(A::CSRMatrix{Tv, Ti}) where {Tv, Ti}
     cv = colvals(A_cpu)
     nzv = nonzeros(A_cpu)
     rp = rowptr(A_cpu)
+    ti_one = one(Ti)
 
     # Compute coloring for parallel triangular solves (on CPU)
     colors, num_colors = greedy_coloring(A_cpu)
@@ -777,7 +778,7 @@ function build_ilu0_smoother(A::CSRMatrix{Tv, Ti}) where {Tv, Ti}
     # Find diagonal indices
     diag_idx = Vector{Ti}(undef, n)
     @inbounds for i in 1:n
-        for nz in rp[i]:(rp[i+1]-1)
+        for nz in rp[i]:(rp[i+ti_one]-ti_one)
             if cv[nz] == i
                 diag_idx[i] = Ti(nz)
                 break
@@ -809,6 +810,7 @@ function _ilu0_factorize!(L_nzval::Vector{Tv}, U_nzval::Vector{Tv},
     cv = colvals(A)
     nzv = nonzeros(A)
     rp = rowptr(A)
+    ti_one = one(Ti)
 
     # Copy A values into U
     copyto!(U_nzval, nzv)
@@ -819,13 +821,13 @@ function _ilu0_factorize!(L_nzval::Vector{Tv}, U_nzval::Vector{Tv},
 
     @inbounds for i in 1:n
         # Process row i: for each k < i in row i's lower triangle
-        for nz in rp[i]:(diag_idx[i]-1)
+        for nz in rp[i]:(diag_idx[i]-ti_one)
             k = cv[nz]
             # L[i,k] = U[i,k] / U[k,k]
             u_kk = U_nzval[diag_idx[k]]
             # Use original row k's norm as reference scale for zero check
             row_k_norm = zero(real(Tv))
-            for nz_k in rp[k]:(rp[k+1]-1)
+            for nz_k in rp[k]:(rp[k+Ti(1)]-ti_one)
                 row_k_norm += abs(nzv[nz_k])
             end
             if abs(u_kk) < _safe_threshold(Tv, row_k_norm)
@@ -842,10 +844,10 @@ function _ilu0_factorize!(L_nzval::Vector{Tv}, U_nzval::Vector{Tv},
             U_nzval[nz] = zero(Tv)  # Clear lower triangle in U
 
             # Update row i: for each j in row k with j > k, if (i,j) exists
-            for nz_k in (diag_idx[k]+1):(rp[k+1]-1)
+            for nz_k in (diag_idx[k]+ti_one):(rp[k+Ti(1)]-ti_one)
                 j = cv[nz_k]
                 # Find (i,j) in row i
-                nz_ij = _find_nz_in_row(cv, rp[i], rp[i+1]-1, j)
+                nz_ij = _find_nz_in_row(cv, rp[i], rp[i+Ti(1)]-ti_one, j)
                 if nz_ij > 0
                     U_nzval[nz_ij] -= l_ik * U_nzval[nz_k]
                 end
@@ -854,7 +856,7 @@ function _ilu0_factorize!(L_nzval::Vector{Tv}, U_nzval::Vector{Tv},
         # Diagonal safeguard: if U[i,i] became zero or near-zero, perturb it
         u_ii = U_nzval[diag_idx[i]]
         row_norm = zero(real(Tv))
-        for nz in rp[i]:(rp[i+1]-1)
+        for nz in rp[i]:(rp[i+Ti(1)]-ti_one)
             row_norm += abs(nzv[nz])
         end
         safe_thresh = _safe_threshold(Tv, row_norm)
@@ -866,21 +868,21 @@ function _ilu0_factorize!(L_nzval::Vector{Tv}, U_nzval::Vector{Tv},
 end
 
 """Find column `col` in row range [start, stop] of colval array."""
-function _find_nz_in_row(cv::AbstractVector{Ti}, start::Ti, stop::Ti, col::Ti) where Ti
+function _find_nz_in_row(cv::AbstractVector{Ti}, start, stop, col) where Ti
     # Binary search since columns are sorted in CSR
-    lo, hi = Int(start), Int(stop)
+    lo, hi = Ti(start), Ti(stop)
     while lo <= hi
         mid = (lo + hi) >> 1
         @inbounds c = cv[mid]
         if c == col
-            return Ti(mid)
+            return mid
         elseif c < col
-            lo = mid + 1
+            lo = mid + one(Ti)
         else
-            hi = mid - 1
+            hi = mid - one(Ti)
         end
     end
-    return Ti(0)
+    return zero(Ti)
 end
 
 function update_smoother!(smoother::ILU0Smoother, A::CSRMatrix;
@@ -898,10 +900,10 @@ Apply ILU(0) smoothing: x += (LU)⁻¹ (b - Ax).
 Uses sequential forward/backward substitution on CPU.
 For GPU arrays, copies data to CPU, applies ILU, and copies back.
 """
-function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
-                 smoother::ILU0Smoother; steps::Int=1, backend=DEFAULT_BACKEND, block_size::Int=64)
+function smooth!(x::AbstractVector, A::CSRMatrix{Tv, Ti}, b::AbstractVector,
+                 smoother::ILU0Smoother; steps::Int=1, backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
     n = size(A, 1)
-    Tv = eltype(x)
+    ti_one = one(Ti)
 
     # Use CPU arrays for sequential ILU solve
     is_gpu = !(x isa Array)
@@ -924,7 +926,7 @@ function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
         # Compute residual: tmp = b - A*x (on CPU)
         @inbounds for i in 1:n
             Ax_i = zero(Tv)
-            for nz in rp[i]:(rp[i+1]-1)
+            for nz in rp[i]:(rp[i+ti_one]-ti_one)
                 j = cv[nz]
                 Ax_i += nzv[nz] * x_cpu[j]
             end
@@ -933,7 +935,7 @@ function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
 
         # Forward substitution: L * z = tmp  (z stored in tmp, natural row order)
         @inbounds for i in 1:n
-            for nz in rp[i]:(smoother.diag_idx[i]-1)
+            for nz in rp[i]:(smoother.diag_idx[i]-ti_one)
                 j = cv[nz]
                 tmp[i] -= smoother.L_nzval[nz] * tmp[j]
             end
@@ -941,7 +943,7 @@ function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
 
         # Backward substitution: U * dx = z  (dx stored in tmp, reverse row order)
         @inbounds for i in n:-1:1
-            for nz in (smoother.diag_idx[i]+1):(rp[i+1]-1)
+            for nz in (smoother.diag_idx[i]+ti_one):(rp[i+ti_one]-ti_one)
                 j = cv[nz]
                 tmp[i] -= smoother.U_nzval[nz] * tmp[j]
             end

@@ -827,7 +827,7 @@ function _ilu0_factorize!(L_nzval::Vector{Tv}, U_nzval::Vector{Tv},
             u_kk = U_nzval[diag_idx[k]]
             # Use original row k's norm as reference scale for zero check
             row_k_norm = zero(real(Tv))
-            for nz_k in rp[k]:(rp[k+Ti(1)]-ti_one)
+            for nz_k in rp[k]:(rp[k+ti_one]-ti_one)
                 row_k_norm += abs(nzv[nz_k])
             end
             if abs(u_kk) < _safe_threshold(Tv, row_k_norm)
@@ -844,10 +844,10 @@ function _ilu0_factorize!(L_nzval::Vector{Tv}, U_nzval::Vector{Tv},
             U_nzval[nz] = zero(Tv)  # Clear lower triangle in U
 
             # Update row i: for each j in row k with j > k, if (i,j) exists
-            for nz_k in (diag_idx[k]+ti_one):(rp[k+Ti(1)]-ti_one)
+            for nz_k in (diag_idx[k]+ti_one):(rp[k+ti_one]-ti_one)
                 j = cv[nz_k]
                 # Find (i,j) in row i
-                nz_ij = _find_nz_in_row(cv, rp[i], rp[i+Ti(1)]-ti_one, j)
+                nz_ij = _find_nz_in_row(cv, rp[i], rp[i+ti_one]-ti_one, j)
                 if nz_ij > 0
                     U_nzval[nz_ij] -= l_ik * U_nzval[nz_k]
                 end
@@ -856,7 +856,7 @@ function _ilu0_factorize!(L_nzval::Vector{Tv}, U_nzval::Vector{Tv},
         # Diagonal safeguard: if U[i,i] became zero or near-zero, perturb it
         u_ii = U_nzval[diag_idx[i]]
         row_norm = zero(real(Tv))
-        for nz in rp[i]:(rp[i+Ti(1)]-ti_one)
+        for nz in rp[i]:(rp[i+ti_one]-ti_one)
             row_norm += abs(nzv[nz])
         end
         safe_thresh = _safe_threshold(Tv, row_norm)

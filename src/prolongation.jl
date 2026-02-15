@@ -38,11 +38,13 @@ memory use on large models.
 function _smooth_prolongation(A::CSRMatrix{Tv, Ti},
                               P_tent::ProlongationOp{Ti, Tv},
                               ω::Real) where {Tv, Ti}
+    # Convert to CPU for scalar indexing operations
+    A_cpu = csr_to_cpu(A)
     n_fine = P_tent.nrow
     n_coarse = P_tent.ncol
-    cv_a = colvals(A)
-    nzv_a = nonzeros(A)
-    rp_a = rowptr(A)
+    cv_a = colvals(A_cpu)
+    nzv_a = nonzeros(A_cpu)
+    rp_a = rowptr(A_cpu)
 
     # Compute inverse diagonal of A
     invdiag = Vector{Tv}(undef, n_fine)

@@ -3,12 +3,14 @@
 
 External API entry point: convert `StaticSparsityMatrixCSR` to `CSRMatrix` once
 and forward to the general resetup.
+
+The backend and block_size are taken from the hierarchy (set during `amg_setup`).
 """
 function amg_resetup!(hierarchy::AMGHierarchy{Tv, Ti},
                       A_new::StaticSparsityMatrixCSR{Tv, Ti},
-                      config::AMGConfig=AMGConfig();
-                      backend=DEFAULT_BACKEND) where {Tv, Ti}
-    block_size = config.block_size
+                      config::AMGConfig=AMGConfig()) where {Tv, Ti}
+    backend = hierarchy.backend
+    block_size = hierarchy.block_size
     nlevels = length(hierarchy.levels)
     if nlevels == 0
         A_csr = csr_from_static(A_new)

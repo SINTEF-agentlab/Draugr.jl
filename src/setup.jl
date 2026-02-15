@@ -44,8 +44,8 @@ External API entry point: convert `StaticSparsityMatrixCSR` to `CSRMatrix` once
 and forward to the general CSRMatrix-based setup.
 """
 function amg_setup(A::StaticSparsityMatrixCSR{Tv, Ti}, config::AMGConfig=AMGConfig();
-                   backend=DEFAULT_BACKEND) where {Tv, Ti}
-    return amg_setup(csr_from_static(A), config; backend=backend)
+                   backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
+    return amg_setup(csr_from_static(A), config; backend=backend, block_size=block_size)
 end
 
 """
@@ -59,12 +59,11 @@ The sparsity structure computed here is reused by `amg_resetup!` when matrix
 coefficients change but the pattern remains the same.
 """
 function amg_setup(A_csr::CSRMatrix{Tv, Ti}, config::AMGConfig=AMGConfig();
-                   backend=DEFAULT_BACKEND) where {Tv, Ti}
+                   backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
     t_setup = time()
     levels = AMGLevel{Tv, Ti}[]
     A_current = A_csr
     n_finest = size(A_csr, 1)
-    block_size = config.block_size
     # Determine if we need GPU-resident arrays: any non-CPU array type
     # (CuArray, JLArray, MtlArray, etc.) triggers GPU-resident hierarchy
     is_gpu = !(A_csr.nzval isa Array)
@@ -122,9 +121,10 @@ function amg_setup(A_csr::CSRMatrix{Tv, Ti}, config::AMGConfig=AMGConfig();
         solve_r = Vector{Tv}(undef, n_finest)
     end
     hierarchy = AMGHierarchy{Tv, Ti}(levels, coarse_dense,
-                                      coarse_factor, coarse_x, coarse_b, solve_r)
+                                      coarse_factor, coarse_x, coarse_b, solve_r,
+                                      backend, block_size)
     t_setup = time() - t_setup
-    if config.verbose
+    if config.verbose >= 1
         _print_hierarchy_info(hierarchy, config, n_finest, t_setup)
     end
     return hierarchy

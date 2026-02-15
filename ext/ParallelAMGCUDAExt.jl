@@ -20,30 +20,31 @@ function ParallelAMG.csr_from_gpu(A::CuSparseMatrixCSR{Tv, Ti}) where {Tv, Ti}
 end
 
 """
-    amg_setup(A::CuSparseMatrixCSR, config; backend) -> AMGHierarchy
+    amg_setup(A::CuSparseMatrixCSR, config; backend, block_size) -> AMGHierarchy
 
 AMG setup accepting a CUDA sparse CSR matrix. Unwraps the GPU arrays into
 a `CSRMatrix` and forwards to the standard setup with `CUDABackend()`.
 """
 function ParallelAMG.amg_setup(A::CuSparseMatrixCSR{Tv, Ti},
                                config::AMGConfig=AMGConfig();
-                               backend=CUDABackend()) where {Tv, Ti}
+                               backend=CUDABackend(),
+                               block_size::Int=64) where {Tv, Ti}
     A_csr = ParallelAMG.csr_from_gpu(A)
-    return ParallelAMG.amg_setup(A_csr, config; backend=backend)
+    return ParallelAMG.amg_setup(A_csr, config; backend=backend, block_size=block_size)
 end
 
 """
     amg_resetup!(hierarchy, A_new::CuSparseMatrixCSR, config)
 
-AMG resetup accepting a CUDA sparse CSR matrix. Unwraps the GPU arrays,
-converts to CPU, and copies values into the existing hierarchy.
+AMG resetup accepting a CUDA sparse CSR matrix. Uses backend and block_size
+from the hierarchy.
 """
 function ParallelAMG.amg_resetup!(hierarchy::AMGHierarchy{Tv, Ti},
                                   A_new::CuSparseMatrixCSR{Tv, Ti},
-                                  config::AMGConfig=AMGConfig();
-                                  backend=CUDABackend()) where {Tv, Ti}
+                                  config::AMGConfig=AMGConfig()) where {Tv, Ti}
+    backend = hierarchy.backend
+    block_size = hierarchy.block_size
     A_csr = ParallelAMG.csr_to_cpu(ParallelAMG.csr_from_gpu(A_new))
-    block_size = config.block_size
     nlevels = length(hierarchy.levels)
     if nlevels == 0
         ParallelAMG._update_coarse_solver!(hierarchy, A_csr; block_size=block_size)

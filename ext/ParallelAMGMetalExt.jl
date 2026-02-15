@@ -5,7 +5,7 @@ using Metal
 using KernelAbstractions
 
 """
-    amg_setup(A::CSRMatrix{Tv, Ti, <:MtlVector, <:MtlVector, <:MtlVector}, config; backend) -> AMGHierarchy
+    amg_setup(A::CSRMatrix{Tv, Ti, <:MtlVector, <:MtlVector, <:MtlVector}, config; backend, block_size) -> AMGHierarchy
 
 AMG setup for a `CSRMatrix` backed by Metal `MtlVector` arrays.
 Automatically uses `MetalBackend()` as the default backend.
@@ -24,23 +24,24 @@ hierarchy = amg_setup(A, config)
 """
 function ParallelAMG.amg_setup(A::CSRMatrix{Tv, Ti, <:MtlVector, <:MtlVector, <:MtlVector},
                                config::AMGConfig=AMGConfig();
-                               backend=MetalBackend()) where {Tv, Ti}
+                               backend=MetalBackend(),
+                               block_size::Int=64) where {Tv, Ti}
     return invoke(ParallelAMG.amg_setup, Tuple{CSRMatrix{Tv, Ti}, AMGConfig},
-                  A, config; backend=backend)
+                  A, config; backend=backend, block_size=block_size)
 end
 
 """
     amg_resetup!(hierarchy, A_new::CSRMatrix{Tv, Ti, <:MtlVector, <:MtlVector, <:MtlVector}, config)
 
 AMG resetup for a `CSRMatrix` backed by Metal `MtlVector` arrays.
-Converts to CPU and copies values into the existing hierarchy.
+Uses backend and block_size from the hierarchy.
 """
 function ParallelAMG.amg_resetup!(hierarchy::AMGHierarchy{Tv, Ti},
                                   A_new::CSRMatrix{Tv, Ti, <:MtlVector, <:MtlVector, <:MtlVector},
-                                  config::AMGConfig=AMGConfig();
-                                  backend=MetalBackend()) where {Tv, Ti}
+                                  config::AMGConfig=AMGConfig()) where {Tv, Ti}
+    backend = hierarchy.backend
+    block_size = hierarchy.block_size
     A_csr = ParallelAMG.csr_to_cpu(A_new)
-    block_size = config.block_size
     nlevels = length(hierarchy.levels)
     if nlevels == 0
         ParallelAMG._update_coarse_solver!(hierarchy, A_csr; block_size=block_size)

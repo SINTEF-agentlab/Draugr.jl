@@ -176,17 +176,19 @@ mutable struct JacobiSmoother{Tv, V<:AbstractVector{Tv}} <: AbstractSmoother
 end
 
 """
-    ColoredGaussSeidelSmoother{Tv, Ti}
+    ColoredGaussSeidelSmoother{Tv, Ti, V, Vi}
 
 Parallel multicolor Gauss-Seidel smoother. Nodes are colored such that same-color
 nodes have no direct connections, enabling parallel updates within each color.
+The `color_order` and `invdiag` arrays are stored on the same device as the matrix.
+The `color_offsets` are always on CPU since they are used for loop control.
 """
-mutable struct ColoredGaussSeidelSmoother{Tv, Ti} <: AbstractSmoother
-    colors::Vector{Ti}          # color[i] = color index for node i
-    color_offsets::Vector{Int}  # color_offsets[c]:color_offsets[c+1]-1 = nodes of color c
-    color_order::Vector{Ti}     # nodes sorted by color
+mutable struct ColoredGaussSeidelSmoother{Tv, Ti, V<:AbstractVector{Tv}, Vi<:AbstractVector{Ti}} <: AbstractSmoother
+    colors::Vector{Ti}          # color[i] = color index for node i (CPU, used for setup only)
+    color_offsets::Vector{Int}  # color_offsets[c]:color_offsets[c+1]-1 = nodes of color c (CPU)
+    color_order::Vi             # nodes sorted by color (device)
     num_colors::Int
-    invdiag::Vector{Tv}         # inverse diagonal
+    invdiag::V                  # inverse diagonal (device)
 end
 
 """
@@ -208,10 +210,13 @@ SPAI(1) smoother: sparse approximate inverse using the sparsity pattern of A.
 For each row i, computes the least-squares optimal sparse vector m_i such that
 ‖e_i - A * m_i‖₂ is minimized subject to sparsity(m_i) ⊆ sparsity(A[i,:]).
 The result is stored in CSR format matching A's sparsity.
+
+The `nzval` and `tmp` arrays are stored on the same device as the matrix so
+that the apply kernels can run on GPU without host/device mixing.
 """
-mutable struct SPAI1Smoother{Tv, Ti} <: AbstractSmoother
-    nzval::Vector{Tv}          # nonzero values of the approximate inverse (same pattern as A)
-    tmp::Vector{Tv}            # workspace
+mutable struct SPAI1Smoother{Tv, Ti, V<:AbstractVector{Tv}} <: AbstractSmoother
+    nzval::V          # nonzero values of the approximate inverse (same pattern as A)
+    tmp::V            # workspace
 end
 
 """
@@ -248,6 +253,10 @@ end
 Parallel ILU(0) smoother. Computes an incomplete LU factorization with the same
 sparsity pattern as A, then applies forward/backward substitution using graph
 coloring for parallelism.
+
+The factorization data is always stored on CPU since ILU factorization and
+triangular solves require sequential scalar indexing. The apply step copies
+vectors to/from CPU as needed for GPU matrices.
 """
 mutable struct ILU0Smoother{Tv, Ti} <: AbstractSmoother
     L_nzval::Vector{Tv}       # strictly lower triangle values (same pattern positions as A)
@@ -258,6 +267,7 @@ mutable struct ILU0Smoother{Tv, Ti} <: AbstractSmoother
     color_order::Vector{Ti}
     num_colors::Int
     tmp::Vector{Tv}
+    A_cpu::CSRMatrix{Tv, Ti}  # CPU copy of A's structure for sequential triangular solves
 end
 
 # ── Prolongation info (stored implicitly) ─────────────────────────────────────
@@ -354,6 +364,9 @@ The coarse LU factorization uses high-level `lu` / `lu!` so that GPU backends
 The coarsest-level workspace (`coarse_x`, `coarse_b`) is always on CPU since
 LU direct solves use LAPACK. Level workspace and smoother arrays are allocated
 on the same device as the input matrix.
+
+The `backend` and `block_size` are stored in the hierarchy so that cycle/solve/resetup
+functions automatically use the correct backend without requiring explicit kwargs.
 """
 mutable struct AMGHierarchy{Tv, Ti<:Integer}
     levels::Vector{AMGLevel{Tv, Ti}}
@@ -362,6 +375,8 @@ mutable struct AMGHierarchy{Tv, Ti<:Integer}
     coarse_x::Vector{Tv}       # workspace for coarsest level (CPU for LU solve)
     coarse_b::Vector{Tv}       # workspace for coarsest level (CPU for LU solve)
     solve_r::AbstractVector{Tv}        # residual buffer for amg_solve! (finest level size)
+    backend::Any               # KernelAbstractions backend (CPU, CUDABackend, etc.)
+    block_size::Int            # block size for KA kernel launches
 end
 
 # ── AMG Configuration ─────────────────────────────────────────────────────────
@@ -376,7 +391,10 @@ Fields:
 - `max_levels`, `max_coarse_size`: Hierarchy limits
 - `pre_smoothing_steps`, `post_smoothing_steps`: Smoothing counts
 - `jacobi_omega`: Damping factor for Jacobi smoother
-- `verbose`: Print hierarchy information and solve diagnostics
+- `verbose`: Verbosity level as an integer:
+  - 0: Silent
+  - 1: Print hierarchy summary after setup and convergence summary after solve
+  - 2: Additionally print iteration counter and residual norm at each cycle during solve
 - `initial_coarsening`: Optional alternative coarsening for the first N levels (defaults to `coarsening`)
 - `initial_coarsening_levels`: Number of levels to use `initial_coarsening` for (default: 0)
 - `max_row_sum`: Maximum row sum threshold for dependency weakening (default: 0, disabled).
@@ -385,8 +403,6 @@ Fields:
 - `cycle_type`: AMG cycle type, `:V` for V-cycle or `:W` for W-cycle (default: `:V`)
 - `strength_type`: Strength of connection algorithm (default: `AbsoluteStrength()`).
   Use `SignedStrength()` for non-M-matrices with positive off-diagonals.
-- `block_size`: Block size for KernelAbstractions kernels (default: 64). Can be tuned for
-  different GPU backends (e.g., 256 for CUDA, 64 for Metal).
 """
 struct AMGConfig
     coarsening::CoarseningAlgorithm
@@ -396,13 +412,12 @@ struct AMGConfig
     pre_smoothing_steps::Int
     post_smoothing_steps::Int
     jacobi_omega::Float64
-    verbose::Bool
+    verbose::Int
     initial_coarsening::CoarseningAlgorithm
     initial_coarsening_levels::Int
     max_row_sum::Float64
     cycle_type::Symbol
     strength_type::StrengthType
-    block_size::Int
 end
 
 function AMGConfig(;
@@ -413,22 +428,23 @@ function AMGConfig(;
     pre_smoothing_steps::Int = 1,
     post_smoothing_steps::Int = 1,
     jacobi_omega::Float64 = 2.0/3.0,
-    verbose::Bool = false,
+    verbose::Union{Bool, Int} = 0,
     initial_coarsening::CoarseningAlgorithm = coarsening,
     initial_coarsening_levels::Int = 0,
     max_row_sum::Float64 = 0.0,
     cycle_type::Symbol = :V,
     strength_type::StrengthType = AbsoluteStrength(),
-    block_size::Int = 64,
     # Deprecated: accepted but ignored for backward compatibility
+    block_size::Int = 64,
     min_coarse_ratio::Float64 = 0.5,
     max_stall_levels::Int = 2,
 )
     @assert cycle_type in (:V, :W) "cycle_type must be :V or :W"
+    verbose_int = verbose isa Bool ? Int(verbose) : verbose
     return AMGConfig(coarsening, smoother, max_levels, max_coarse_size,
-                     pre_smoothing_steps, post_smoothing_steps, jacobi_omega, verbose,
+                     pre_smoothing_steps, post_smoothing_steps, jacobi_omega, verbose_int,
                      initial_coarsening, initial_coarsening_levels,
-                     max_row_sum, cycle_type, strength_type, block_size)
+                     max_row_sum, cycle_type, strength_type)
 end
 
 """

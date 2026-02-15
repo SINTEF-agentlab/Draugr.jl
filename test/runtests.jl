@@ -2074,7 +2074,7 @@ end
             hierarchy = amg_setup(A_jl, config)
             b = JLArray(ones(n))
             x = JLArray(zeros(n))
-            x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=100, backend=JLBackend())
+            x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=100)
             # Verify convergence by computing residual on CPU
             x_cpu = Array(x)
             b_cpu = Array(b)
@@ -2100,7 +2100,7 @@ end
             hierarchy = amg_setup(A_jl, config)
             b = JLArray(ones(n))
             x = JLArray(zeros(n))
-            x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=100, backend=JLBackend())
+            x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=100)
             # Verify convergence
             x_cpu = Array(x)
             b_cpu = Array(b)
@@ -2125,32 +2125,86 @@ end
             n = 100
             b = JLArray(ones(n))
             x = JLArray(zeros(n))
-            # Apply a single cycle
-            amg_cycle!(x, b, hierarchy, config; backend=JLBackend())
+            # Apply a single cycle (backend from hierarchy)
+            amg_cycle!(x, b, hierarchy, config)
             @test !all(Array(x) .== 0.0)  # something changed
         end
 
-        @testset "Backend consistency - strength_graph uses JLBackend" begin
-            # This test verifies that the backend is properly threaded
-            # through the setup path including coarsening/strength_graph
+        @testset "Backend stored in hierarchy" begin
             A_jl = poisson1d_jl(100)
             config = AMGConfig()
-            # If backend is not properly threaded, this would fail with
-            # scalar indexing errors on JLArrays
-            hierarchy = amg_setup(A_jl, config; backend=JLBackend())
+            hierarchy = amg_setup(A_jl, config)
             @test length(hierarchy.levels) >= 1
+            @test hierarchy.backend isa JLBackend
+            @test hierarchy.block_size == 64
         end
 
-        @testset "AMG with different smoothers on JLArrays" begin
+        @testset "AMG with all smoothers on JLArrays" begin
             A_jl = poisson1d_jl(100)
-            for smoother in [JacobiSmootherType(), SPAI0SmootherType()]
-                config = AMGConfig(smoother=smoother)
-                hierarchy = amg_setup(A_jl, config)
-                @test length(hierarchy.levels) >= 1
-                b = JLArray(ones(100))
-                x = JLArray(zeros(100))
-                x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=100, backend=JLBackend())
-                @test niter < 100
+            all_smoothers = [
+                JacobiSmootherType(),
+                SPAI0SmootherType(),
+                SPAI1SmootherType(),
+                L1JacobiSmootherType(),
+                ChebyshevSmootherType(),
+                ColoredGaussSeidelType(),
+                ILU0SmootherType(),
+            ]
+            for smoother in all_smoothers
+                @testset "Smoother: $(typeof(smoother).name.name)" begin
+                    config = AMGConfig(smoother=smoother)
+                    hierarchy = amg_setup(A_jl, config)
+                    @test length(hierarchy.levels) >= 1
+                    b = JLArray(ones(100))
+                    x = JLArray(zeros(100))
+                    x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+                    @test niter < 200
+                end
+            end
+        end
+
+        @testset "AMG with all coarsening types on JLArrays" begin
+            A_jl = poisson2d_jl(10)
+            n = 100
+            all_coarsenings = [
+                AggregationCoarsening(),
+                PMISCoarsening(),
+                HMISCoarsening(),
+                RSCoarsening(),
+                AggressiveCoarsening(),
+                SmoothedAggregationCoarsening(),
+            ]
+            for coarsening in all_coarsenings
+                @testset "Coarsening: $(typeof(coarsening).name.name)" begin
+                    config = AMGConfig(coarsening=coarsening)
+                    hierarchy = amg_setup(A_jl, config)
+                    @test length(hierarchy.levels) >= 1
+                    b = JLArray(ones(n))
+                    x = JLArray(zeros(n))
+                    x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-6, maxiter=200)
+                    @test niter < 200
+                end
+            end
+        end
+
+        @testset "AMG with CF interpolation types on JLArrays" begin
+            A_jl = poisson2d_jl(10)
+            n = 100
+            interp_types = [
+                DirectInterpolation(),
+                StandardInterpolation(),
+                ExtendedIInterpolation(),
+            ]
+            for interp in interp_types
+                @testset "Interpolation: $(typeof(interp).name.name)" begin
+                    config = AMGConfig(coarsening=PMISCoarsening(0.25, interp))
+                    hierarchy = amg_setup(A_jl, config)
+                    @test length(hierarchy.levels) >= 1
+                    b = JLArray(ones(n))
+                    x = JLArray(zeros(n))
+                    x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-6, maxiter=200)
+                    @test niter < 200
+                end
             end
         end
 
@@ -2163,11 +2217,33 @@ end
             @test length(hierarchy.levels) >= 1
             # Resetup with the same matrix (same sparsity, same values)
             amg_resetup!(hierarchy, A_jl, config)
-            # Solve after resetup
+            # Solve after resetup (backend from hierarchy)
             b = JLArray(ones(n))
             x = JLArray(zeros(n))
-            x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=100, backend=JLBackend())
+            x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=100)
             @test niter < 100
+        end
+
+        @testset "Verbosity levels" begin
+            A_jl = poisson2d_jl(10)
+            n = 100
+            # verbosity 0 = silent
+            config0 = AMGConfig(verbose=0)
+            hierarchy0 = amg_setup(A_jl, config0)
+            @test length(hierarchy0.levels) >= 1
+            # verbosity 1 = hierarchy + solve summary
+            config1 = AMGConfig(verbose=1)
+            hierarchy1 = amg_setup(A_jl, config1)
+            @test length(hierarchy1.levels) >= 1
+            # verbosity 2 = per-iteration output
+            config2 = AMGConfig(verbose=2)
+            hierarchy2 = amg_setup(A_jl, config2)
+            @test length(hierarchy2.levels) >= 1
+            # Bool backward compat
+            config_bool = AMGConfig(verbose=true)
+            @test config_bool.verbose == 1
+            config_bool_f = AMGConfig(verbose=false)
+            @test config_bool_f.verbose == 0
         end
 
         @testset "csr_to_cpu conversion" begin

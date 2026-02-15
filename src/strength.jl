@@ -153,8 +153,8 @@ end
 Dispatch strength computation based on config's strength_type.
 """
 function strength_graph(A::CSRMatrix, θ::Real, config::AMGConfig;
-                        backend=DEFAULT_BACKEND)
-    return strength_graph(A, θ, config.strength_type; backend=backend, block_size=config.block_size)
+                        backend=DEFAULT_BACKEND, block_size::Int=64)
+    return strength_graph(A, θ, config.strength_type; backend=backend, block_size=block_size)
 end
 
 """

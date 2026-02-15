@@ -1,16 +1,19 @@
 """
-    amg_cycle!(x, b, hierarchy, config; backend=DEFAULT_BACKEND)
+    amg_cycle!(x, b, hierarchy, config)
 
 Apply one V-cycle of AMG to improve the solution `x` for the system `Ax = b`.
 
 The V-cycle descends through all levels with pre-smoothing, restriction, and
 then ascends with prolongation and post-smoothing. At the coarsest level a
 direct solver is used.
+
+The backend and block_size are taken from the hierarchy (set during `amg_setup`).
 """
 function amg_cycle!(x::AbstractVector{Tv}, b::AbstractVector{Tv},
                     hierarchy::AMGHierarchy{Tv, Ti},
-                    config::AMGConfig=AMGConfig();
-                    backend=DEFAULT_BACKEND) where {Tv, Ti}
+                    config::AMGConfig=AMGConfig()) where {Tv, Ti}
+    backend = hierarchy.backend
+    block_size = hierarchy.block_size
     nlevels = length(hierarchy.levels)
     if nlevels == 0
         # Direct solve only
@@ -20,7 +23,7 @@ function amg_cycle!(x::AbstractVector{Tv}, b::AbstractVector{Tv},
         return x
     end
     # V-cycle: descend
-    _vcycle_descend!(x, b, hierarchy, config, 1; backend=backend, block_size=config.block_size)
+    _vcycle_descend!(x, b, hierarchy, config, 1; backend=backend, block_size=block_size)
     return x
 end
 
@@ -96,18 +99,21 @@ function _vcycle_descend!(x::AbstractVector{Tv}, b::AbstractVector{Tv},
 end
 
 """
-    amg_solve!(x, b, hierarchy, config; tol=1e-10, maxiter=100, backend=DEFAULT_BACKEND)
+    amg_solve!(x, b, hierarchy, config; tol=1e-10, maxiter=100)
 
 Solve Ax = b using AMG V-cycles. Returns the solution in `x` and the number of
 iterations performed. Uses pre-allocated residual buffer from hierarchy to avoid
 allocations.
+
+The backend and block_size are taken from the hierarchy (set during `amg_setup`).
 """
 function amg_solve!(x::AbstractVector{Tv}, b::AbstractVector{Tv},
                     hierarchy::AMGHierarchy{Tv, Ti},
                     config::AMGConfig=AMGConfig();
-                    tol::Real=1e-10, maxiter::Int=100,
-                    backend=DEFAULT_BACKEND) where {Tv, Ti}
-    t_solve = config.verbose ? time() : 0.0
+                    tol::Real=1e-10, maxiter::Int=100) where {Tv, Ti}
+    backend = hierarchy.backend
+    block_size = hierarchy.block_size
+    t_solve = config.verbose >= 1 ? time() : 0.0
     bnorm = norm(b)
     if bnorm == 0
         fill!(x, zero(Tv))
@@ -123,25 +129,29 @@ function amg_solve!(x::AbstractVector{Tv}, b::AbstractVector{Tv},
         copyto!(x, hierarchy.coarse_x)
         return x, 1
     end
-    block_size = config.block_size
     # Use pre-allocated residual buffer (no allocations!)
     r = hierarchy.solve_r
     rnorm = bnorm
     for iter in 1:maxiter
-        amg_cycle!(x, b, hierarchy, config; backend=backend)
+        amg_cycle!(x, b, hierarchy, config)
         # Check convergence using parallelized residual computation
         compute_residual!(r, A, x, b; backend=backend, block_size=block_size)
         rnorm = norm(r)
-        if rnorm / bnorm < tol
-            if config.verbose
+        rel_norm = rnorm / bnorm
+        if config.verbose >= 2
+            Printf.@printf("  AMG iter %4d: residual norm = %.6e, relative = %.6e\n",
+                            iter, rnorm, rel_norm)
+        end
+        if rel_norm < tol
+            if config.verbose >= 1
                 t_solve = time() - t_solve
                 Printf.@printf("AMG solve converged: %d iterations, %.4f s, final residual %.2e\n",
-                                iter, t_solve, rnorm / bnorm)
+                                iter, t_solve, rel_norm)
             end
             return x, iter
         end
     end
-    if config.verbose
+    if config.verbose >= 1
         t_solve = time() - t_solve
         Printf.@printf("AMG solve did NOT converge: %d iterations, %.4f s, final residual %.2e\n",
                         maxiter, t_solve, rnorm / bnorm)

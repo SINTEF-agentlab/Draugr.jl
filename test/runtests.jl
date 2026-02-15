@@ -2003,6 +2003,122 @@ end
     end
 
     # ══════════════════════════════════════════════════════════════════════════
+    # Standalone Smoother API
+    # ══════════════════════════════════════════════════════════════════════════
+
+    @testset "Standalone Smoother API - build_smoother from StaticCSR" begin
+        A = poisson1d_csr(10)
+        # Jacobi
+        s = build_smoother(A, JacobiSmootherType())
+        @test s isa JacobiSmoother
+        @test length(s.invdiag) == 10
+        @test all(s.invdiag .≈ 0.5)
+        # SPAI0
+        s2 = build_smoother(A, SPAI0SmootherType())
+        @test s2 isa SPAI0Smoother
+        # l1-Jacobi
+        s3 = build_smoother(A, L1JacobiSmootherType())
+        @test s3 isa L1JacobiSmoother
+        # Colored GS
+        s4 = build_smoother(A, ColoredGaussSeidelType())
+        @test s4 isa ColoredGaussSeidelSmoother
+        # ILU0
+        s5 = build_smoother(A, ILU0SmootherType())
+        @test s5 isa ILU0Smoother
+        # Chebyshev
+        s6 = build_smoother(A, ChebyshevSmootherType())
+        @test s6 isa ChebyshevSmoother
+        # SPAI1
+        s7 = build_smoother(A, SPAI1SmootherType())
+        @test s7 isa SPAI1Smoother
+    end
+
+    @testset "Standalone Smoother API - smooth! with StaticCSR" begin
+        A = poisson1d_csr(10)
+        smoother = build_smoother(A, JacobiSmootherType())
+        b = ones(10)
+        x = zeros(10)
+        # Apply smoother directly with StaticSparsityMatrixCSR
+        smooth!(x, A, b, smoother; steps=10)
+        r = b - sparse(A.At') * x
+        @test norm(r) < norm(b)
+    end
+
+    @testset "Standalone Smoother API - update_smoother! with StaticCSR" begin
+        A = poisson1d_csr(10)
+        smoother = build_smoother(A, JacobiSmootherType())
+        @test all(smoother.invdiag .≈ 0.5)
+        # Update with same matrix
+        update_smoother!(smoother, A)
+        @test all(smoother.invdiag .≈ 0.5)
+    end
+
+    @testset "Standalone Smoother API - all types smooth correctly" begin
+        A = poisson1d_csr(10)
+        b = ones(10)
+        for stype in [JacobiSmootherType(), SPAI0SmootherType(), L1JacobiSmootherType(),
+                      ColoredGaussSeidelType(), ILU0SmootherType(), ChebyshevSmootherType(),
+                      SPAI1SmootherType()]
+            smoother = build_smoother(A, stype)
+            x = zeros(10)
+            smooth!(x, A, b, smoother; steps=10)
+            r = b - sparse(A.At') * x
+            @test norm(r) < norm(b)
+        end
+    end
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # RS Coarsening performance (bucket sort optimization)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    @testset "RS Coarsening - larger system" begin
+        # Test with a larger system to exercise the bucket sort path
+        A = poisson2d_csr(30)
+        Ac = to_csr(A)
+        cf, cmap, nc = ParallelAMG.coarsen_rs(Ac, 0.25)
+        @test nc > 0
+        @test nc < 900
+        @test sum(cf .== 1) == nc
+        @test all(abs.(cf) .== 1)
+        # Every F-point should have a strong C-neighbor
+        is_strong = ParallelAMG.strength_graph(Ac, 0.25)
+        cv = colvals(Ac)
+        for i in 1:size(Ac, 1)
+            if cf[i] == -1
+                has_C = false
+                for nz in nzrange(Ac, i)
+                    j = cv[nz]
+                    if j != i && is_strong[nz] && cf[j] == 1
+                        has_C = true
+                        break
+                    end
+                end
+                @test has_C
+            end
+        end
+    end
+
+    @testset "Block-aware helpers" begin
+        # Test _frobenius_norm2 for scalars
+        @test ParallelAMG._frobenius_norm2(3.0) ≈ 9.0
+        @test ParallelAMG._frobenius_norm2(-2.0) ≈ 4.0
+        # Test _entry_norm for scalars
+        @test ParallelAMG._entry_norm(3.0) ≈ 3.0
+        @test ParallelAMG._entry_norm(-2.0) ≈ 2.0
+        # Test _is_finite_entry for scalars
+        @test ParallelAMG._is_finite_entry(1.0) == true
+        @test ParallelAMG._is_finite_entry(Inf) == false
+        @test ParallelAMG._is_finite_entry(NaN) == false
+        # Test block-aware helpers with small matrices (simulating SMatrix behavior)
+        M = [1.0 2.0; 3.0 4.0]
+        @test ParallelAMG._frobenius_norm2(M) ≈ 1.0 + 4.0 + 9.0 + 16.0  # sum of squares
+        @test ParallelAMG._entry_norm(M) ≈ sqrt(30.0)
+        @test ParallelAMG._is_finite_entry(M) == true
+        M_inf = [1.0 Inf; 0.0 1.0]
+        @test ParallelAMG._is_finite_entry(M_inf) == false
+    end
+
+    # ══════════════════════════════════════════════════════════════════════════
     # JLArrays GPU backend tests
     # ══════════════════════════════════════════════════════════════════════════
 

@@ -513,7 +513,8 @@ function coarsen_rs(A_in::CSRMatrix{Tv, Ti}, θ::Real;
     max_λ_val = maximum(λ; init=0)
     # Build bucket structure: bucket_head[k+1] = first node with λ==k
     # (shift by 1 so λ==0 maps to index 1)
-    bucket_head = fill(0, max_λ_val + 1)
+    # Pre-allocate to n to avoid resizing during λ increments
+    bucket_head = fill(0, max(max_λ_val + 1, n))
     bucket_next = zeros(Int, n)
     bucket_prev = zeros(Int, n)
     @inbounds for i in 1:n

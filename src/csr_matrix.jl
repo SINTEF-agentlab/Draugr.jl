@@ -182,3 +182,14 @@ function _allocate_undef_vector(A::CSRMatrix, ::Type{Tv}, n::Int) where Tv
     be = _get_backend(A.nzval)
     return KernelAbstractions.allocate(be, Tv, n)
 end
+
+"""
+    _allocate_dense_matrix(A::CSRMatrix, ::Type{Tv}, m, n) -> AbstractMatrix{Tv}
+
+Allocate a zero-filled m×n dense matrix on the same device as the CSR matrix `A`.
+Uses `KernelAbstractions.zeros` with the backend inferred from the matrix arrays.
+"""
+function _allocate_dense_matrix(A::CSRMatrix, ::Type{Tv}, m::Int, n::Int) where Tv
+    be = _get_backend(A.nzval)
+    return KernelAbstractions.zeros(be, Tv, m, n)
+end

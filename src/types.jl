@@ -370,10 +370,10 @@ functions automatically use the correct backend without requiring explicit kwarg
 """
 mutable struct AMGHierarchy{Tv, Ti<:Integer}
     levels::Vector{AMGLevel{Tv, Ti}}
-    coarse_A::Matrix{Tv}       # dense coarse matrix (values recomputed each resetup)
-    coarse_factor::Factorization{Tv}  # LU (or other) factorization of coarse_A
-    coarse_x::Vector{Tv}       # workspace for coarsest level (CPU for LU solve)
-    coarse_b::Vector{Tv}       # workspace for coarsest level (CPU for LU solve)
+    coarse_A::AbstractMatrix{Tv}       # dense coarse matrix (values recomputed each resetup)
+    coarse_factor::Factorization{Tv}   # LU (or other) factorization of coarse_A
+    coarse_x::AbstractVector{Tv}       # workspace for coarsest level direct solve
+    coarse_b::AbstractVector{Tv}       # workspace for coarsest level direct solve
     solve_r::AbstractVector{Tv}        # residual buffer for amg_solve! (finest level size)
     backend::Any               # KernelAbstractions backend (CPU, CUDABackend, etc.)
     block_size::Int            # block size for KA kernel launches

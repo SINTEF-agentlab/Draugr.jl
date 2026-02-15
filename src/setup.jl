@@ -106,18 +106,31 @@ function amg_setup(A_csr::CSRMatrix{Tv, Ti}, config::AMGConfig=AMGConfig();
         A_current = A_coarse
     end
     # Set up direct solver at coarsest level using high-level lu()
-    A_cpu = csr_to_cpu(A_current)
-    n_coarse = size(A_cpu, 1)
-    coarse_dense = Matrix{Tv}(undef, n_coarse, n_coarse)
-    _csr_to_dense!(coarse_dense, A_cpu)
-    coarse_factor = lu(coarse_dense)
-    # Workspace buffers for coarsest-level direct solve (always CPU for LU)
-    coarse_x = Vector{Tv}(undef, n_coarse)
-    coarse_b = Vector{Tv}(undef, n_coarse)
-    # Pre-allocate residual buffer for amg_solve! (same device as input)
+    # For GPU: build dense matrix on CPU (A_current may be CPU from coarsening),
+    # then copy to device so lu() dispatches to GPU (e.g., CUDA's cuSOLVER).
+    # If the GPU backend doesn't support lu(), _build_coarse_lu falls back to CPU.
+    n_coarse = size(A_current, 1)
     if is_gpu
+        # Build dense on CPU first (A_current is CPU from compute_coarse_sparsity)
+        A_cpu = csr_to_cpu(A_current)
+        coarse_cpu = Matrix{Tv}(undef, n_coarse, n_coarse)
+        _csr_to_dense!(coarse_cpu, A_cpu)
+        # Copy to device and attempt GPU LU; falls back to CPU if unsupported
+        coarse_dev = _allocate_dense_matrix(A_csr, Tv, n_coarse, n_coarse)
+        copyto!(coarse_dev, coarse_cpu)
+        coarse_dense, coarse_factor = _build_coarse_lu(coarse_dev)
+        coarse_x = similar(coarse_dense, Tv, n_coarse)
+        fill!(coarse_x, zero(Tv))
+        coarse_b = similar(coarse_dense, Tv, n_coarse)
+        fill!(coarse_b, zero(Tv))
         solve_r = _allocate_vector(A_csr, Tv, n_finest)
     else
+        coarse_dense = Matrix{Tv}(undef, n_coarse, n_coarse)
+        A_cpu = csr_to_cpu(A_current)
+        _csr_to_dense!(coarse_dense, A_cpu)
+        coarse_factor = lu(coarse_dense)
+        coarse_x = Vector{Tv}(undef, n_coarse)
+        coarse_b = Vector{Tv}(undef, n_coarse)
         solve_r = Vector{Tv}(undef, n_finest)
     end
     hierarchy = AMGHierarchy{Tv, Ti}(levels, coarse_dense,
@@ -368,8 +381,8 @@ _smoother_name(::ILU0Smoother) = "ILU(0)"
 
 Convert a CSRMatrix to a dense matrix using a KA kernel.
 """
-function _csr_to_dense!(M::Matrix{Tv}, A::CSRMatrix{Tv};
-                        backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv}
+function _csr_to_dense!(M::AbstractMatrix{Tv}, A::CSRMatrix{Tv};
+                        backend=_get_backend(nonzeros(A)), block_size::Int=64) where {Tv}
     fill!(M, zero(Tv))
     n = size(A, 1)
     cv = colvals(A)
@@ -388,5 +401,23 @@ end
             j = colval[nz]
             M[i, j] = nzval[nz]
         end
+    end
+end
+
+"""
+    _build_coarse_lu(M::AbstractMatrix{Tv}) -> (dense_matrix, factorization)
+
+Build an LU factorization of the dense coarse matrix `M`.
+For GPU arrays that support `lu()` (e.g., CuArray), the factorization stays on device.
+For GPU arrays without native `lu()` support, falls back to CPU.
+Returns a tuple of (dense_matrix, factorization) where both are on the same device.
+"""
+function _build_coarse_lu(M::AbstractMatrix{Tv}) where {Tv}
+    try
+        return M, lu(M)
+    catch
+        # Fall back to CPU if the GPU backend doesn't support lu()
+        M_cpu = Matrix{Tv}(M)
+        return M_cpu, lu(M_cpu)
     end
 end

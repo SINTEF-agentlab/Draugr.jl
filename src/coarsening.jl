@@ -440,7 +440,6 @@ function _rs_first_pass!(A::CSRMatrix{Tv, Ti}, is_strong::AbstractVector{Bool};
     bucket_prev = zeros(Int, n)
     @inbounds for i in 1:n
         cf[i] != 0 && continue
-        k = λ[i] + 1
         if λ[i] == 0
             # Zero measure → mark with f_pnt (Z_PT for HMIS, F_PT for RS)
             cf[i] = f_pnt
@@ -452,6 +451,7 @@ function _rs_first_pass!(A::CSRMatrix{Tv, Ti}, is_strong::AbstractVector{Bool};
                 end
             end
         else
+            k = λ[i] + 1
             old_head = bucket_head[k]
             bucket_head[k] = i
             bucket_next[i] = old_head
@@ -462,7 +462,8 @@ function _rs_first_pass!(A::CSRMatrix{Tv, Ti}, is_strong::AbstractVector{Bool};
         end
     end
 
-    # Rebuild buckets since λ values may have been incremented
+    # Rebuild buckets: the λ increments above may have changed values for nodes
+    # that were already inserted into buckets at their old λ positions.
     fill!(bucket_head, 0)
     fill!(bucket_next, 0)
     fill!(bucket_prev, 0)
@@ -473,8 +474,8 @@ function _rs_first_pass!(A::CSRMatrix{Tv, Ti}, is_strong::AbstractVector{Bool};
     end
     if max_λ_val + 1 > length(bucket_head)
         resize!(bucket_head, max_λ_val + 1)
+        fill!(bucket_head, 0)
     end
-    fill!(bucket_head, 0)
     @inbounds for i in 1:n
         cf[i] != 0 && continue
         k = λ[i] + 1

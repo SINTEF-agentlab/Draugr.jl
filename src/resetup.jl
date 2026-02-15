@@ -66,13 +66,18 @@ end
 Recompute the coarsest dense matrix from the last AMG level in-place,
 writing directly into `hierarchy.coarse_A`. Avoids allocating a temporary
 coarse CSR matrix. Modifies `hierarchy.coarse_A` as a side effect.
+
+For GPU hierarchies, the Galerkin product is computed on CPU (requires scalar
+indexing) and then copied back to the device dense matrix.
 """
 function _recompute_coarsest_dense!(hierarchy::AMGHierarchy{Tv, Ti},
                                     level::AMGLevel{Tv, Ti};
                                     backend=DEFAULT_BACKEND) where {Tv, Ti}
     M = hierarchy.coarse_A
-    fill!(M, zero(Tv))
-    # Convert to CPU for scalar indexing (dense matrix is always CPU)
+    n_coarse = size(M, 1)
+    # Always compute on CPU (Galerkin product requires scalar indexing)
+    M_cpu = Matrix{Tv}(undef, n_coarse, n_coarse)
+    fill!(M_cpu, zero(Tv))
     A_cpu = csr_to_cpu(level.A)
     n_fine = size(A_cpu, 1)
     cv_a = colvals(A_cpu)
@@ -92,11 +97,13 @@ function _recompute_coarsest_dense!(hierarchy::AMGHierarchy{Tv, Ti},
                 for pnz_j in P_rowptr[j]:(P_rowptr[j+1]-1)
                     J = P_colval[pnz_j]
                     p_j = P_nzval[pnz_j]
-                    M[I, J] += p_i * a_ij * p_j
+                    M_cpu[I, J] += p_i * a_ij * p_j
                 end
             end
         end
     end
+    # Copy back to device (no-op for CPU matrices)
+    copyto!(M, M_cpu)
     return M
 end
 
@@ -104,10 +111,19 @@ end
     _update_coarse_solver!(hierarchy, A; backend=DEFAULT_BACKEND)
 
 Update the direct solver at the coarsest level using high-level lu().
+Handles cross-device scenarios where coarse_A may be CPU while A is on GPU.
 """
 function _update_coarse_solver!(hierarchy::AMGHierarchy{Tv}, A::CSRMatrix{Tv};
                                 backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv}
-    _csr_to_dense!(hierarchy.coarse_A, A; backend=backend, block_size=block_size)
+    M = hierarchy.coarse_A
+    if M isa Matrix
+        # Coarse system is on CPU — convert CSR to CPU for _csr_to_dense!
+        A_cpu = csr_to_cpu(A)
+        _csr_to_dense!(M, A_cpu; block_size=block_size)
+    else
+        # Coarse system is on device — use device CSR directly
+        _csr_to_dense!(M, A; backend=backend, block_size=block_size)
+    end
     hierarchy.coarse_factor = lu(hierarchy.coarse_A)
     return hierarchy
 end

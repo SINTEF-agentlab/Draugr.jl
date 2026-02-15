@@ -2,7 +2,7 @@ module ParallelAMGMetalExt
 
 using ParallelAMG
 using Metal
-using KernelAbstractions
+using KernelAbstractions, LinearAlgebra
 
 """
     amg_setup(A::CSRMatrix{Tv, Ti, <:MtlVector, <:MtlVector, <:MtlVector}, config; backend, block_size) -> AMGHierarchy

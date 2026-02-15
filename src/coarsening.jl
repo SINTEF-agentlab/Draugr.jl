@@ -337,16 +337,9 @@ function coarsen_hmis(A_in::CSRMatrix{Tv, Ti}, θ::Real;
     A = csr_to_cpu(A_in)
     cv = colvals(A)
     is_strong_sym = _symmetrize_strength(A, is_strong)
-    # Column-based measure on the symmetric graph
-    st_count = zeros(Int, n)
-    @inbounds for i in 1:n
-        for nz in nzrange(A, i)
-            j = cv[nz]
-            if j != i && is_strong_sym[nz]
-                st_count[j] += 1
-            end
-        end
-    end
+    # Column-based measure on the full (unsymmetrized) strength graph,
+    # matching hypre's HMIS which uses S^T counts for the measure.
+    st_count = _compute_strong_transpose_count(A, is_strong)
     measure = zeros(Float64, n)
     @inbounds for i in 1:n
         measure[i] = Float64(st_count[i]) + rand(rng)
@@ -400,9 +393,11 @@ function coarsen_hmis(A_in::CSRMatrix{Tv, Ti}, θ::Real;
         end
         @inbounds for i in 1:n
             cf[i] != 0 && continue
+            # Use the full (unsymmetrized) strength graph for fine marking:
+            # a node becomes fine if any strong neighbor is coarse, matching hypre.
             for nz in nzrange(A, i)
                 j = cv[nz]
-                if is_strong_sym[nz] && cf[j] == 1
+                if is_strong[nz] && cf[j] == 1
                     cf[i] = -1
                     break
                 end

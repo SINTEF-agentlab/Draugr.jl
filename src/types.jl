@@ -434,7 +434,8 @@ function AMGConfig(;
     max_row_sum::Float64 = 0.0,
     cycle_type::Symbol = :V,
     strength_type::StrengthType = AbsoluteStrength(),
-    # Deprecated: accepted but ignored for backward compatibility
+    # Deprecated: accepted for backward compatibility but not stored in config.
+    # block_size is passed through to `amg_setup` and stored in the hierarchy.
     block_size::Int = 64,
     min_coarse_ratio::Float64 = 0.5,
     max_stall_levels::Int = 2,

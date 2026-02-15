@@ -25,11 +25,11 @@ Base.size(A::CSRMatrix) = (A.nrow, A.ncol)
 Base.size(A::CSRMatrix, d::Int) = d == 1 ? A.nrow : (d == 2 ? A.ncol : 1)
 SparseArrays.nnz(A::CSRMatrix) = length(A.nzval)
 SparseArrays.nonzeros(A::CSRMatrix) = A.nzval
-SparseArrays.nzrange(A::CSRMatrix, row::Integer) = A.rowptr[row]:(A.rowptr[row+1]-1)
+SparseArrays.nzrange(A::CSRMatrix, row::Integer) = A.rowptr[row]:(A.rowptr[row+1]-one(eltype(A.rowptr)))
 
 function Base.getindex(A::CSRMatrix{Tv}, i::Integer, j::Integer) where Tv
     @boundscheck (1 <= i <= A.nrow && 1 <= j <= A.ncol) || throw(BoundsError(A, (i, j)))
-    for nz in A.rowptr[i]:(A.rowptr[i+1]-1)
+    for nz in nzrange(A, i)
         @inbounds A.colval[nz] == j && return A.nzval[nz]
     end
     return zero(Tv)

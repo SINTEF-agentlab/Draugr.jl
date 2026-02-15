@@ -395,7 +395,7 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
         for (k, a_ik) in strong_fine
             # Find coarse connections of fine point k
             # hypre formula: distribute = a_{i,k} / sum where
-            # sum = Σ a_{k,m} for m in C_i (strong coarse of i) with opposite sign to a_{k,k}
+            # sum = Σ a_{k,m} for m in (C_i ∪ {i}) with opposite sign to a_{k,k}
             diag_k = zero(Tv)
             for nz2 in nzrange(A, k)
                 if cv[nz2] == k

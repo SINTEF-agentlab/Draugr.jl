@@ -470,6 +470,8 @@ column-weight measure) and second pass (ensuring every F-point has interpolation
 from C-points through strong connections).
 
 This produces reliable coarsening ratios and is the classical AMG standard.
+Uses a precomputed transpose graph and bucket sorting for O(nnz) complexity
+instead of the naive O(n²) greedy scan.
 """
 function coarsen_rs(A_in::CSRMatrix{Tv, Ti}, θ::Real;
                     rng=Random.default_rng(),
@@ -485,6 +487,10 @@ function coarsen_rs(A_in::CSRMatrix{Tv, Ti}, θ::Real;
     cv = colvals(A)
     # Compute λ_i = number of points that strongly depend on i (transpose measure)
     λ = _compute_strong_transpose_count(A, is_strong)
+    # Precompute transpose adjacency: for each node j, which nodes i strongly
+    # depend on j (i.e., is_strong[nz] where cv[nz]==j in row i).
+    # This avoids the O(n) scan per greedy step.
+    st_offsets, st_sources = _build_strong_transpose_adj(A, is_strong)
     # CF splitting
     cf = zeros(Int, n)  # 0 = undecided, 1 = C, -1 = F
     # Mark isolated nodes immediately
@@ -501,46 +507,103 @@ function coarsen_rs(A_in::CSRMatrix{Tv, Ti}, θ::Real;
             cf[i] = 1  # isolated → coarse
         end
     end
-    # First pass: greedy selection
-    # Pick the undecided node with largest λ, make it C, make its strong
-    # dependents F, and update λ for affected nodes.
-    while true
-        # Find undecided node with maximum λ
-        best_i = 0
-        best_λ = -1
-        @inbounds for i in 1:n
-            if cf[i] == 0 && λ[i] > best_λ
-                best_λ = λ[i]
-                best_i = i
+    # First pass: greedy selection with bucket sorting for O(nnz) complexity.
+    # Maintain a set of linked-list buckets indexed by λ value. Each step
+    # picks from the highest non-empty bucket.
+    max_λ_val = maximum(λ; init=0)
+    # Build bucket structure: bucket_head[k+1] = first node with λ==k
+    # (shift by 1 so λ==0 maps to index 1)
+    bucket_head = fill(0, max_λ_val + 1)
+    bucket_next = zeros(Int, n)
+    bucket_prev = zeros(Int, n)
+    @inbounds for i in 1:n
+        cf[i] != 0 && continue
+        k = λ[i] + 1
+        old_head = bucket_head[k]
+        bucket_head[k] = i
+        bucket_next[i] = old_head
+        bucket_prev[i] = 0
+        if old_head != 0
+            bucket_prev[old_head] = i
+        end
+    end
+    top_bucket = max_λ_val
+    # Helper: remove node i from its bucket
+    @inline function _bucket_remove!(i)
+        @inbounds begin
+            k = λ[i] + 1
+            p = bucket_prev[i]
+            nx = bucket_next[i]
+            if p != 0
+                bucket_next[p] = nx
+            else
+                bucket_head[k] = nx
+            end
+            if nx != 0
+                bucket_prev[nx] = p
+            end
+            bucket_next[i] = 0
+            bucket_prev[i] = 0
+        end
+    end
+    # Helper: move node i to new bucket for updated λ value
+    @inline function _bucket_update!(i, new_λ)
+        @inbounds begin
+            _bucket_remove!(i)
+            λ[i] = new_λ
+            k = new_λ + 1
+            old_len = length(bucket_head)
+            if k > old_len
+                resize!(bucket_head, k)
+                for idx in (old_len + 1):k
+                    bucket_head[idx] = 0
+                end
+            end
+            old_head = bucket_head[k]
+            bucket_head[k] = i
+            bucket_next[i] = old_head
+            bucket_prev[i] = 0
+            if old_head != 0
+                bucket_prev[old_head] = i
             end
         end
-        best_i == 0 && break  # all decided
-        # Make best_i coarse
+    end
+    while true
+        # Find highest non-empty bucket
+        while top_bucket >= 0 && bucket_head[top_bucket + 1] == 0
+            top_bucket -= 1
+        end
+        top_bucket < 0 && break
+        best_i = bucket_head[top_bucket + 1]
+        best_i == 0 && break
+        # Remove best_i from bucket and make it coarse
+        _bucket_remove!(best_i)
         cf[best_i] = 1
         # For each undecided node j that strongly depends on best_i, make j fine
-        @inbounds for j in 1:n
+        @inbounds for idx in st_offsets[best_i]:(st_offsets[best_i + 1] - 1)
+            j = st_sources[idx]
             cf[j] != 0 && continue
-            # Check if j→best_i is a strong connection
-            for nz in nzrange(A, j)
-                if cv[nz] == best_i && is_strong[nz]
-                    cf[j] = -1  # j becomes fine
-                    # Increment λ for undecided nodes that j depends on
-                    # (they gain influence because j is now F)
-                    for nz2 in nzrange(A, j)
-                        k = cv[nz2]
-                        if k != j && is_strong[nz2] && cf[k] == 0
-                            λ[k] += 1
-                        end
+            _bucket_remove!(j)
+            cf[j] = -1  # j becomes fine
+            # Increment λ for undecided nodes that j strongly depends on
+            # (they gain influence because j is now F)
+            for nz2 in nzrange(A, j)
+                k = cv[nz2]
+                if k != j && is_strong[nz2] && cf[k] == 0
+                    new_val = λ[k] + 1
+                    _bucket_update!(k, new_val)
+                    if new_val > top_bucket
+                        top_bucket = new_val
                     end
-                    break
                 end
             end
         end
-        # Decrement λ for nodes that best_i depends on (they lose influence)
+        # Decrement λ for nodes that best_i strongly depends on
         @inbounds for nz in nzrange(A, best_i)
             j = cv[nz]
             if j != best_i && is_strong[nz] && cf[j] == 0
-                λ[j] = max(0, λ[j] - 1)
+                new_val = max(0, λ[j] - 1)
+                _bucket_update!(j, new_val)
             end
         end
     end
@@ -556,6 +619,48 @@ function coarsen_rs(A_in::CSRMatrix{Tv, Ti}, θ::Real;
         end
     end
     return cf, coarse_map, n_coarse
+end
+
+"""
+    _build_strong_transpose_adj(A, is_strong) -> (offsets, sources)
+
+Build the transpose adjacency list for strong connections. For each node j,
+`sources[offsets[j]:(offsets[j+1]-1)]` gives the list of nodes i such that
+row i has a strong connection to column j (i.e., i strongly depends on j).
+"""
+function _build_strong_transpose_adj(A::CSRMatrix{Tv, Ti}, is_strong::AbstractVector{Bool}) where {Tv, Ti}
+    n = size(A, 1)
+    cv = colvals(A)
+    # Count: how many nodes strongly depend on each j
+    counts = zeros(Int, n)
+    @inbounds for i in 1:n
+        for nz in nzrange(A, i)
+            j = cv[nz]
+            if j != i && is_strong[nz]
+                counts[j] += 1
+            end
+        end
+    end
+    # Build offsets (CSR-style)
+    offsets = Vector{Int}(undef, n + 1)
+    offsets[1] = 1
+    @inbounds for j in 1:n
+        offsets[j + 1] = offsets[j] + counts[j]
+    end
+    total = offsets[n + 1] - 1
+    sources = Vector{Int}(undef, total)
+    # Fill sources
+    pos = copy(offsets[1:n])
+    @inbounds for i in 1:n
+        for nz in nzrange(A, i)
+            j = cv[nz]
+            if j != i && is_strong[nz]
+                sources[pos[j]] = i
+                pos[j] += 1
+            end
+        end
+    end
+    return offsets, sources
 end
 
 """

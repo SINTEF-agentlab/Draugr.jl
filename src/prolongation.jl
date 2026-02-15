@@ -394,23 +394,46 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
         end
         for (k, a_ik) in strong_fine
             # Find coarse connections of fine point k
+            # hypre formula: distribute = a_{i,k} / sum where
+            # sum = Σ a_{k,m} for m in (C_i ∪ {i}) with opposite sign to a_{k,k}
+            diag_k = zero(Tv)
+            for nz2 in nzrange(A, k)
+                if cv[nz2] == k
+                    diag_k = nzv[nz2]
+                    break
+                end
+            end
+            sgn = real(diag_k) < 0 ? -1 : 1
             sum_C_k = zero(Tv)
             coarse_vals_k = Dict{Int, Tv}()
             for nz2 in nzrange(A, k)
                 j2 = cv[nz2]
-                if j2 != k && cf[j2] == 1
+                j2 == k && continue
+                a_kj = nzv[nz2]
+                if cf[j2] == 1
                     cm2 = coarse_map[j2]
                     # Only distribute to coarse points in C_i
-                    if haskey(strong_coarse, cm2)
-                        coarse_vals_k[cm2] = get(coarse_vals_k, cm2, zero(Tv)) + nzv[nz2]
-                        sum_C_k += nzv[nz2]
+                    if haskey(strong_coarse, cm2) && sgn * real(a_kj) < 0
+                        coarse_vals_k[cm2] = get(coarse_vals_k, cm2, zero(Tv)) + a_kj
+                        sum_C_k += a_kj
                     end
                 end
+                # Also include connection back to i in the sum
+                if j2 == i && sgn * real(a_kj) < 0
+                    sum_C_k += a_kj
+                end
             end
-            if abs(sum_C_k) > eps(Tv)
+            if abs(sum_C_k) > eps(real(Tv))
+                distribute = a_ik / sum_C_k
                 for (cm2, a_kj) in coarse_vals_k
-                    indirect = a_ik * a_kj / sum_C_k
-                    contributions[cm2] = get(contributions, cm2, zero(Tv)) + indirect
+                    contributions[cm2] = get(contributions, cm2, zero(Tv)) + distribute * a_kj
+                end
+                # Diagonal contribution: a_{k,i} * distribute
+                for nz2 in nzrange(A, k)
+                    if cv[nz2] == i && sgn * real(nzv[nz2]) < 0
+                        d_i += distribute * nzv[nz2]
+                        break
+                    end
                 end
             else
                 # Lump into diagonal
@@ -423,11 +446,7 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
             push!(I_p, Ti(i)); push!(J_p, Ti(best_j)); push!(V_p, one(Tv))
         else
             for (cm, val) in contributions
-                w = abs(d_i) > _safe_threshold(Tv, abs(d_i)) ? -val / d_i : zero(Tv)
-                # Clamp weight magnitude to avoid explosion
-                if abs(w) > 10
-                    w *= Tv(10) / abs(w)
-                end
+                w = abs(d_i) > eps(real(Tv)) ? -val / d_i : zero(Tv)
                 push!(I_p, Ti(i)); push!(J_p, Ti(cm)); push!(V_p, w)
             end
         end
@@ -447,7 +466,7 @@ interpolation targets, resulting in a larger but more accurate interpolation ste
 """
 function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                               coarse_map::Vector{Int}, n_coarse::Int,
-                              ::ExtendedIInterpolation, θ::Real=0.25;
+                              interp::ExtendedIInterpolation, θ::Real=0.25;
                               backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
     # Compute strength on GPU if available, then convert to CPU for graph algorithms
     is_strong_raw = strength_graph(A_in, θ; backend=backend, block_size=block_size)
@@ -456,6 +475,27 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
     n_fine = size(A, 1)
     cv = colvals(A)
     nzv = nonzeros(A)
+
+    trunc_factor = interp.trunc_factor
+
+    # Build strength-based sparse matrix S for determining C-hat
+    # S_diag[i] contains strong neighbors of i (like hypre's S_diag)
+    # Build S as adjacency list: for each node, list of (neighbor, is_strong_F)
+    strong_nbrs = Vector{Vector{Int}}(undef, n_fine)
+    @inbounds for i in 1:n_fine
+        snb = Int[]
+        for nz in nzrange(A, i)
+            j = cv[nz]
+            if j != i && is_strong[nz]
+                push!(snb, j)
+            end
+        end
+        strong_nbrs[i] = snb
+    end
+
+    # P_marker tracks which coarse points are in C-hat for current row
+    P_marker = fill(-1, n_fine)
+    strong_f_marker = -2
 
     I_p = Ti[]
     J_p = Ti[]
@@ -466,88 +506,154 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
             push!(I_p, Ti(i)); push!(J_p, Ti(coarse_map[i])); push!(V_p, one(Tv))
             continue
         end
-        # Classify connections
-        a_ii = zero(Tv)
-        sum_weak = zero(Tv)
-        strong_coarse_direct = Dict{Int, Tv}()
-        strong_fine = Tuple{Int, Tv}[]
-        for nz in nzrange(A, i)
-            j = cv[nz]
-            if j == i
-                a_ii = nzv[nz]
-            elseif is_strong[nz] && cf[j] == 1
-                cm = coarse_map[j]
-                strong_coarse_direct[cm] = get(strong_coarse_direct, cm, zero(Tv)) + nzv[nz]
-            elseif is_strong[nz] && cf[j] == -1
-                push!(strong_fine, (j, nzv[nz]))
-            else
-                sum_weak += nzv[nz]
-            end
-        end
-        d_i = a_ii + sum_weak
-        # Extended set: include distance-2 coarse points through strong fine neighbors
-        extended_coarse = Dict{Int, Tv}()
-        for (cm, val) in strong_coarse_direct
-            extended_coarse[cm] = val
-        end
-        for (k, a_ik) in strong_fine
-            # Add coarse connections of fine point k (distance-2 coarse)
-            sum_C_k = zero(Tv)
-            coarse_vals_k = Dict{Int, Tv}()
-            for nz2 in nzrange(A, k)
-                j2 = cv[nz2]
-                if j2 != k && cf[j2] == 1
-                    cm2 = coarse_map[j2]
-                    coarse_vals_k[cm2] = get(coarse_vals_k, cm2, zero(Tv)) + nzv[nz2]
-                    sum_C_k += nzv[nz2]
+
+        # ── Phase 1: Determine C-hat (extended coarse interpolation set) ──
+        # C-hat = strong C neighbors of i ∪ strong C neighbors of strong F neighbors of i
+        # Also mark strong F neighbors with strong_f_marker
+        chat_indices = Int[]  # indices into P arrays for C-hat points
+
+        for j in strong_nbrs[i]
+            if cf[j] == 1
+                # j is a strong C neighbor of i
+                if P_marker[j] < 0
+                    P_marker[j] = length(chat_indices)
+                    push!(chat_indices, j)
                 end
-            end
-            if abs(sum_C_k) > eps(Tv)
-                for (cm2, a_kj) in coarse_vals_k
-                    indirect = a_ik * a_kj / sum_C_k
-                    extended_coarse[cm2] = get(extended_coarse, cm2, zero(Tv)) + indirect
-                end
-            else
-                d_i += a_ik
-            end
-        end
-        if isempty(extended_coarse)
-            best_j = _find_nearest_coarse(A, i, cf, coarse_map)
-            push!(I_p, Ti(i)); push!(J_p, Ti(best_j)); push!(V_p, one(Tv))
-        else
-            # Compute raw weights, then truncate and normalize to avoid instability
-            raw_weights = Dict{Int, Tv}()
-            for (cm, val) in extended_coarse
-                w = abs(d_i) > _safe_threshold(Tv, abs(d_i)) ? -val / d_i : zero(Tv)
-                # Clamp weight magnitude to avoid explosion
-                if abs(w) > 10
-                    w *= Tv(10) / abs(w)
-                end
-                raw_weights[cm] = w
-            end
-            # Truncation: drop entries with |w| < 0.1 * max|w| and redistribute
-            max_w = maximum(abs, values(raw_weights))
-            trunc_threshold = Tv(0.1) * max_w
-            trunc_count = 0
-            for (cm, w) in raw_weights
-                if abs(w) >= trunc_threshold
-                    push!(I_p, Ti(i)); push!(J_p, Ti(cm)); push!(V_p, w)
-                    trunc_count += 1
-                end
-            end
-            # If everything was truncated, keep the largest
-            if trunc_count == 0
-                best_cm = first(keys(raw_weights))
-                best_w = zero(real(Tv))
-                for (cm, w) in raw_weights
-                    if abs(w) > best_w
-                        best_w = abs(w)
-                        best_cm = cm
+            elseif cf[j] == -1
+                # j is a strong F neighbor of i — mark it and add its C neighbors
+                P_marker[j] = strong_f_marker
+                for k in strong_nbrs[j]
+                    if cf[k] == 1 && P_marker[k] < 0
+                        P_marker[k] = length(chat_indices)
+                        push!(chat_indices, k)
                     end
                 end
-                push!(I_p, Ti(i)); push!(J_p, Ti(best_cm)); push!(V_p, raw_weights[best_cm])
             end
         end
+
+        n_chat = length(chat_indices)
+        if n_chat == 0
+            # No C-hat: fallback to nearest coarse point
+            best_j = _find_nearest_coarse(A, i, cf, coarse_map)
+            push!(I_p, Ti(i)); push!(J_p, Ti(best_j)); push!(V_p, one(Tv))
+            # Reset markers
+            for j in strong_nbrs[i]
+                P_marker[j] = -1
+                if cf[j] == -1
+                    for k in strong_nbrs[j]
+                        P_marker[k] = -1
+                    end
+                end
+            end
+            strong_f_marker -= 1
+            continue
+        end
+
+        # ── Phase 2: Compute weights (matching hypre's ExtPI formula) ──
+        # Initialize P_data for C-hat points to zero, and diagonal
+        P_data = zeros(Tv, n_chat)
+        diagonal = zero(Tv)
+
+        for nz in nzrange(A, i)
+            j = cv[nz]
+            a_ij = nzv[nz]
+
+            if j == i
+                diagonal += a_ij
+                continue
+            end
+
+            p_idx = P_marker[j]
+            if p_idx >= 0
+                # j is a C-point in C-hat: accumulate a_{i,j}
+                P_data[p_idx + 1] += a_ij
+            elseif p_idx == strong_f_marker
+                # j is a strong F-neighbor: distribute through row of A[j,:]
+                # Compute sum = Σ a_{j,m} for m in (C-hat ∪ {i}) with sgn*a_{j,m} < 0
+                diag_j = zero(Tv)
+                for nz3 in nzrange(A, j)
+                    if cv[nz3] == j
+                        diag_j = nzv[nz3]
+                        break
+                    end
+                end
+                sgn = real(diag_j) < 0 ? -1 : 1
+
+                sum_val = zero(Tv)
+                for nz2 in nzrange(A, j)
+                    m = cv[nz2]
+                    m == j && continue
+                    a_jm = nzv[nz2]
+                    if sgn * real(a_jm) < 0
+                        if P_marker[m] >= 0 || m == i
+                            sum_val += a_jm
+                        end
+                    end
+                end
+
+                if abs(sum_val) > eps(real(Tv))
+                    distribute = a_ij / sum_val
+                    for nz2 in nzrange(A, j)
+                        m = cv[nz2]
+                        m == j && continue
+                        a_jm = nzv[nz2]
+                        if sgn * real(a_jm) < 0
+                            p_idx_m = P_marker[m]
+                            if p_idx_m >= 0
+                                P_data[p_idx_m + 1] += distribute * a_jm
+                            elseif m == i
+                                diagonal += distribute * a_jm
+                            end
+                        end
+                    end
+                else
+                    # Can't distribute: lump into diagonal
+                    diagonal += a_ij
+                end
+            else
+                # Weak connection or non-C-hat C-point: lump into diagonal
+                diagonal += a_ij
+            end
+        end
+
+        # ── Phase 3: Finalize weights: P[j] = P_data[j] / (-diagonal) ──
+        if abs(diagonal) > eps(real(Tv))
+            for idx in 1:n_chat
+                P_data[idx] /= -diagonal
+            end
+        end
+
+        # ── Phase 4: Truncation (matching hypre's trunc_factor) ──
+        if trunc_factor > 0 && n_chat > 0
+            max_w = zero(real(Tv))
+            for idx in 1:n_chat
+                max_w = max(max_w, abs(P_data[idx]))
+            end
+            threshold = trunc_factor * max_w
+            for idx in 1:n_chat
+                if abs(P_data[idx]) >= threshold
+                    push!(I_p, Ti(i)); push!(J_p, Ti(coarse_map[chat_indices[idx]])); push!(V_p, P_data[idx])
+                end
+            end
+        else
+            for idx in 1:n_chat
+                push!(I_p, Ti(i)); push!(J_p, Ti(coarse_map[chat_indices[idx]])); push!(V_p, P_data[idx])
+            end
+        end
+
+        # ── Reset markers ──
+        for j in chat_indices
+            P_marker[j] = -1
+        end
+        for j in strong_nbrs[i]
+            P_marker[j] = -1
+            if cf[j] == -1
+                for k in strong_nbrs[j]
+                    P_marker[k] = -1
+                end
+            end
+        end
+        strong_f_marker -= 1
     end
 
     return _coo_to_prolongation(I_p, J_p, V_p, n_fine, n_coarse)

@@ -1,3 +1,42 @@
+# ── Device conversion helpers for AMG structures ─────────────────────────────
+
+"""
+    _prolongation_to_device(ref, P) -> ProlongationOp
+
+Copy a ProlongationOp to the same device as `ref`'s arrays.
+"""
+function _prolongation_to_device(ref::CSRMatrix, P::ProlongationOp)
+    rp = _to_device(ref, P.rowptr)
+    cv = _to_device(ref, P.colval)
+    nzv = _to_device(ref, P.nzval)
+    return ProlongationOp(rp, cv, nzv, P.nrow, P.ncol)
+end
+
+"""
+    _transpose_map_to_device(ref, Pt_map) -> TransposeMap
+
+Copy a TransposeMap to the same device as `ref`'s arrays.
+"""
+function _transpose_map_to_device(ref::CSRMatrix, Pt_map::TransposeMap)
+    offsets = _to_device(ref, Pt_map.offsets)
+    fine_rows = _to_device(ref, Pt_map.fine_rows)
+    p_nz_idx = _to_device(ref, Pt_map.p_nz_idx)
+    return TransposeMap(offsets, fine_rows, p_nz_idx)
+end
+
+"""
+    _restriction_map_to_device(ref, r_map) -> RestrictionMap
+
+Copy a RestrictionMap to the same device as `ref`'s arrays.
+"""
+function _restriction_map_to_device(ref::CSRMatrix, r_map::RestrictionMap)
+    nz_offsets = _to_device(ref, r_map.nz_offsets)
+    triple_pi_idx = _to_device(ref, r_map.triple_pi_idx)
+    triple_anz_idx = _to_device(ref, r_map.triple_anz_idx)
+    triple_pj_idx = _to_device(ref, r_map.triple_pj_idx)
+    return RestrictionMap(nz_offsets, triple_pi_idx, triple_anz_idx, triple_pj_idx)
+end
+
 """
     amg_setup(A::StaticSparsityMatrixCSR, config; backend) -> AMGHierarchy
 
@@ -5,8 +44,8 @@ External API entry point: convert `StaticSparsityMatrixCSR` to `CSRMatrix` once
 and forward to the general CSRMatrix-based setup.
 """
 function amg_setup(A::StaticSparsityMatrixCSR{Tv, Ti}, config::AMGConfig=AMGConfig();
-                   backend=DEFAULT_BACKEND) where {Tv, Ti}
-    return amg_setup(csr_from_static(A), config; backend=backend)
+                   backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
+    return amg_setup(csr_from_static(A), config; backend=backend, block_size=block_size)
 end
 
 """
@@ -20,50 +59,85 @@ The sparsity structure computed here is reused by `amg_resetup!` when matrix
 coefficients change but the pattern remains the same.
 """
 function amg_setup(A_csr::CSRMatrix{Tv, Ti}, config::AMGConfig=AMGConfig();
-                   backend=DEFAULT_BACKEND) where {Tv, Ti}
+                   backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
     t_setup = time()
     levels = AMGLevel{Tv, Ti}[]
     A_current = A_csr
     n_finest = size(A_csr, 1)
+    # Determine if we need GPU-resident arrays: any non-CPU array type
+    # (CuArray, JLArray, MtlArray, etc.) triggers GPU-resident hierarchy
+    is_gpu = !(A_csr.nzval isa Array)
     for lvl in 1:(config.max_levels - 1)
         n = size(A_current, 1)
         n <= config.max_coarse_size && break
         # Select coarsening algorithm for this level
         coarsening_alg = _get_coarsening_for_level(config, lvl)
-        # Coarsen and build prolongation, with automatic θ reduction on stall
-        P, n_coarse = _coarsen_with_fallback(A_current, coarsening_alg, config)
+        # Coarsen and build prolongation (coarsening converts to CPU internally)
+        P, n_coarse = _coarsen_with_fallback(A_current, coarsening_alg, config; backend=backend, block_size=block_size)
         n_coarse >= n && break  # no coarsening progress
         n_coarse == 0 && break  # degenerate case
-        # Compute coarse operator via Galerkin product
-        A_coarse, r_map = compute_coarse_sparsity(A_current, P, n_coarse)
+        # Compute coarse operator via Galerkin product (CPU — inherently sequential)
+        A_cpu = csr_to_cpu(A_current)
+        A_coarse, r_map = compute_coarse_sparsity(A_cpu, P, n_coarse)
         # Build transpose map for atomic-free restriction
         Pt_map = build_transpose_map(P)
-        # Build smoother
-        smoother = build_smoother(A_current, config.smoother, config.jacobi_omega; backend=backend)
-        # Workspace
-        r = KernelAbstractions.zeros(backend, Tv, n)
-        xc = KernelAbstractions.zeros(backend, Tv, n_coarse)
-        bc = KernelAbstractions.zeros(backend, Tv, n_coarse)
-        level = AMGLevel{Tv, Ti}(A_current, P, Pt_map, r_map, smoother, r, xc, bc)
+        if is_gpu
+            # Copy level structures to GPU device so kernels can access them
+            A_dev = _csr_to_device(A_csr, A_cpu)
+            P_dev = _prolongation_to_device(A_csr, P)
+            Pt_map_dev = _transpose_map_to_device(A_csr, Pt_map)
+            r_map_dev = _restriction_map_to_device(A_csr, r_map)
+            # Build smoother on device arrays
+            smoother = build_smoother(A_dev, config.smoother, config.jacobi_omega; backend=backend, block_size=block_size)
+            # Workspace on device
+            r = _allocate_vector(A_csr, Tv, n)
+            xc = _allocate_vector(A_csr, Tv, n_coarse)
+            bc = _allocate_vector(A_csr, Tv, n_coarse)
+            level = AMGLevel{Tv, Ti}(A_dev, P_dev, Pt_map_dev, r_map_dev, smoother, r, xc, bc)
+        else
+            # CPU path: use arrays as-is
+            smoother = build_smoother(A_cpu, config.smoother, config.jacobi_omega; backend=backend, block_size=block_size)
+            r = Vector{Tv}(undef, n)
+            xc = Vector{Tv}(undef, n_coarse)
+            bc = Vector{Tv}(undef, n_coarse)
+            level = AMGLevel{Tv, Ti}(A_cpu, P, Pt_map, r_map, smoother, r, xc, bc)
+        end
         push!(levels, level)
         A_current = A_coarse
     end
-    # Set up direct solver at coarsest level with in-place LU buffer
+    # Set up direct solver at coarsest level using high-level lu()
+    # For GPU: build dense matrix on CPU (A_current may be CPU from coarsening),
+    # then copy to device so lu() dispatches to GPU (e.g., CUDA's cuSOLVER).
+    # If the GPU backend doesn't support lu(), _build_coarse_lu falls back to CPU.
     n_coarse = size(A_current, 1)
-    coarse_dense = Matrix{Tv}(undef, n_coarse, n_coarse)
-    _csr_to_dense!(coarse_dense, A_current)
-    coarse_lu = copy(coarse_dense)
-    coarse_ipiv = Vector{LinearAlgebra.BlasInt}(undef, n_coarse)
-    LinearAlgebra.LAPACK.getrf!(coarse_lu, coarse_ipiv)
-    coarse_factor = LU(coarse_lu, coarse_ipiv, 0)  # 0 = successful factorization info
-    coarse_x = KernelAbstractions.zeros(backend, Tv, n_coarse)
-    coarse_b = KernelAbstractions.zeros(backend, Tv, n_coarse)
-    # Pre-allocate residual buffer for amg_solve! at finest level size
-    solve_r = KernelAbstractions.zeros(backend, Tv, n_finest)
-    hierarchy = AMGHierarchy{Tv, Ti}(levels, coarse_dense, coarse_lu, coarse_ipiv,
-                                      coarse_factor, coarse_x, coarse_b, solve_r)
+    if is_gpu
+        # Build dense on CPU first (A_current is CPU from compute_coarse_sparsity)
+        A_cpu = csr_to_cpu(A_current)
+        coarse_cpu = Matrix{Tv}(undef, n_coarse, n_coarse)
+        _csr_to_dense!(coarse_cpu, A_cpu)
+        # Copy to device and attempt GPU LU; falls back to CPU if unsupported
+        coarse_dev = _allocate_dense_matrix(A_csr, Tv, n_coarse, n_coarse)
+        copyto!(coarse_dev, coarse_cpu)
+        coarse_dense, coarse_factor = _build_coarse_lu(coarse_dev)
+        coarse_x = similar(coarse_dense, Tv, n_coarse)
+        fill!(coarse_x, zero(Tv))
+        coarse_b = similar(coarse_dense, Tv, n_coarse)
+        fill!(coarse_b, zero(Tv))
+        solve_r = _allocate_vector(A_csr, Tv, n_finest)
+    else
+        coarse_dense = Matrix{Tv}(undef, n_coarse, n_coarse)
+        A_cpu = csr_to_cpu(A_current)
+        _csr_to_dense!(coarse_dense, A_cpu)
+        coarse_factor = lu(coarse_dense)
+        coarse_x = Vector{Tv}(undef, n_coarse)
+        coarse_b = Vector{Tv}(undef, n_coarse)
+        solve_r = Vector{Tv}(undef, n_finest)
+    end
+    hierarchy = AMGHierarchy{Tv, Ti}(levels, coarse_dense,
+                                      coarse_factor, coarse_x, coarse_b, solve_r,
+                                      backend, block_size)
     t_setup = time() - t_setup
-    if config.verbose
+    if config.verbose >= 1
         _print_hierarchy_info(hierarchy, config, n_finest, t_setup)
     end
     return hierarchy
@@ -78,16 +152,17 @@ the common case where coarser-level matrices have sparser strong connectivity
 and the original θ is too aggressive.
 """
 function _coarsen_with_fallback(A::CSRMatrix, alg::CoarseningAlgorithm,
-                                config::AMGConfig)
+                                config::AMGConfig;
+                                backend=DEFAULT_BACKEND, block_size::Int=64)
     n = size(A, 1)
-    P, n_coarse = _coarsen_and_build_P(A, alg, config)
+    P, n_coarse = _coarsen_and_build_P(A, alg, config; backend=backend, block_size=block_size)
     # If coarsening is adequate, return
     (n_coarse < 0.8 * n || n <= config.max_coarse_size) && return P, n_coarse
     # Try reducing θ
     for attempt in 1:3
         reduced_alg = _reduce_theta(alg, 0.5^attempt)
         reduced_alg === nothing && return P, n_coarse  # no θ to reduce
-        P2, nc2 = _coarsen_and_build_P(A, reduced_alg, config)
+        P2, nc2 = _coarsen_and_build_P(A, reduced_alg, config; backend=backend, block_size=block_size)
         if nc2 < n_coarse
             P, n_coarse = P2, nc2
         end
@@ -114,10 +189,11 @@ whether the algorithm uses CF-splitting or aggregation.
 When max_row_sum is configured, strength computation uses a weakened matrix.
 """
 function _coarsen_and_build_P(A::CSRMatrix, alg::CoarseningAlgorithm,
-                              config::AMGConfig=AMGConfig())
+                              config::AMGConfig=AMGConfig();
+                              backend=DEFAULT_BACKEND, block_size::Int=64)
     if uses_cf_splitting(alg)
-        cf, coarse_map, n_coarse = coarsen_cf(A, alg, config)
-        P = build_cf_prolongation(A, cf, coarse_map, n_coarse, alg.interpolation, alg.θ)
+        cf, coarse_map, n_coarse = coarsen_cf(A, alg, config; backend=backend, block_size=block_size)
+        P = build_cf_prolongation(A, cf, coarse_map, n_coarse, alg.interpolation, alg.θ; backend=backend, block_size=block_size)
         # Apply interpolation truncation if configured
         tf = _get_trunc_factor(alg.interpolation)
         if tf > 0
@@ -125,7 +201,7 @@ function _coarsen_and_build_P(A::CSRMatrix, alg::CoarseningAlgorithm,
         end
         return P, n_coarse
     else
-        agg, n_coarse = coarsen(A, alg, config)
+        agg, n_coarse = coarsen(A, alg, config; backend=backend, block_size=block_size)
         P = build_prolongation(A, agg, n_coarse)
         # Apply filtering if requested
         if _has_filtering(alg) && alg.filtering
@@ -136,8 +212,9 @@ function _coarsen_and_build_P(A::CSRMatrix, alg::CoarseningAlgorithm,
 end
 
 function _coarsen_and_build_P(A::CSRMatrix, alg::SmoothedAggregationCoarsening,
-                              config::AMGConfig=AMGConfig())
-    agg, n_coarse = coarsen(A, AggregationCoarsening(alg.θ), config)
+                              config::AMGConfig=AMGConfig();
+                              backend=DEFAULT_BACKEND, block_size::Int=64)
+    agg, n_coarse = coarsen(A, AggregationCoarsening(alg.θ), config; backend=backend, block_size=block_size)
     P_tent = build_prolongation(A, agg, n_coarse)
     # Smooth: P = (I - ω D⁻¹ A) P_tent
     P = _smooth_prolongation(A, P_tent, alg.ω)
@@ -158,18 +235,19 @@ When `base=:pmis` with no interpolation specified, falls back to aggregation-bas
 aggressive coarsening.
 """
 function _coarsen_and_build_P(A::CSRMatrix, alg::AggressiveCoarsening,
-                              config::AMGConfig=AMGConfig())
+                              config::AMGConfig=AMGConfig();
+                              backend=DEFAULT_BACKEND, block_size::Int=64)
     if alg.base == :hmis
-        cf, coarse_map, n_coarse = coarsen_aggressive_cf(A, alg.θ, :hmis; config=config)
-        P = build_cf_prolongation(A, cf, coarse_map, n_coarse, alg.interpolation, alg.θ)
+        cf, coarse_map, n_coarse = coarsen_aggressive_cf(A, alg.θ, :hmis; config=config, backend=backend, block_size=block_size)
+        P = build_cf_prolongation(A, cf, coarse_map, n_coarse, alg.interpolation, alg.θ; backend=backend, block_size=block_size)
         tf = _get_trunc_factor(alg.interpolation)
         if tf > 0
             P = _truncate_interpolation(P, tf)
         end
         return P, n_coarse
     elseif alg.base == :pmis
-        cf, coarse_map, n_coarse = coarsen_aggressive_cf(A, alg.θ, :pmis; config=config)
-        P = build_cf_prolongation(A, cf, coarse_map, n_coarse, alg.interpolation, alg.θ)
+        cf, coarse_map, n_coarse = coarsen_aggressive_cf(A, alg.θ, :pmis; config=config, backend=backend, block_size=block_size)
+        P = build_cf_prolongation(A, cf, coarse_map, n_coarse, alg.interpolation, alg.θ; backend=backend, block_size=block_size)
         tf = _get_trunc_factor(alg.interpolation)
         if tf > 0
             P = _truncate_interpolation(P, tf)
@@ -177,7 +255,7 @@ function _coarsen_and_build_P(A::CSRMatrix, alg::AggressiveCoarsening,
         return P, n_coarse
     else
         # Legacy: aggregation-based aggressive coarsening
-        agg, n_coarse = coarsen(A, alg, config)
+        agg, n_coarse = coarsen(A, alg, config; backend=backend, block_size=block_size)
         P = build_prolongation(A, agg, n_coarse)
         return P, n_coarse
     end
@@ -303,16 +381,16 @@ _smoother_name(::ILU0Smoother) = "ILU(0)"
 
 Convert a CSRMatrix to a dense matrix using a KA kernel.
 """
-function _csr_to_dense!(M::Matrix{Tv}, A::CSRMatrix{Tv};
-                        backend=DEFAULT_BACKEND) where {Tv}
+function _csr_to_dense!(M::AbstractMatrix{Tv}, A::CSRMatrix{Tv};
+                        backend=_get_backend(nonzeros(A)), block_size::Int=64) where {Tv}
     fill!(M, zero(Tv))
     n = size(A, 1)
     cv = colvals(A)
     nzv = nonzeros(A)
     rp = rowptr(A)
-    kernel! = csr_to_dense_kernel!(backend, 64)
+    kernel! = csr_to_dense_kernel!(backend, block_size)
     kernel!(M, nzv, cv, rp; ndrange=n)
-    KernelAbstractions.synchronize(backend)
+    _synchronize(backend)
     return M
 end
 
@@ -323,5 +401,23 @@ end
             j = colval[nz]
             M[i, j] = nzval[nz]
         end
+    end
+end
+
+"""
+    _build_coarse_lu(M::AbstractMatrix{Tv}) -> (dense_matrix, factorization)
+
+Build an LU factorization of the dense coarse matrix `M`.
+For GPU arrays that support `lu()` (e.g., CuArray), the factorization stays on device.
+For GPU arrays without native `lu()` support, falls back to CPU.
+Returns a tuple of (dense_matrix, factorization) where both are on the same device.
+"""
+function _build_coarse_lu(M::AbstractMatrix{Tv}) where {Tv}
+    try
+        return M, lu(M)
+    catch
+        # Fall back to CPU if the GPU backend doesn't support lu()
+        M_cpu = Matrix{Tv}(M)
+        return M_cpu, lu(M_cpu)
     end
 end

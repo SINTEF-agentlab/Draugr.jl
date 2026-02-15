@@ -5,10 +5,10 @@ Build a weighted Jacobi smoother from matrix `A` with damping `ω`.
 """
 function build_jacobi_smoother(A::CSRMatrix{Tv, Ti}, ω::Real) where {Tv, Ti}
     n = size(A, 1)
-    invdiag = Vector{Tv}(undef, n)
+    invdiag = _allocate_undef_vector(A, Tv, n)
     compute_inverse_diagonal!(invdiag, A)
-    tmp = zeros(Tv, n)
-    return JacobiSmoother{Tv}(invdiag, tmp, Tv(ω))
+    tmp = _allocate_vector(A, Tv, n)
+    return JacobiSmoother(invdiag, tmp, Tv(ω))
 end
 
 """
@@ -18,14 +18,14 @@ Compute inverse of diagonal entries of A using a KA kernel.
 """
 function compute_inverse_diagonal!(invdiag::AbstractVector{Tv},
                                    A::CSRMatrix{Tv, Ti};
-                                   backend=DEFAULT_BACKEND) where {Tv, Ti}
+                                   backend=_get_backend(nonzeros(A)), block_size::Int=64) where {Tv, Ti}
     n = size(A, 1)
     cv = colvals(A)
     nzv = nonzeros(A)
     rp = rowptr(A)
-    kernel! = invdiag_kernel!(backend, 64)
+    kernel! = invdiag_kernel!(backend, block_size)
     kernel!(invdiag, nzv, cv, rp; ndrange=n)
-    KernelAbstractions.synchronize(backend)
+    _synchronize(backend)
     return invdiag
 end
 
@@ -53,8 +53,8 @@ end
 Update the smoother for new matrix values (same sparsity pattern).
 """
 function update_smoother!(smoother::JacobiSmoother, A::CSRMatrix;
-                          backend=DEFAULT_BACKEND)
-    compute_inverse_diagonal!(smoother.invdiag, A; backend=backend)
+                          backend=_get_backend(nonzeros(A)), block_size::Int=64)
+    compute_inverse_diagonal!(smoother.invdiag, A; backend=backend, block_size=block_size)
     return smoother
 end
 
@@ -86,7 +86,7 @@ Uses KernelAbstractions for parallel execution. Alternates read/write buffers
 to avoid an extra copy per step; only copies back on odd step counts.
 """
 function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
-                 smoother::JacobiSmoother; steps::Int=1, backend=DEFAULT_BACKEND)
+                 smoother::JacobiSmoother; steps::Int=1, backend=DEFAULT_BACKEND, block_size::Int=64)
     n = size(A, 1)
     nzv = nonzeros(A)
     cv = colvals(A)
@@ -95,9 +95,9 @@ function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
     src = x
     dst = tmp
     for _ in 1:steps
-        kernel! = jacobi_kernel!(backend, 64)
+        kernel! = jacobi_kernel!(backend, block_size)
         kernel!(dst, src, b, nzv, cv, rp, smoother.invdiag, smoother.ω; ndrange=n)
-        KernelAbstractions.synchronize(backend)
+        _synchronize(backend)
         src, dst = dst, src
     end
     # After the loop, src holds the latest result.
@@ -147,10 +147,13 @@ end
     build_colored_gs_smoother(A)
 
 Build a parallel colored Gauss-Seidel smoother.
+Graph coloring is performed on CPU, then color_order and invdiag are
+copied to the same device as A.
 """
 function build_colored_gs_smoother(A::CSRMatrix{Tv, Ti}) where {Tv, Ti}
     n = size(A, 1)
-    colors, num_colors = greedy_coloring(A)
+    A_cpu = csr_to_cpu(A)
+    colors, num_colors = greedy_coloring(A_cpu)
     # Sort nodes by color for efficient parallel iteration
     color_counts = zeros(Int, num_colors)
     @inbounds for i in 1:n
@@ -161,22 +164,24 @@ function build_colored_gs_smoother(A::CSRMatrix{Tv, Ti}) where {Tv, Ti}
     for c in 1:num_colors
         color_offsets[c+1] = color_offsets[c] + color_counts[c]
     end
-    color_order = Vector{Ti}(undef, n)
+    color_order_cpu = Vector{Ti}(undef, n)
     pos = copy(color_offsets[1:num_colors])
     @inbounds for i in 1:n
         c = colors[i]
-        color_order[pos[c]] = Ti(i)
+        color_order_cpu[pos[c]] = Ti(i)
         pos[c] += 1
     end
-    invdiag = Vector{Tv}(undef, n)
+    invdiag = _allocate_undef_vector(A, Tv, n)
     compute_inverse_diagonal!(invdiag, A)
-    return ColoredGaussSeidelSmoother{Tv, Ti}(colors, color_offsets, color_order,
-                                               num_colors, invdiag)
+    # Copy color_order to device
+    color_order_dev = A.nzval isa Array ? color_order_cpu : _to_device(A, color_order_cpu)
+    return ColoredGaussSeidelSmoother(colors, color_offsets, color_order_dev,
+                                       num_colors, invdiag)
 end
 
 function update_smoother!(smoother::ColoredGaussSeidelSmoother, A::CSRMatrix;
-                          backend=DEFAULT_BACKEND)
-    compute_inverse_diagonal!(smoother.invdiag, A; backend=backend)
+                          backend=_get_backend(nonzeros(A)), block_size::Int=64)
+    compute_inverse_diagonal!(smoother.invdiag, A; backend=backend, block_size=block_size)
     return smoother
 end
 
@@ -202,7 +207,7 @@ end
 Apply parallel colored Gauss-Seidel smoothing.
 """
 function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
-                 smoother::ColoredGaussSeidelSmoother; steps::Int=1, backend=DEFAULT_BACKEND)
+                 smoother::ColoredGaussSeidelSmoother; steps::Int=1, backend=DEFAULT_BACKEND, block_size::Int=64)
     nzv = nonzeros(A)
     cv = colvals(A)
     rp = rowptr(A)
@@ -211,10 +216,10 @@ function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
             start = smoother.color_offsets[c]
             count = smoother.color_offsets[c+1] - start
             count == 0 && continue
-            kernel! = gs_color_kernel!(backend, 64)
+            kernel! = gs_color_kernel!(backend, block_size)
             kernel!(x, b, nzv, cv, rp, smoother.invdiag,
                     smoother.color_order, start - 1; ndrange=count)
-            KernelAbstractions.synchronize(backend)
+            _synchronize(backend)
         end
     end
     return x
@@ -233,21 +238,21 @@ This minimizes ‖e_i - m[i]*A[i,:]‖₂.
 """
 function build_spai0_smoother(A::CSRMatrix{Tv, Ti}) where {Tv, Ti}
     n = size(A, 1)
-    m_diag = Vector{Tv}(undef, n)
+    m_diag = _allocate_undef_vector(A, Tv, n)
     _compute_spai0!(m_diag, A)
-    tmp = zeros(Tv, n)
-    return SPAI0Smoother{Tv}(m_diag, tmp)
+    tmp = _allocate_vector(A, Tv, n)
+    return SPAI0Smoother(m_diag, tmp)
 end
 
 function _compute_spai0!(m_diag::AbstractVector{Tv}, A::CSRMatrix{Tv, Ti};
-                         backend=DEFAULT_BACKEND) where {Tv, Ti}
+                         backend=_get_backend(nonzeros(A)), block_size::Int=64) where {Tv, Ti}
     n = size(A, 1)
     nzv = nonzeros(A)
     cv = colvals(A)
     rp = rowptr(A)
-    kernel! = spai0_kernel!(backend, 64)
+    kernel! = spai0_kernel!(backend, block_size)
     kernel!(m_diag, nzv, cv, rp; ndrange=n)
-    KernelAbstractions.synchronize(backend)
+    _synchronize(backend)
     return m_diag
 end
 
@@ -268,8 +273,8 @@ end
 end
 
 function update_smoother!(smoother::SPAI0Smoother, A::CSRMatrix;
-                          backend=DEFAULT_BACKEND)
-    _compute_spai0!(smoother.m_diag, A; backend=backend)
+                          backend=_get_backend(nonzeros(A)), block_size::Int=64)
+    _compute_spai0!(smoother.m_diag, A; backend=backend, block_size=block_size)
     return smoother
 end
 
@@ -293,7 +298,7 @@ end
 Apply SPAI(0) smoothing iterations. Alternates buffers to avoid extra copies.
 """
 function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
-                 smoother::SPAI0Smoother; steps::Int=1, backend=DEFAULT_BACKEND)
+                 smoother::SPAI0Smoother; steps::Int=1, backend=DEFAULT_BACKEND, block_size::Int=64)
     n = size(A, 1)
     nzv = nonzeros(A)
     cv = colvals(A)
@@ -302,9 +307,9 @@ function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
     src = x
     dst = tmp
     for _ in 1:steps
-        kernel! = spai0_smooth_kernel!(backend, 64)
+        kernel! = spai0_smooth_kernel!(backend, block_size)
         kernel!(dst, src, b, nzv, cv, rp, smoother.m_diag; ndrange=n)
-        KernelAbstractions.synchronize(backend)
+        _synchronize(backend)
         src, dst = dst, src
     end
     if isodd(steps)
@@ -327,10 +332,13 @@ This is stored in the same CSR pattern as A but with modified values.
 """
 function build_spai1_smoother(A::CSRMatrix{Tv, Ti}) where {Tv, Ti}
     n = size(A, 1)
+    A_cpu = csr_to_cpu(A)
     nzval_m = Vector{Tv}(undef, nnz(A))
-    _compute_spai1!(nzval_m, A)
-    tmp = zeros(Tv, n)
-    return SPAI1Smoother{Tv, Ti}(nzval_m, tmp)
+    _compute_spai1!(nzval_m, A_cpu)
+    # Copy nzval to device if needed
+    nzval_dev = A.nzval isa Array ? nzval_m : _to_device(A, nzval_m)
+    tmp = _allocate_vector(A, Tv, n)
+    return SPAI1Smoother{Tv, Ti, typeof(nzval_dev)}(nzval_dev, tmp)
 end
 
 """
@@ -419,8 +427,11 @@ function _compute_spai1!(nzval_m::Vector{Tv}, A::CSRMatrix{Tv, Ti}) where {Tv, T
 end
 
 function update_smoother!(smoother::SPAI1Smoother, A::CSRMatrix;
-                          backend=DEFAULT_BACKEND)
-    _compute_spai1!(smoother.nzval, A)
+                          backend=_get_backend(nonzeros(A)), block_size::Int=64)
+    A_cpu = csr_to_cpu(A)
+    nzval_cpu = Vector{eltype(smoother.nzval)}(undef, nnz(A))
+    _compute_spai1!(nzval_cpu, A_cpu)
+    copyto!(smoother.nzval, nzval_cpu)
     return smoother
 end
 
@@ -464,7 +475,7 @@ Apply SPAI(1) smoothing: x <- x + M*(b - A*x) where M ≈ A⁻¹.
 Two-pass: first compute residual into tmp, then apply M.
 """
 function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
-                 smoother::SPAI1Smoother; steps::Int=1, backend=DEFAULT_BACKEND)
+                 smoother::SPAI1Smoother; steps::Int=1, backend=DEFAULT_BACKEND, block_size::Int=64)
     n = size(A, 1)
     nzv = nonzeros(A)
     cv = colvals(A)
@@ -472,13 +483,13 @@ function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
     tmp = smoother.tmp
     for _ in 1:steps
         # Pass 1: compute residual r = b - A*x into tmp
-        kernel1! = spai1_smooth_kernel!(backend, 64)
+        kernel1! = spai1_smooth_kernel!(backend, block_size)
         kernel1!(tmp, x, b, nzv, cv, rp, smoother.nzval; ndrange=n)
-        KernelAbstractions.synchronize(backend)
+        _synchronize(backend)
         # Pass 2: x += M * r
-        kernel2! = spai1_apply_kernel!(backend, 64)
+        kernel2! = spai1_apply_kernel!(backend, block_size)
         kernel2!(x, tmp, smoother.nzval, cv, rp; ndrange=n)
-        KernelAbstractions.synchronize(backend)
+        _synchronize(backend)
     end
     return x
 end
@@ -487,19 +498,19 @@ end
 # Smoother dispatch based on SmootherType config
 # ══════════════════════════════════════════════════════════════════════════════
 
-function build_smoother(A::CSRMatrix, ::JacobiSmootherType, ω::Real; backend=DEFAULT_BACKEND)
+function build_smoother(A::CSRMatrix, ::JacobiSmootherType, ω::Real; backend=DEFAULT_BACKEND, block_size::Int=64)
     return build_jacobi_smoother(A, ω)
 end
 
-function build_smoother(A::CSRMatrix, ::ColoredGaussSeidelType, ω::Real; backend=DEFAULT_BACKEND)
+function build_smoother(A::CSRMatrix, ::ColoredGaussSeidelType, ω::Real; backend=DEFAULT_BACKEND, block_size::Int=64)
     return build_colored_gs_smoother(A)
 end
 
-function build_smoother(A::CSRMatrix, ::SPAI0SmootherType, ω::Real; backend=DEFAULT_BACKEND)
+function build_smoother(A::CSRMatrix, ::SPAI0SmootherType, ω::Real; backend=DEFAULT_BACKEND, block_size::Int=64)
     return build_spai0_smoother(A)
 end
 
-function build_smoother(A::CSRMatrix, ::SPAI1SmootherType, ω::Real; backend=DEFAULT_BACKEND)
+function build_smoother(A::CSRMatrix, ::SPAI1SmootherType, ω::Real; backend=DEFAULT_BACKEND, block_size::Int=64)
     return build_spai1_smoother(A)
 end
 
@@ -518,22 +529,22 @@ near-zero diagonals, or wrong-sign off-diagonals.
 """
 function build_l1jacobi_smoother(A::CSRMatrix{Tv, Ti}, ω::Real) where {Tv, Ti}
     n = size(A, 1)
-    invdiag = Vector{Tv}(undef, n)
+    invdiag = _allocate_undef_vector(A, Tv, n)
     _compute_l1_invdiag!(invdiag, A)
-    tmp = zeros(Tv, n)
-    return L1JacobiSmoother{Tv}(invdiag, tmp, Tv(ω))
+    tmp = _allocate_vector(A, Tv, n)
+    return L1JacobiSmoother(invdiag, tmp, Tv(ω))
 end
 
 function _compute_l1_invdiag!(invdiag::AbstractVector{Tv},
                                A::CSRMatrix{Tv, Ti};
-                               backend=DEFAULT_BACKEND) where {Tv, Ti}
+                               backend=_get_backend(nonzeros(A)), block_size::Int=64) where {Tv, Ti}
     n = size(A, 1)
     nzv = nonzeros(A)
     cv = colvals(A)
     rp = rowptr(A)
-    kernel! = l1_invdiag_kernel!(backend, 64)
+    kernel! = l1_invdiag_kernel!(backend, block_size)
     kernel!(invdiag, nzv, cv, rp; ndrange=n)
-    KernelAbstractions.synchronize(backend)
+    _synchronize(backend)
     return invdiag
 end
 
@@ -550,13 +561,13 @@ end
 end
 
 function update_smoother!(smoother::L1JacobiSmoother, A::CSRMatrix;
-                          backend=DEFAULT_BACKEND)
-    _compute_l1_invdiag!(smoother.invdiag, A; backend=backend)
+                          backend=_get_backend(nonzeros(A)), block_size::Int=64)
+    _compute_l1_invdiag!(smoother.invdiag, A; backend=backend, block_size=block_size)
     return smoother
 end
 
 function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
-                 smoother::L1JacobiSmoother; steps::Int=1, backend=DEFAULT_BACKEND)
+                 smoother::L1JacobiSmoother; steps::Int=1, backend=DEFAULT_BACKEND, block_size::Int=64)
     n = size(A, 1)
     nzv = nonzeros(A)
     cv = colvals(A)
@@ -565,9 +576,9 @@ function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
     src = x
     dst = tmp
     for _ in 1:steps
-        kernel! = jacobi_kernel!(backend, 64)
+        kernel! = jacobi_kernel!(backend, block_size)
         kernel!(dst, src, b, nzv, cv, rp, smoother.invdiag, smoother.ω; ndrange=n)
-        KernelAbstractions.synchronize(backend)
+        _synchronize(backend)
         src, dst = dst, src
     end
     if isodd(steps)
@@ -576,7 +587,7 @@ function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
     return x
 end
 
-function build_smoother(A::CSRMatrix, ::L1JacobiSmootherType, ω::Real; backend=DEFAULT_BACKEND)
+function build_smoother(A::CSRMatrix, ::L1JacobiSmootherType, ω::Real; backend=DEFAULT_BACKEND, block_size::Int=64)
     return build_l1jacobi_smoother(A, ω)
 end
 
@@ -618,29 +629,46 @@ constructs a degree-`degree` Chebyshev iteration.
 function build_chebyshev_smoother(A::CSRMatrix{Tv, Ti};
                                   degree::Int=3) where {Tv, Ti}
     n = size(A, 1)
-    invdiag = Vector{Tv}(undef, n)
+    invdiag = _allocate_undef_vector(A, Tv, n)
     compute_inverse_diagonal!(invdiag, A)
-    ρ = _estimate_spectral_radius(A, invdiag)
+    # Spectral radius estimation uses scalar indexing and mul!, which require CPU arrays
+    invdiag_cpu = invdiag isa Array ? invdiag : Array(invdiag)
+    A_cpu = csr_to_cpu(A)
+    ρ = _estimate_spectral_radius(A_cpu, invdiag_cpu)
     # Standard Chebyshev bounds for SPD: [ρ/30, 1.1*ρ]
     λ_max = Tv(1.1) * ρ
     λ_min = λ_max / Tv(30.0)
-    tmp1 = zeros(Tv, n)
-    tmp2 = zeros(Tv, n)
-    return ChebyshevSmoother{Tv}(invdiag, tmp1, tmp2, λ_min, λ_max, degree)
+    tmp1 = _allocate_vector(A, Tv, n)
+    tmp2 = _allocate_vector(A, Tv, n)
+    return ChebyshevSmoother(invdiag, tmp1, tmp2, λ_min, λ_max, degree)
 end
 
 function update_smoother!(smoother::ChebyshevSmoother, A::CSRMatrix;
-                          backend=DEFAULT_BACKEND)
-    compute_inverse_diagonal!(smoother.invdiag, A; backend=backend)
-    ρ = _estimate_spectral_radius(A, smoother.invdiag)
+                          backend=_get_backend(nonzeros(A)), block_size::Int=64)
+    compute_inverse_diagonal!(smoother.invdiag, A; backend=backend, block_size=block_size)
+    # Spectral radius estimation requires CPU arrays
+    invdiag_cpu = smoother.invdiag isa Array ? smoother.invdiag : Array(smoother.invdiag)
+    A_cpu = csr_to_cpu(A)
+    ρ = _estimate_spectral_radius(A_cpu, invdiag_cpu)
     smoother.λ_max = eltype(smoother.invdiag)(1.1) * ρ
     smoother.λ_min = smoother.λ_max / eltype(smoother.invdiag)(30.0)
     return smoother
 end
 
-@kernel function chebyshev_apply_kernel!(x, @Const(r), @Const(invdiag), scale)
+@kernel function chebyshev_init_kernel!(d, x, @Const(invdiag), @Const(r), inv_θ)
     i = @index(Global)
-    @inbounds x[i] += scale * invdiag[i] * r[i]
+    @inbounds begin
+        d[i] = invdiag[i] * r[i] * inv_θ
+        x[i] += d[i]
+    end
+end
+
+@kernel function chebyshev_iter_kernel!(d, x, @Const(invdiag), @Const(r), scale_r, scale_d)
+    i = @index(Global)
+    @inbounds begin
+        d[i] = scale_r * invdiag[i] * r[i] + scale_d * d[i]
+        x[i] += d[i]
+    end
 end
 
 """
@@ -648,9 +676,10 @@ end
 
 Apply Chebyshev polynomial smoothing. Each step applies the full polynomial
 of the configured degree using the standard three-term recurrence.
+Uses KA kernels for GPU compatibility.
 """
 function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
-                 smoother::ChebyshevSmoother; steps::Int=1, backend=DEFAULT_BACKEND)
+                 smoother::ChebyshevSmoother; steps::Int=1, backend=DEFAULT_BACKEND, block_size::Int=64)
     n = size(A, 1)
     Tv = eltype(x)
     nzv = nonzeros(A)
@@ -664,26 +693,26 @@ function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
 
     for _ in 1:steps
         # Iteration 0: r = b - A*x, d = (1/θ) * D⁻¹ * r, x += d
-        rkernel! = residual_kernel_smoother!(backend, 64)
+        rkernel! = residual_kernel_smoother!(backend, block_size)
         rkernel!(r, b, x, nzv, cv, rp; ndrange=n)
-        KernelAbstractions.synchronize(backend)
+        _synchronize(backend)
 
-        @inbounds for i in 1:n
-            d[i] = smoother.invdiag[i] * r[i] / θ
-            x[i] += d[i]
-        end
+        init_kernel! = chebyshev_init_kernel!(backend, block_size)
+        init_kernel!(d, x, smoother.invdiag, r, Tv(1) / θ; ndrange=n)
+        _synchronize(backend)
 
         # Iterations 1..degree-1 using three-term recurrence
         σ_old = θ / δ
         for k in 1:(smoother.degree - 1)
             rkernel!(r, b, x, nzv, cv, rp; ndrange=n)
-            KernelAbstractions.synchronize(backend)
+            _synchronize(backend)
 
             σ_new = one(Tv) / (Tv(2) * θ / δ - σ_old)
-            @inbounds for i in 1:n
-                d[i] = Tv(2) * σ_new / δ * smoother.invdiag[i] * r[i] + σ_new * σ_old * d[i]
-                x[i] += d[i]
-            end
+            scale_r = Tv(2) * σ_new / δ
+            scale_d = σ_new * σ_old
+            iter_kernel! = chebyshev_iter_kernel!(backend, block_size)
+            iter_kernel!(d, x, smoother.invdiag, r, scale_r, scale_d; ndrange=n)
+            _synchronize(backend)
             σ_old = σ_new
         end
     end
@@ -703,7 +732,7 @@ end
     end
 end
 
-function build_smoother(A::CSRMatrix, ::ChebyshevSmootherType, ω::Real; backend=DEFAULT_BACKEND)
+function build_smoother(A::CSRMatrix, ::ChebyshevSmootherType, ω::Real; backend=DEFAULT_BACKEND, block_size::Int=64)
     return build_chebyshev_smoother(A)
 end
 
@@ -716,16 +745,19 @@ end
 
 Build a parallel ILU(0) smoother. Computes an incomplete LU factorization with
 the same sparsity pattern as A, using graph coloring for parallel forward/backward
-substitution.
+substitution. All factorization data is stored on CPU; GPU matrices are
+automatically converted.
 """
 function build_ilu0_smoother(A::CSRMatrix{Tv, Ti}) where {Tv, Ti}
-    n = size(A, 1)
-    cv = colvals(A)
-    nzv = nonzeros(A)
-    rp = rowptr(A)
+    A_cpu = csr_to_cpu(A)
+    n = size(A_cpu, 1)
+    cv = colvals(A_cpu)
+    nzv = nonzeros(A_cpu)
+    rp = rowptr(A_cpu)
+    ti_one = one(Ti)
 
-    # Compute coloring for parallel triangular solves
-    colors, num_colors = greedy_coloring(A)
+    # Compute coloring for parallel triangular solves (on CPU)
+    colors, num_colors = greedy_coloring(A_cpu)
     color_counts = zeros(Int, num_colors)
     @inbounds for i in 1:n
         color_counts[colors[i]] += 1
@@ -746,7 +778,7 @@ function build_ilu0_smoother(A::CSRMatrix{Tv, Ti}) where {Tv, Ti}
     # Find diagonal indices
     diag_idx = Vector{Ti}(undef, n)
     @inbounds for i in 1:n
-        for nz in rp[i]:(rp[i+1]-1)
+        for nz in rp[i]:(rp[i+ti_one]-ti_one)
             if cv[nz] == i
                 diag_idx[i] = Ti(nz)
                 break
@@ -754,14 +786,14 @@ function build_ilu0_smoother(A::CSRMatrix{Tv, Ti}) where {Tv, Ti}
         end
     end
 
-    # ILU(0) factorization
-    L_nzval = zeros(Tv, nnz(A))
+    # ILU(0) factorization (on CPU)
+    L_nzval = zeros(Tv, nnz(A_cpu))
     U_nzval = copy(nzv)
-    _ilu0_factorize!(L_nzval, U_nzval, diag_idx, A)
+    _ilu0_factorize!(L_nzval, U_nzval, diag_idx, A_cpu)
 
     tmp = zeros(Tv, n)
     return ILU0Smoother{Tv, Ti}(L_nzval, U_nzval, diag_idx, colors,
-                                 color_offsets, color_order, num_colors, tmp)
+                                 color_offsets, color_order, num_colors, tmp, A_cpu)
 end
 
 """
@@ -778,6 +810,7 @@ function _ilu0_factorize!(L_nzval::Vector{Tv}, U_nzval::Vector{Tv},
     cv = colvals(A)
     nzv = nonzeros(A)
     rp = rowptr(A)
+    ti_one = one(Ti)
 
     # Copy A values into U
     copyto!(U_nzval, nzv)
@@ -788,13 +821,13 @@ function _ilu0_factorize!(L_nzval::Vector{Tv}, U_nzval::Vector{Tv},
 
     @inbounds for i in 1:n
         # Process row i: for each k < i in row i's lower triangle
-        for nz in rp[i]:(diag_idx[i]-1)
+        for nz in rp[i]:(diag_idx[i]-ti_one)
             k = cv[nz]
             # L[i,k] = U[i,k] / U[k,k]
             u_kk = U_nzval[diag_idx[k]]
             # Use original row k's norm as reference scale for zero check
             row_k_norm = zero(real(Tv))
-            for nz_k in rp[k]:(rp[k+1]-1)
+            for nz_k in rp[k]:(rp[k+ti_one]-ti_one)
                 row_k_norm += abs(nzv[nz_k])
             end
             if abs(u_kk) < _safe_threshold(Tv, row_k_norm)
@@ -811,10 +844,10 @@ function _ilu0_factorize!(L_nzval::Vector{Tv}, U_nzval::Vector{Tv},
             U_nzval[nz] = zero(Tv)  # Clear lower triangle in U
 
             # Update row i: for each j in row k with j > k, if (i,j) exists
-            for nz_k in (diag_idx[k]+1):(rp[k+1]-1)
+            for nz_k in (diag_idx[k]+ti_one):(rp[k+ti_one]-ti_one)
                 j = cv[nz_k]
                 # Find (i,j) in row i
-                nz_ij = _find_nz_in_row(cv, rp[i], rp[i+1]-1, j)
+                nz_ij = _find_nz_in_row(cv, rp[i], rp[i+ti_one]-ti_one, j)
                 if nz_ij > 0
                     U_nzval[nz_ij] -= l_ik * U_nzval[nz_k]
                 end
@@ -823,7 +856,7 @@ function _ilu0_factorize!(L_nzval::Vector{Tv}, U_nzval::Vector{Tv},
         # Diagonal safeguard: if U[i,i] became zero or near-zero, perturb it
         u_ii = U_nzval[diag_idx[i]]
         row_norm = zero(real(Tv))
-        for nz in rp[i]:(rp[i+1]-1)
+        for nz in rp[i]:(rp[i+ti_one]-ti_one)
             row_norm += abs(nzv[nz])
         end
         safe_thresh = _safe_threshold(Tv, row_norm)
@@ -835,26 +868,28 @@ function _ilu0_factorize!(L_nzval::Vector{Tv}, U_nzval::Vector{Tv},
 end
 
 """Find column `col` in row range [start, stop] of colval array."""
-function _find_nz_in_row(cv::AbstractVector{Ti}, start::Ti, stop::Ti, col::Ti) where Ti
+function _find_nz_in_row(cv::AbstractVector{Ti}, start, stop, col) where Ti
     # Binary search since columns are sorted in CSR
-    lo, hi = Int(start), Int(stop)
+    lo, hi = Ti(start), Ti(stop)
     while lo <= hi
         mid = (lo + hi) >> 1
         @inbounds c = cv[mid]
         if c == col
-            return Ti(mid)
+            return mid
         elseif c < col
-            lo = mid + 1
+            lo = mid + one(Ti)
         else
-            hi = mid - 1
+            hi = mid - one(Ti)
         end
     end
-    return Ti(0)
+    return zero(Ti)
 end
 
 function update_smoother!(smoother::ILU0Smoother, A::CSRMatrix;
-                          backend=DEFAULT_BACKEND)
-    _ilu0_factorize!(smoother.L_nzval, smoother.U_nzval, smoother.diag_idx, A)
+                          backend=_get_backend(nonzeros(A)), block_size::Int=64)
+    A_cpu = csr_to_cpu(A)
+    copyto!(smoother.A_cpu.nzval, A_cpu.nzval)
+    _ilu0_factorize!(smoother.L_nzval, smoother.U_nzval, smoother.diag_idx, smoother.A_cpu)
     return smoother
 end
 
@@ -862,26 +897,45 @@ end
     smooth!(x, A, b, smoother::ILU0Smoother; steps=1)
 
 Apply ILU(0) smoothing: x += (LU)⁻¹ (b - Ax).
-Uses sequential forward/backward substitution for robustness.
+Uses sequential forward/backward substitution on CPU.
+For GPU arrays, copies data to CPU, applies ILU, and copies back.
 """
-function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
-                 smoother::ILU0Smoother; steps::Int=1, backend=DEFAULT_BACKEND)
+function smooth!(x::AbstractVector, A::CSRMatrix{Tv, Ti}, b::AbstractVector,
+                 smoother::ILU0Smoother; steps::Int=1, backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
     n = size(A, 1)
-    Tv = eltype(x)
-    nzv = nonzeros(A)
-    cv = colvals(A)
-    rp = rowptr(A)
-    tmp = smoother.tmp  # residual / solve workspace
+    ti_one = one(Ti)
+
+    # Use CPU arrays for sequential ILU solve
+    is_gpu = !(x isa Array)
+    if is_gpu
+        x_cpu = Array(x)
+        b_cpu = Array(b)
+        A_cpu = smoother.A_cpu
+    else
+        x_cpu = x
+        b_cpu = b
+        A_cpu = A
+    end
+
+    nzv = nonzeros(A_cpu)
+    cv = colvals(A_cpu)
+    rp = rowptr(A_cpu)
+    tmp = smoother.tmp  # always CPU
 
     for _ in 1:steps
-        # Compute residual: tmp = b - A*x
-        rkernel! = residual_kernel_smoother!(backend, 64)
-        rkernel!(tmp, b, x, nzv, cv, rp; ndrange=n)
-        KernelAbstractions.synchronize(backend)
+        # Compute residual: tmp = b - A*x (on CPU)
+        @inbounds for i in 1:n
+            Ax_i = zero(Tv)
+            for nz in rp[i]:(rp[i+ti_one]-ti_one)
+                j = cv[nz]
+                Ax_i += nzv[nz] * x_cpu[j]
+            end
+            tmp[i] = b_cpu[i] - Ax_i
+        end
 
         # Forward substitution: L * z = tmp  (z stored in tmp, natural row order)
         @inbounds for i in 1:n
-            for nz in rp[i]:(smoother.diag_idx[i]-1)
+            for nz in rp[i]:(smoother.diag_idx[i]-ti_one)
                 j = cv[nz]
                 tmp[i] -= smoother.L_nzval[nz] * tmp[j]
             end
@@ -889,7 +943,7 @@ function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
 
         # Backward substitution: U * dx = z  (dx stored in tmp, reverse row order)
         @inbounds for i in n:-1:1
-            for nz in (smoother.diag_idx[i]+1):(rp[i+1]-1)
+            for nz in (smoother.diag_idx[i]+ti_one):(rp[i+ti_one]-ti_one)
                 j = cv[nz]
                 tmp[i] -= smoother.U_nzval[nz] * tmp[j]
             end
@@ -901,13 +955,18 @@ function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
         @inbounds for i in 1:n
             v = tmp[i]
             if isfinite(v)
-                x[i] += v
+                x_cpu[i] += v
             end
         end
+    end
+
+    # Copy result back to GPU if needed
+    if is_gpu
+        copyto!(x, x_cpu)
     end
     return x
 end
 
-function build_smoother(A::CSRMatrix, ::ILU0SmootherType, ω::Real; backend=DEFAULT_BACKEND)
+function build_smoother(A::CSRMatrix, ::ILU0SmootherType, ω::Real; backend=DEFAULT_BACKEND, block_size::Int=64)
     return build_ilu0_smoother(A)
 end

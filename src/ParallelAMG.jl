@@ -50,10 +50,18 @@ include("cycle.jl")
 # Jutul preconditioner interface
 include("jutul_interface.jl")
 
+"""
+    csr_from_gpu(A)
+
+Convert a GPU sparse CSR matrix to the internal `CSRMatrix` representation.
+This is a generic function extended by GPU backend extensions (CUDA, Metal).
+"""
+function csr_from_gpu end
+
 # Public API
 export StaticSparsityMatrixCSR, static_sparsity_sparse, static_csr_from_csc
 export colvals, rowptr
-export CSRMatrix
+export CSRMatrix, csr_from_gpu, csr_to_cpu
 export AggregationCoarsening, PMISCoarsening, HMISCoarsening, AggressiveCoarsening
 export SmoothedAggregationCoarsening, RSCoarsening
 export DirectInterpolation, StandardInterpolation, ExtendedIInterpolation

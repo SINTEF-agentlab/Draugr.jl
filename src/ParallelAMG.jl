@@ -50,6 +50,9 @@ include("cycle.jl")
 # Jutul preconditioner interface
 include("jutul_interface.jl")
 
+# C-callable function interface
+include("cfunction_interface.jl")
+
 """
     csr_from_gpu(A)
 
@@ -78,5 +81,16 @@ export SPAI0SmootherType, SPAI1SmootherType
 export L1JacobiSmootherType, ChebyshevSmootherType, ILU0SmootherType
 export build_smoother, update_smoother!, smooth!
 export ParallelAMGPreconditioner
+# C-callable interface
+export CoarseningEnum, SmootherEnum, InterpolationEnum, CycleEnum, StrengthEnum
+export COARSENING_AGGREGATION, COARSENING_PMIS, COARSENING_HMIS, COARSENING_RS
+export COARSENING_AGGRESSIVE_PMIS, COARSENING_AGGRESSIVE_HMIS, COARSENING_SMOOTHED_AGGREGATION
+export SMOOTHER_JACOBI, SMOOTHER_COLORED_GS, SMOOTHER_SERIAL_GS
+export SMOOTHER_SPAI0, SMOOTHER_SPAI1, SMOOTHER_L1_JACOBI, SMOOTHER_CHEBYSHEV, SMOOTHER_ILU0
+export INTERPOLATION_DIRECT, INTERPOLATION_STANDARD, INTERPOLATION_EXTENDED_I
+export CYCLE_V, CYCLE_W
+export STRENGTH_ABSOLUTE, STRENGTH_SIGNED
+export amg_c_config_create, amg_c_setup, amg_c_resetup!, amg_c_solve!, amg_c_cycle!
+export amg_c_free!, amg_c_config_free!, amg_c_get_cfunctions
 
 end # module

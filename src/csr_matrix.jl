@@ -85,16 +85,25 @@ function _csr_to_device(ref::CSRMatrix, A_cpu::CSRMatrix)
 end
 
 """
-    csr_from_csc(A::SparseMatrixCSC) -> CSRMatrix
+    csr_from_csc(A::SparseMatrixCSC; do_collect=false) -> CSRMatrix
 
 Convert a `SparseMatrixCSC` to a `CSRMatrix` by transposing.
+
+When `do_collect` is `false` (default), the resulting `CSRMatrix` directly
+references the internal arrays of the transposed matrix without copying.
+When `do_collect` is `true`, `collect` is called to produce independent copies.
 """
-function csr_from_csc(A::SparseMatrixCSC{Tv, Ti}) where {Tv, Ti}
+function csr_from_csc(A::SparseMatrixCSC{Tv, Ti}; do_collect::Bool=false) where {Tv, Ti}
     At = sparse(A')
     rp = SparseArrays.getcolptr(At)
     cv = SparseArrays.rowvals(At)
     nzv = nonzeros(At)
-    return CSRMatrix(collect(rp), collect(cv), collect(nzv), size(A, 1), size(A, 2))
+    if do_collect
+        rp = collect(rp)
+        cv = collect(cv)
+        nzv = collect(nzv)
+    end
+    return CSRMatrix(rp, cv, nzv, size(A, 1), size(A, 2))
 end
 
 @kernel function copy_kernel!(dst, @Const(src))

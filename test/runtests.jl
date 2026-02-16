@@ -2510,6 +2510,25 @@ end
             x, iter = amg_solve!(x, b, h)
             @test iter < 100
         end
+
+        @testset "csr_from_sparse_csr do_collect" begin
+            A_sparse = poisson1d_sparsecsr(10)
+            ext = Base.get_extension(ParallelAMG, :ParallelAMGSparseMatricesCSRExt)
+            # Default (do_collect=false, 1-based): shares underlying arrays
+            A_csr = ext.csr_from_sparse_csr(A_sparse)
+            @test A_csr isa CSRMatrix
+            @test size(A_csr) == (10, 10)
+            @test A_csr[1,1] ≈ 2.0
+            @test A_csr.nzval === nonzeros(A_sparse)
+
+            # do_collect=true: independent copy
+            A_csr2 = ext.csr_from_sparse_csr(A_sparse; do_collect=true)
+            @test A_csr2 isa CSRMatrix
+            @test size(A_csr2) == (10, 10)
+            @test A_csr2[1,1] ≈ 2.0
+            @test A_csr2.nzval !== nonzeros(A_sparse)
+            @test A_csr2.nzval == nonzeros(A_sparse)
+        end
     end
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -2636,6 +2655,41 @@ end
             @test A_csr[1,1] ≈ 2.0
             @test A_csr[1,2] ≈ -1.0
             @test A_csr[2,1] ≈ -1.0
+        end
+
+        @testset "csr_from_csc do_collect" begin
+            A_csc = sparse([1,1,2,2,2,3,3], [1,2,1,2,3,2,3], [2.0,-1.0,-1.0,2.0,-1.0,-1.0,2.0], 3, 3)
+            # Default (do_collect=false): arrays are not independently copied
+            A_csr = csr_from_csc(A_csc)
+            @test A_csr isa CSRMatrix
+            @test size(A_csr) == (3, 3)
+            @test A_csr[1,1] ≈ 2.0
+            @test A_csr[1,2] ≈ -1.0
+
+            # do_collect=true: arrays are independent copies
+            A_csr2 = csr_from_csc(A_csc; do_collect=true)
+            @test A_csr2 isa CSRMatrix
+            @test size(A_csr2) == (3, 3)
+            @test A_csr2[1,1] ≈ 2.0
+            @test A_csr2[1,2] ≈ -1.0
+        end
+
+        @testset "csr_from_static do_collect" begin
+            A_static = poisson1d_csr(10)
+            # Default (do_collect=false): shares underlying arrays
+            A_csr = ParallelAMG.csr_from_static(A_static)
+            @test A_csr isa CSRMatrix
+            @test size(A_csr) == (10, 10)
+            @test A_csr[1,1] ≈ 2.0
+            @test A_csr.nzval === nonzeros(A_static)
+
+            # do_collect=true: independent copy
+            A_csr2 = ParallelAMG.csr_from_static(A_static; do_collect=true)
+            @test A_csr2 isa CSRMatrix
+            @test size(A_csr2) == (10, 10)
+            @test A_csr2[1,1] ≈ 2.0
+            @test A_csr2.nzval !== nonzeros(A_static)
+            @test A_csr2.nzval == nonzeros(A_static)
         end
     end
 

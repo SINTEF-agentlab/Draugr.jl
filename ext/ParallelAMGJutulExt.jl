@@ -45,15 +45,24 @@ end
 # ── CSR conversion from StaticSparsityMatrixCSR ──────────────────────────────
 
 """
-    csr_from_static(A::StaticSparsityMatrixCSR) -> CSRMatrix
+    csr_from_static(A::StaticSparsityMatrixCSR; do_collect=false) -> CSRMatrix
 
 Convert a `StaticSparsityMatrixCSR` to the internal `CSRMatrix`
 representation by extracting its raw CSR vectors.
+
+When `do_collect` is `false` (default), the resulting `CSRMatrix` directly
+references the internal arrays of the source matrix without copying.
+When `do_collect` is `true`, `collect` is called to produce independent copies.
 """
-function ParallelAMG.csr_from_static(A::StaticSparsityMatrixCSR{Tv, Ti}) where {Tv, Ti}
-    rp = collect(ParallelAMG.rowptr(A))
-    cv = collect(colvals(A))
-    nzv = collect(nonzeros(A))
+function ParallelAMG.csr_from_static(A::StaticSparsityMatrixCSR{Tv, Ti}; do_collect::Bool=false) where {Tv, Ti}
+    rp = ParallelAMG.rowptr(A)
+    cv = colvals(A)
+    nzv = nonzeros(A)
+    if do_collect
+        rp = collect(rp)
+        cv = collect(cv)
+        nzv = collect(nzv)
+    end
     return CSRMatrix(rp, cv, nzv, size(A, 1), size(A, 2))
 end
 

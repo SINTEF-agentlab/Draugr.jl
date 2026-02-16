@@ -76,29 +76,46 @@ function _interpolation_from_enum(e::InterpolationEnum, trunc::Float64)
 end
 
 function _smoother_from_enum(e::SmootherEnum)
-    if e == SMOOTHER_JACOBI;       return JacobiSmootherType()
-    elseif e == SMOOTHER_COLORED_GS; return ColoredGaussSeidelType()
-    elseif e == SMOOTHER_SERIAL_GS;  return SerialGaussSeidelType()
-    elseif e == SMOOTHER_SPAI0;      return SPAI0SmootherType()
-    elseif e == SMOOTHER_SPAI1;      return SPAI1SmootherType()
-    elseif e == SMOOTHER_L1_JACOBI;  return L1JacobiSmootherType()
-    elseif e == SMOOTHER_CHEBYSHEV;  return ChebyshevSmootherType()
-    elseif e == SMOOTHER_ILU0;       return ILU0SmootherType()
-    else;                            return JacobiSmootherType()
+    if e == SMOOTHER_JACOBI
+        return JacobiSmootherType()
+    elseif e == SMOOTHER_COLORED_GS
+        return ColoredGaussSeidelType()
+    elseif e == SMOOTHER_SERIAL_GS
+        return SerialGaussSeidelType()
+    elseif e == SMOOTHER_SPAI0
+        return SPAI0SmootherType()
+    elseif e == SMOOTHER_SPAI1
+        return SPAI1SmootherType()
+    elseif e == SMOOTHER_L1_JACOBI
+        return L1JacobiSmootherType()
+    elseif e == SMOOTHER_CHEBYSHEV
+        return ChebyshevSmootherType()
+    elseif e == SMOOTHER_ILU0
+        return ILU0SmootherType()
+    else
+        return JacobiSmootherType()
     end
 end
 
 function _coarsening_from_enum(e::CoarseningEnum, θ::Float64,
                                interp::InterpolationEnum, trunc::Float64)
     ip = _interpolation_from_enum(interp, trunc)
-    if e == COARSENING_AGGREGATION;            return AggregationCoarsening(θ)
-    elseif e == COARSENING_PMIS;               return PMISCoarsening(θ, ip)
-    elseif e == COARSENING_HMIS;               return HMISCoarsening(θ, ip)
-    elseif e == COARSENING_RS;                 return RSCoarsening(θ, ip)
-    elseif e == COARSENING_AGGRESSIVE_PMIS;    return AggressiveCoarsening(θ, :pmis, ip)
-    elseif e == COARSENING_AGGRESSIVE_HMIS;    return AggressiveCoarsening(θ, :hmis, ip)
-    elseif e == COARSENING_SMOOTHED_AGGREGATION; return SmoothedAggregationCoarsening(θ)
-    else;                                      return AggregationCoarsening(θ)
+    if e == COARSENING_AGGREGATION
+        return AggregationCoarsening(θ)
+    elseif e == COARSENING_PMIS
+        return PMISCoarsening(θ, ip)
+    elseif e == COARSENING_HMIS
+        return HMISCoarsening(θ, ip)
+    elseif e == COARSENING_RS
+        return RSCoarsening(θ, ip)
+    elseif e == COARSENING_AGGRESSIVE_PMIS
+        return AggressiveCoarsening(θ, :pmis, ip)
+    elseif e == COARSENING_AGGRESSIVE_HMIS
+        return AggressiveCoarsening(θ, :hmis, ip)
+    elseif e == COARSENING_SMOOTHED_AGGREGATION
+        return SmoothedAggregationCoarsening(θ)
+    else
+        return AggregationCoarsening(θ)
     end
 end
 

@@ -412,9 +412,9 @@ Fields:
   - 2: Additionally print iteration counter and residual norm at each cycle during solve
 - `initial_coarsening`: Optional alternative coarsening for the first N levels (defaults to `coarsening`)
 - `initial_coarsening_levels`: Number of levels to use `initial_coarsening` for (default: 0)
-- `max_row_sum`: Maximum row sum threshold for dependency weakening (default: 0, disabled).
-  When > 0, rows where |row_sum|/|a_ii| > max_row_sum have their off-diagonal entries scaled
-  down to enforce the threshold, improving AMG robustness for indefinite or nearly singular systems.
+- `max_row_sum`: Maximum row sum threshold for dependency weakening (default: 1.0, disabled).
+  When < 1.0, rows where |row_sum| > |a_ii| * max_row_sum have all off-diagonal entries
+  zeroed out (all dependencies made weak), matching the hypre definition.
 - `cycle_type`: AMG cycle type, `:V` for V-cycle or `:W` for W-cycle (default: `:V`)
 - `strength_type`: Strength of connection algorithm (default: `AbsoluteStrength()`).
   Use `SignedStrength()` for non-M-matrices with positive off-diagonals.
@@ -446,7 +446,7 @@ function AMGConfig(;
     verbose::Union{Bool, Int} = 0,
     initial_coarsening::CoarseningAlgorithm = coarsening,
     initial_coarsening_levels::Int = 0,
-    max_row_sum::Float64 = 0.0,
+    max_row_sum::Float64 = 1.0,
     cycle_type::Symbol = :V,
     strength_type::StrengthType = AbsoluteStrength(),
     # Deprecated: accepted for backward compatibility but not stored in config.

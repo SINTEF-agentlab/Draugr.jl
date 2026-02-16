@@ -97,12 +97,12 @@ export AMGConfig, AMGHierarchy, AMGLevel
 export amg_setup, amg_resetup!, amg_cycle!, amg_solve!
 export hypre_default_config
 export AbstractSmoother
-export JacobiSmoother, ColoredGaussSeidelSmoother, SerialGaussSeidelSmoother
+export JacobiSmoother, ColoredGaussSeidelSmoother, L1ColoredGaussSeidelSmoother, SerialGaussSeidelSmoother
 export SPAI0Smoother, SPAI1Smoother
 export L1JacobiSmoother, ChebyshevSmoother, ILU0Smoother
 export JacobiSmootherType, ColoredGaussSeidelType, SerialGaussSeidelType
 export SPAI0SmootherType, SPAI1SmootherType
-export L1JacobiSmootherType, ChebyshevSmootherType, ILU0SmootherType
+export L1JacobiSmootherType, L1ColoredGaussSeidelType, ChebyshevSmootherType, ILU0SmootherType
 export build_smoother, update_smoother!, smooth!
 export AbstractParallelAMGPreconditioner, ParallelAMGPreconditioner
 export setup_specific_preconditioner
@@ -112,6 +112,7 @@ export COARSENING_AGGREGATION, COARSENING_PMIS, COARSENING_HMIS, COARSENING_RS
 export COARSENING_AGGRESSIVE_PMIS, COARSENING_AGGRESSIVE_HMIS, COARSENING_SMOOTHED_AGGREGATION
 export SMOOTHER_JACOBI, SMOOTHER_COLORED_GS, SMOOTHER_SERIAL_GS
 export SMOOTHER_SPAI0, SMOOTHER_SPAI1, SMOOTHER_L1_JACOBI, SMOOTHER_CHEBYSHEV, SMOOTHER_ILU0
+export SMOOTHER_L1_COLORED_GS
 export INTERPOLATION_DIRECT, INTERPOLATION_STANDARD, INTERPOLATION_EXTENDED_I
 export CYCLE_V, CYCLE_W
 export STRENGTH_ABSOLUTE, STRENGTH_SIGNED

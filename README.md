@@ -25,19 +25,19 @@ Pkg.add("Metal")   # Apple GPUs
 ```julia
 using ParallelAMG, SparseArrays
 
-# Build a sparse matrix in CSR format (via Jutul's StaticCSR)
-using Jutul.StaticCSR: static_sparsity_sparse
+# Build a standard Julia CSC sparse matrix
 I = [1,1,2,2,2,3,3]; J = [1,2,1,2,3,2,3]
 V = [2.0,-1.0,-1.0,2.0,-1.0,-1.0,2.0]
-A = static_sparsity_sparse(I, J, V, 3, 3)
-
-# Or convert from a standard Julia CSC sparse matrix
 A_csc = sparse(I, J, V, 3, 3)
-A     = static_csr_from_csc(A_csc)
 
-# Setup the AMG hierarchy
+# Setup the AMG hierarchy (CSC matrices are converted to CSR internally)
 config    = AMGConfig()
-hierarchy = amg_setup(A, config)
+hierarchy = amg_setup(A_csc, config)
+
+# Or use a CSR matrix directly via SparseMatricesCSR.jl
+using SparseMatricesCSR
+A_csr = SparseMatrixCSR(A_csc)
+hierarchy = amg_setup(A_csr, config)
 
 # Solve Ax = b
 b = [1.0, 0.0, 1.0]
@@ -104,6 +104,7 @@ All interpolation types accept an optional `trunc_factor` for weight truncation
 | `JacobiSmootherType()`      | Weighted Jacobi (default, GPU-friendly)     |
 | `L1JacobiSmootherType()`    | l1-Jacobi (more robust for difficult cases) |
 | `ColoredGaussSeidelType()`  | Parallel multicolor Gauss-Seidel            |
+| `L1ColoredGaussSeidelType()`| L1 multicolor Gauss-Seidel (more robust)    |
 | `SerialGaussSeidelType()`   | Sequential Gauss-Seidel (CPU only)          |
 | `SPAI0SmootherType()`       | Diagonal sparse approximate inverse         |
 | `SPAI1SmootherType()`       | Sparse approximate inverse (pattern of A)   |
@@ -195,7 +196,7 @@ Integer enums are used to select algorithms.
 | Category        | Values                                                                     |
 |-----------------|----------------------------------------------------------------------------|
 | `CoarseningEnum`| `COARSENING_AGGREGATION(0)`, `COARSENING_PMIS(1)`, `COARSENING_HMIS(2)`, `COARSENING_RS(3)`, `COARSENING_AGGRESSIVE_PMIS(4)`, `COARSENING_AGGRESSIVE_HMIS(5)`, `COARSENING_SMOOTHED_AGGREGATION(6)` |
-| `SmootherEnum`  | `SMOOTHER_JACOBI(0)`, `SMOOTHER_COLORED_GS(1)`, `SMOOTHER_SERIAL_GS(2)`, `SMOOTHER_SPAI0(3)`, `SMOOTHER_SPAI1(4)`, `SMOOTHER_L1_JACOBI(5)`, `SMOOTHER_CHEBYSHEV(6)`, `SMOOTHER_ILU0(7)` |
+| `SmootherEnum`  | `SMOOTHER_JACOBI(0)`, `SMOOTHER_COLORED_GS(1)`, `SMOOTHER_SERIAL_GS(2)`, `SMOOTHER_SPAI0(3)`, `SMOOTHER_SPAI1(4)`, `SMOOTHER_L1_JACOBI(5)`, `SMOOTHER_CHEBYSHEV(6)`, `SMOOTHER_ILU0(7)`, `SMOOTHER_L1_COLORED_GS(8)` |
 | `InterpolationEnum` | `INTERPOLATION_DIRECT(0)`, `INTERPOLATION_STANDARD(1)`, `INTERPOLATION_EXTENDED_I(2)` |
 | `CycleEnum`     | `CYCLE_V(0)`, `CYCLE_W(1)` |
 | `StrengthEnum`  | `STRENGTH_ABSOLUTE(0)`, `STRENGTH_SIGNED(1)` |

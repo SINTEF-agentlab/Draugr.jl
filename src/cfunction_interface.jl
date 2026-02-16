@@ -34,6 +34,7 @@ Integer codes for smoother types (passed from C).
     SMOOTHER_L1_JACOBI         = 5
     SMOOTHER_CHEBYSHEV         = 6
     SMOOTHER_ILU0              = 7
+    SMOOTHER_L1_COLORED_GS     = 8
 end
 
 """
@@ -92,6 +93,8 @@ function _smoother_from_enum(e::SmootherEnum)
         return ChebyshevSmootherType()
     elseif e == SMOOTHER_ILU0
         return ILU0SmootherType()
+    elseif e == SMOOTHER_L1_COLORED_GS
+        return L1ColoredGaussSeidelType()
     else
         return JacobiSmootherType()
     end

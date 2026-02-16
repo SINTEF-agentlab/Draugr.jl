@@ -70,9 +70,11 @@ export AMGConfig, AMGHierarchy, AMGLevel
 export amg_setup, amg_resetup!, amg_cycle!, amg_solve!
 export hypre_default_config
 export AbstractSmoother
-export JacobiSmoother, ColoredGaussSeidelSmoother, SPAI0Smoother, SPAI1Smoother
+export JacobiSmoother, ColoredGaussSeidelSmoother, SerialGaussSeidelSmoother
+export SPAI0Smoother, SPAI1Smoother
 export L1JacobiSmoother, ChebyshevSmoother, ILU0Smoother
-export JacobiSmootherType, ColoredGaussSeidelType, SPAI0SmootherType, SPAI1SmootherType
+export JacobiSmootherType, ColoredGaussSeidelType, SerialGaussSeidelType
+export SPAI0SmootherType, SPAI1SmootherType
 export L1JacobiSmootherType, ChebyshevSmootherType, ILU0SmootherType
 export build_smoother, update_smoother!, smooth!
 export ParallelAMGPreconditioner

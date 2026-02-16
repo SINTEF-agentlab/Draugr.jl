@@ -36,13 +36,13 @@ Recommended for use with HMIS coarsening for challenging 3D problems.
 (0 = no truncation). Maps to HYPRE's `AggTruncFactor`.
 `max_elements`: maximum number of interpolation entries per row (0 = no limit).
 When the number of entries exceeds this limit, only the strongest entries are kept.
-Default: 4.
+Default: 0.
 """
 struct ExtendedIInterpolation <: InterpolationType
     trunc_factor::Float64
     max_elements::Int
 end
-ExtendedIInterpolation() = ExtendedIInterpolation(0.0, 4)
+ExtendedIInterpolation() = ExtendedIInterpolation(0.0, 0)
 ExtendedIInterpolation(trunc_factor::Real) = ExtendedIInterpolation(Float64(trunc_factor), 4)
 
 # ── Coarsening type tags ──────────────────────────────────────────────────────

@@ -6,9 +6,9 @@
     CSRMatrix{Tv, Ti, Vr, Vc, Vv}
 
 Lightweight CSR matrix holding raw row-pointer, column-index, and value vectors.
-This is the internal representation used throughout the AMG hierarchy, decoupled
-from Jutul's `StaticSparsityMatrixCSR`.  External API entry points accept
-`StaticSparsityMatrixCSR` and convert to `CSRMatrix` once at the boundary.
+This is the internal representation used throughout the AMG hierarchy.
+External API entry points accept various sparse CSR formats and convert to
+`CSRMatrix` once at the boundary.
 
 The vector types are parameterized as `AbstractVector` subtypes so the format
 works with GPU arrays or other custom vector implementations.
@@ -85,34 +85,25 @@ function _csr_to_device(ref::CSRMatrix, A_cpu::CSRMatrix)
 end
 
 """
-    csr_from_static(A::StaticSparsityMatrixCSR) -> CSRMatrix
+    csr_from_csc(A::SparseMatrixCSC; do_collect=false) -> CSRMatrix
 
-Convert a Jutul `StaticSparsityMatrixCSR` to the internal `CSRMatrix`
-representation by extracting its raw CSR vectors. This is the single
-conversion point; all internal functions work only with `CSRMatrix`.
+Convert a `SparseMatrixCSC` to a `CSRMatrix` by transposing.
+
+When `do_collect` is `false` (default), the resulting `CSRMatrix` directly
+references the internal arrays of the transposed matrix without copying.
+When `do_collect` is `true`, `collect` is called to produce independent copies.
 """
-function csr_from_static(A::StaticSparsityMatrixCSR{Tv, Ti}) where {Tv, Ti}
-    rp = collect(rowptr(A))
-    cv = collect(colvals(A))
-    nzv = collect(nonzeros(A))
+function csr_from_csc(A::SparseMatrixCSC{Tv, Ti}; do_collect::Bool=false) where {Tv, Ti}
+    At = sparse(A')
+    rp = SparseArrays.getcolptr(At)
+    cv = SparseArrays.rowvals(At)
+    nzv = nonzeros(At)
+    if do_collect
+        rp = collect(rp)
+        cv = collect(cv)
+        nzv = collect(nzv)
+    end
     return CSRMatrix(rp, cv, nzv, size(A, 1), size(A, 2))
-end
-
-"""
-    csr_copy_nzvals!(dest::CSRMatrix, src::StaticSparsityMatrixCSR)
-
-Copy nonzero values from a `StaticSparsityMatrixCSR` into an existing
-`CSRMatrix` with the same sparsity pattern.
-"""
-function csr_copy_nzvals!(dest::CSRMatrix{Tv}, src::StaticSparsityMatrixCSR{Tv};
-                          backend=DEFAULT_BACKEND, block_size::Int=64) where Tv
-    nzv_d = nonzeros(dest)
-    nzv_s = nonzeros(src)
-    n = length(nzv_d)
-    kernel! = copy_kernel!(backend, block_size)
-    kernel!(nzv_d, nzv_s; ndrange=n)
-    _synchronize(backend)
-    return dest
 end
 
 @kernel function copy_kernel!(dst, @Const(src))

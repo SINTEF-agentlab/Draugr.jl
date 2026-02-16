@@ -1092,9 +1092,9 @@ end
 # ══════════════════════════════════════════════════════════════════════════════
 
 """
-    build_smoother(A::StaticSparsityMatrixCSR, smoother_type::SmootherType; ω=2/3, backend, block_size)
+    build_smoother(A::SparseMatrixCSC, smoother_type::SmootherType; ω=2/3, backend, block_size)
 
-Build a smoother from a `StaticSparsityMatrixCSR` matrix. This is the public API
+Build a smoother from a `SparseMatrixCSC` matrix. This is the public API
 for using smoothers independently of the AMG hierarchy.
 
 # Arguments
@@ -1103,41 +1103,33 @@ for using smoothers independently of the AMG hierarchy.
 - `ω`: Damping factor (used by Jacobi and l1-Jacobi smoothers, default: 2/3)
 - `backend`: KernelAbstractions backend (default: CPU)
 - `block_size`: Kernel launch block size (default: 64)
-
-# Example
-```julia
-A = static_sparsity_sparse(I, J, V, n, n)
-smoother = build_smoother(A, JacobiSmootherType())
-x = zeros(n)
-smooth!(x, A, ones(n), smoother; steps=5)
-```
 """
-function build_smoother(A::StaticSparsityMatrixCSR, smoother_type::SmootherType;
+function build_smoother(A::SparseMatrixCSC, smoother_type::SmootherType;
                         ω::Real=2.0/3.0, backend=DEFAULT_BACKEND, block_size::Int=64)
-    A_csr = csr_from_static(A)
+    A_csr = csr_from_csc(A)
     return build_smoother(A_csr, smoother_type, ω; backend=backend, block_size=block_size)
 end
 
 """
-    update_smoother!(smoother::AbstractSmoother, A::StaticSparsityMatrixCSR; backend, block_size)
+    update_smoother!(smoother::AbstractSmoother, A::SparseMatrixCSC; backend, block_size)
 
 Update the smoother for new matrix values (same sparsity pattern). This is
-the public API for updating smoothers with `StaticSparsityMatrixCSR` matrices.
+the public API for updating smoothers with `SparseMatrixCSC` matrices.
 """
-function update_smoother!(smoother::AbstractSmoother, A::StaticSparsityMatrixCSR;
+function update_smoother!(smoother::AbstractSmoother, A::SparseMatrixCSC;
                           backend=DEFAULT_BACKEND, block_size::Int=64)
-    A_csr = csr_from_static(A)
+    A_csr = csr_from_csc(A)
     return update_smoother!(smoother, A_csr; backend=backend, block_size=block_size)
 end
 
 """
-    smooth!(x, A::StaticSparsityMatrixCSR, b, smoother; steps=1, backend, block_size)
+    smooth!(x, A::SparseMatrixCSC, b, smoother; steps=1, backend, block_size)
 
-Apply smoother iterations to solve `Ax = b` using a `StaticSparsityMatrixCSR` matrix.
-This is the public API for applying smoothers with `StaticSparsityMatrixCSR` matrices.
+Apply smoother iterations to solve `Ax = b` using a `SparseMatrixCSC` matrix.
+This is the public API for applying smoothers with `SparseMatrixCSC` matrices.
 """
-function smooth!(x::AbstractVector, A::StaticSparsityMatrixCSR, b::AbstractVector,
+function smooth!(x::AbstractVector, A::SparseMatrixCSC, b::AbstractVector,
                  smoother::AbstractSmoother; steps::Int=1, backend=DEFAULT_BACKEND, block_size::Int=64)
-    A_csr = csr_from_static(A)
+    A_csr = csr_from_csc(A)
     return smooth!(x, A_csr, b, smoother; steps=steps, backend=backend, block_size=block_size)
 end

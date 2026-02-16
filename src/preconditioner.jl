@@ -34,7 +34,7 @@ end
 
 function ParallelAMGPreconditioner(; solver::Union{Nothing, Symbol}=nothing, kwargs...)
     config = AMGConfig(; kwargs...)
-    if solver === nothing
+    if isnothing(solver)
         return ParallelAMGPreconditioner(config, nothing, nothing)
     else
         return setup_specific_preconditioner(Val(solver); kwargs...)

@@ -305,32 +305,34 @@ function _print_hierarchy_info(hierarchy::AMGHierarchy, config::AMGConfig, n_fin
     nlevels = length(hierarchy.levels)
     total_nnz = 0
     total_rows = 0
-    println("╔══════════════════════════════════════════════════════════════════════════════╗")
-    println("║                        AMG Hierarchy Summary                                ║")
-    println("╠══════════════════════════════════════════════════════════════════════════════╣")
-    Printf.@printf("║  Setup time:      %.4f s\n", t_setup)
-    println("║  Levels:          $(nlevels + 1) ($(nlevels) AMG + 1 coarse direct)")
-    println("║  Cycle type:      $(config.cycle_type)-cycle")
-    println("║  Strength:        $(typeof(config.strength_type).name.name)")
+    println("+=============================================================================+")
+    println("                         AMG Hierarchy Summary                                  ")
+    println("+=============================================================================+")
+    Printf.@printf("  Setup time:      %.4f s\n", t_setup)
+    println("  Levels:          $(nlevels + 1) ($(nlevels) AMG + 1 coarse direct)")
+    println("  Cycle type:      $(config.cycle_type)-cycle")
+    println("  Backend:         $(_backend_name(hierarchy.backend))")
+    println("  Block size:      $(hierarchy.block_size)")
+    println("  Strength:        $(typeof(config.strength_type).name.name)")
     # Coarsening info
     coarsening_str = _coarsening_name(config.coarsening)
-    println("║  Coarsening:      $coarsening_str")
+    println("  Coarsening:      $coarsening_str")
     if config.initial_coarsening_levels > 0
         init_str = _coarsening_name(config.initial_coarsening)
-        println("║  Initial coars.:  $init_str (first $(config.initial_coarsening_levels) levels)")
+        println("  Initial coars.:  $init_str (first $(config.initial_coarsening_levels) levels)")
     end
-    println("║  Smoother:        $(typeof(config.smoother).name.name)")
+    println("  Smoother:        $(typeof(config.smoother).name.name)")
     if config.smoother isa JacobiSmootherType || config.smoother isa L1JacobiSmootherType
-        Printf.@printf("║    ω = %.3f\n", config.jacobi_omega)
+        Printf.@printf("    omega = %.3f\n", config.jacobi_omega)
     end
-    Printf.@printf("║  Pre-smooth:      %d steps, Post-smooth: %d steps\n",
+    Printf.@printf("  Pre-smooth:      %d steps, Post-smooth: %d steps\n",
                     config.pre_smoothing_steps, config.post_smoothing_steps)
     if config.max_row_sum < 1.0
-        Printf.@printf("║  Max row sum:     %.2f\n", config.max_row_sum)
+        Printf.@printf("  Max row sum:     %.2f\n", config.max_row_sum)
     end
-    println("╠══════════════════════════════════════════════════════════════════════════════╣")
-    println("║  Level │    Rows │      NNZ │   Ratio │ Smoother                            ")
-    println("╠────────┼─────────┼──────────┼─────────┼─────────────────────────────────────╣")
+    println("+-------+----------+-----------+---------+------------------------------------+")
+    println("  Level     Rows        NNZ      Ratio    Smoother                              ")
+    println("+-------+----------+-----------+---------+------------------------------------+")
     for (i, lvl) in enumerate(hierarchy.levels)
         n = size(lvl.A, 1)
         nz = nnz(lvl.A)
@@ -338,11 +340,11 @@ function _print_hierarchy_info(hierarchy::AMGHierarchy, config::AMGConfig, n_fin
         total_rows += n
         sname = _smoother_name(lvl.smoother)
         if i == 1
-            Printf.@printf("║  %5d │ %7d │ %8d │       — │ %s\n", i, n, nz, sname)
+            Printf.@printf("  %5d   %7d    %8d         -   %s\n", i, n, nz, sname)
         else
             prev_n = size(hierarchy.levels[i-1].A, 1)
             ratio = n / prev_n
-            Printf.@printf("║  %5d │ %7d │ %8d │  %5.3f │ %s\n", i, n, nz, ratio, sname)
+            Printf.@printf("  %5d   %7d    %8d    %5.3f   %s\n", i, n, nz, ratio, sname)
         end
     end
     # Coarsest level
@@ -353,23 +355,27 @@ function _print_hierarchy_info(hierarchy::AMGHierarchy, config::AMGConfig, n_fin
     if nlevels > 0
         prev_n = size(hierarchy.levels[end].A, 1)
         ratio = nc / prev_n
-        Printf.@printf("║  %5d │ %7d │ %8d │  %5.3f │ %s\n", nlevels + 1, nc, nc_nnz, ratio, "Direct (LU)")
+        Printf.@printf("  %5d   %7d    %8d    %5.3f   %s\n", nlevels + 1, nc, nc_nnz, ratio, "Direct (LU)")
     else
-        Printf.@printf("║  %5d │ %7d │ %8d │       — │ %s\n", nlevels + 1, nc, nc_nnz, "Direct (LU)")
+        Printf.@printf("  %5d   %7d    %8d         -   %s\n", nlevels + 1, nc, nc_nnz, "Direct (LU)")
     end
-    println("╠══════════════════════════════════════════════════════════════════════════════╣")
+    println("+=============================================================================+")
     if nlevels > 0
         finest_nnz = nnz(hierarchy.levels[1].A)
         oc = total_nnz / finest_nnz
         gc = total_rows / n_finest
-        Printf.@printf("║  Operator complexity: %.3f\n", oc)
-        Printf.@printf("║  Grid complexity:     %.3f\n", gc)
+        Printf.@printf("  Operator complexity: %.3f\n", oc)
+        Printf.@printf("  Grid complexity:     %.3f\n", gc)
     end
-    println("╚══════════════════════════════════════════════════════════════════════════════╝")
+    println("+=============================================================================+")
 end
+
+_backend_name(b::CPU) = "CPU"
+_backend_name(b) = string(typeof(b))
 
 _smoother_name(::JacobiSmoother) = "Jacobi"
 _smoother_name(::ColoredGaussSeidelSmoother) = "Colored GS"
+_smoother_name(::L1ColoredGaussSeidelSmoother) = "l1-Colored GS"
 _smoother_name(::SerialGaussSeidelSmoother) = "Serial GS"
 _smoother_name(::SPAI0Smoother) = "SPAI(0)"
 _smoother_name(::SPAI1Smoother) = "SPAI(1)"

@@ -477,6 +477,7 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
     nzv = nonzeros(A)
 
     trunc_factor = interp.trunc_factor
+    max_elements = interp.max_elements
 
     # Build strength-based sparse matrix S for determining C-hat
     # S_diag[i] contains strong neighbors of i (like hypre's S_diag)
@@ -623,22 +624,24 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
             end
         end
 
-        # ── Phase 4: Truncation (matching hypre's trunc_factor) ──
+        # ── Phase 4: Truncation (trunc_factor + max_elements limit) ──
+        # First, apply trunc_factor to determine which entries survive
+        keep = collect(1:n_chat)
         if trunc_factor > 0 && n_chat > 0
             max_w = zero(real(Tv))
             for idx in 1:n_chat
                 max_w = max(max_w, abs(P_data[idx]))
             end
             threshold = trunc_factor * max_w
-            for idx in 1:n_chat
-                if abs(P_data[idx]) >= threshold
-                    push!(I_p, Ti(i)); push!(J_p, Ti(coarse_map[chat_indices[idx]])); push!(V_p, P_data[idx])
-                end
-            end
-        else
-            for idx in 1:n_chat
-                push!(I_p, Ti(i)); push!(J_p, Ti(coarse_map[chat_indices[idx]])); push!(V_p, P_data[idx])
-            end
+            keep = [idx for idx in 1:n_chat if abs(P_data[idx]) >= threshold]
+        end
+        # Then, apply max_elements limit: keep only the strongest entries
+        if max_elements > 0 && length(keep) > max_elements
+            sort!(keep; by = idx -> abs(P_data[idx]), rev = true)
+            resize!(keep, max_elements)
+        end
+        for idx in keep
+            push!(I_p, Ti(i)); push!(J_p, Ti(coarse_map[chat_indices[idx]])); push!(V_p, P_data[idx])
         end
 
         # ── Reset markers ──

@@ -241,6 +241,82 @@ function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
 end
 
 # ══════════════════════════════════════════════════════════════════════════════
+# L1 Colored Gauss-Seidel Smoother
+# ══════════════════════════════════════════════════════════════════════════════
+
+"""
+    build_l1_colored_gs_smoother(A)
+
+Build an L1 variant of the parallel colored Gauss-Seidel smoother.
+Uses l1 row norms for diagonal scaling instead of just the diagonal entry,
+providing more robust smoothing for difficult problems.
+Graph coloring is performed on CPU, then color_order and invdiag are
+copied to the same device as A.
+"""
+function build_l1_colored_gs_smoother(A::CSRMatrix{Tv, Ti}) where {Tv, Ti}
+    n = size(A, 1)
+    A_cpu = csr_to_cpu(A)
+    colors, num_colors = greedy_coloring(A_cpu)
+    # Sort nodes by color for efficient parallel iteration
+    color_counts = zeros(Int, num_colors)
+    @inbounds for i in 1:n
+        color_counts[colors[i]] += 1
+    end
+    color_offsets = Vector{Int}(undef, num_colors + 1)
+    color_offsets[1] = 1
+    for c in 1:num_colors
+        color_offsets[c+1] = color_offsets[c] + color_counts[c]
+    end
+    color_order_cpu = Vector{Ti}(undef, n)
+    pos = copy(color_offsets[1:num_colors])
+    @inbounds for i in 1:n
+        c = colors[i]
+        color_order_cpu[pos[c]] = Ti(i)
+        pos[c] += 1
+    end
+    invdiag = _allocate_undef_vector(A, Tv, n)
+    _compute_l1_invdiag!(invdiag, A)
+    # Copy color_order to device
+    color_order_dev = A.nzval isa Array ? color_order_cpu : _to_device(A, color_order_cpu)
+    return L1ColoredGaussSeidelSmoother(colors, color_offsets, color_order_dev,
+                                         num_colors, invdiag)
+end
+
+function update_smoother!(smoother::L1ColoredGaussSeidelSmoother, A::CSRMatrix;
+                          backend=_get_backend(nonzeros(A)), block_size::Int=64)
+    _compute_l1_invdiag!(smoother.invdiag, A; backend=backend, block_size=block_size)
+    return smoother
+end
+
+"""
+    smooth!(x, A, b, smoother::L1ColoredGaussSeidelSmoother; steps=1)
+
+Apply L1 colored Gauss-Seidel smoothing. Uses l1 row norms for diagonal scaling.
+"""
+function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
+                 smoother::L1ColoredGaussSeidelSmoother; steps::Int=1, backend=DEFAULT_BACKEND, block_size::Int=64)
+    nzv = nonzeros(A)
+    cv = colvals(A)
+    rp = rowptr(A)
+    kernel! = gs_color_kernel!(backend, block_size)
+    for _ in 1:steps
+        for c in 1:smoother.num_colors
+            start = smoother.color_offsets[c]
+            count = smoother.color_offsets[c+1] - start
+            count == 0 && continue
+            kernel!(x, b, nzv, cv, rp, smoother.invdiag,
+                    smoother.color_order, start - 1; ndrange=count)
+            _synchronize(backend)
+        end
+    end
+    return x
+end
+
+function build_smoother(A::CSRMatrix, ::L1ColoredGaussSeidelType, ω::Real; backend=DEFAULT_BACKEND, block_size::Int=64)
+    return build_l1_colored_gs_smoother(A)
+end
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Serial (non-threaded) Gauss-Seidel Smoother
 # ══════════════════════════════════════════════════════════════════════════════
 

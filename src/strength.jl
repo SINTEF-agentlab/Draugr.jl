@@ -171,9 +171,9 @@ end
     _apply_max_row_sum(A, threshold)
 
 Apply max row sum dependency weakening (as in hypre). For rows where
-(Σ_j |a_{i,j}|) / |a_{i,i}| > threshold, off-diagonal entries are scaled down
-so that the absolute row sum ratio is brought to the threshold. This weakens
-dependencies in rows that are far from diagonal dominance.
+|row_sum| > |a_{i,i}| * threshold (and threshold < 1), all off-diagonal
+entries are zeroed out, making all dependencies weak. Here row_sum is the
+algebraic sum of all entries in the row (diagonal + off-diagonal).
 
 This is used only for strength-of-connection computation, not for the actual
 matrix used in the solve.
@@ -187,31 +187,26 @@ function _apply_max_row_sum(A::CSRMatrix{Tv, Ti}, threshold::Real) where {Tv, Ti
     nzv_new = copy(nzv_old)
     rp = rowptr(A)
     @inbounds for i in 1:n
-        a_ii = zero(Tv)
-        abs_offdiag_sum = zero(real(Tv))
+        diag = zero(Tv)
+        row_sum = zero(Tv)
+        diag_nz = 0
         for nz in rp[i]:(rp[i+1]-1)
             j = cv[nz]
+            row_sum += nzv_old[nz]
             if j == i
-                a_ii = nzv_old[nz]
-            else
-                abs_offdiag_sum += abs(nzv_old[nz])
+                diag = nzv_old[nz]
+                diag_nz = nz
             end
         end
-        abs_aii = abs(a_ii)
-        abs_aii < eps(real(Tv)) && continue
-        # Check if absolute row sum ratio exceeds threshold
-        # ratio = (|a_ii| + sum|off-diag|) / |a_ii| = 1 + sum|off-diag|/|a_ii|
-        abs_row_sum_ratio = (abs_aii + abs_offdiag_sum) / abs_aii
-        if abs_row_sum_ratio > threshold && abs_offdiag_sum > eps(real(Tv))
-            # Scale off-diag so that (|a_ii| + α * sum|off-diag|) / |a_ii| = threshold
-            # α = (threshold * |a_ii| - |a_ii|) / sum|off-diag|
-            #   = |a_ii| * (threshold - 1) / sum|off-diag|
-            α = abs_aii * (threshold - one(real(Tv))) / abs_offdiag_sum
-            α = clamp(α, zero(real(Tv)), one(real(Tv)))
+        abs_diag = abs(diag)
+        abs_diag < eps(real(Tv)) && continue
+        # Check if |row_sum| > |diag| * threshold and threshold < 1.0 (as in hypre)
+        if abs(row_sum) > abs_diag * threshold && threshold < one(real(Tv))
+            # Make all dependencies weak: zero out off-diagonal entries
             for nz in rp[i]:(rp[i+1]-1)
                 j = cv[nz]
                 if j != i
-                    nzv_new[nz] = Tv(α) * nzv_old[nz]
+                    nzv_new[nz] = zero(Tv)
                 end
             end
         end

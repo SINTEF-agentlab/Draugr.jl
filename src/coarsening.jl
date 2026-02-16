@@ -1001,7 +1001,7 @@ function coarsen_aggressive_cf(A_in::CSRMatrix{Tv, Ti}, θ::Real, base::Symbol;
         return ones(Int, n), collect(1:n), n
     end
     # First pass: standard CF-splitting using base algorithm
-    A_eff = config.max_row_sum > 0 ? _apply_max_row_sum(csr_to_cpu(A_in), config.max_row_sum) : A_in
+    A_eff = config.max_row_sum < 1.0 ? _apply_max_row_sum(csr_to_cpu(A_in), config.max_row_sum) : A_in
     if base == :hmis
         cf1, _, nc1 = coarsen_hmis(A_eff, θ; rng=rng, backend=backend, block_size=block_size)
     else  # :pmis
@@ -1125,7 +1125,7 @@ end
 function coarsen(A::CSRMatrix, alg::AggregationCoarsening,
                 config::AMGConfig=AMGConfig();
                 backend=DEFAULT_BACKEND, block_size::Int=64)
-    if config.max_row_sum > 0
+    if config.max_row_sum < 1.0
         A_weak = _apply_max_row_sum(csr_to_cpu(A), config.max_row_sum)
         return coarsen_aggregation(A_weak, alg.θ; backend=backend, block_size=block_size)
     end
@@ -1135,7 +1135,7 @@ end
 function coarsen(A::CSRMatrix, alg::AggressiveCoarsening,
                 config::AMGConfig=AMGConfig();
                 backend=DEFAULT_BACKEND, block_size::Int=64)
-    if config.max_row_sum > 0
+    if config.max_row_sum < 1.0
         A_weak = _apply_max_row_sum(csr_to_cpu(A), config.max_row_sum)
         return coarsen_aggressive(A_weak, alg.θ; backend=backend, block_size=block_size)
     end
@@ -1162,7 +1162,7 @@ Perform CF-splitting coarsening. Returns `(cf, coarse_map, n_coarse)`.
 function coarsen_cf(A::CSRMatrix, alg::PMISCoarsening,
                     config::AMGConfig=AMGConfig();
                     backend=DEFAULT_BACKEND, block_size::Int=64)
-    if config.max_row_sum > 0
+    if config.max_row_sum < 1.0
         A_weak = _apply_max_row_sum(csr_to_cpu(A), config.max_row_sum)
         return coarsen_pmis(A_weak, alg.θ; backend=backend, block_size=block_size)
     end
@@ -1172,7 +1172,7 @@ end
 function coarsen_cf(A::CSRMatrix, alg::HMISCoarsening,
                     config::AMGConfig=AMGConfig();
                     backend=DEFAULT_BACKEND, block_size::Int=64)
-    if config.max_row_sum > 0
+    if config.max_row_sum < 1.0
         A_weak = _apply_max_row_sum(csr_to_cpu(A), config.max_row_sum)
         return coarsen_hmis(A_weak, alg.θ; backend=backend, block_size=block_size)
     end
@@ -1182,7 +1182,7 @@ end
 function coarsen_cf(A::CSRMatrix, alg::RSCoarsening,
                     config::AMGConfig=AMGConfig();
                     backend=DEFAULT_BACKEND, block_size::Int=64)
-    if config.max_row_sum > 0
+    if config.max_row_sum < 1.0
         A_weak = _apply_max_row_sum(csr_to_cpu(A), config.max_row_sum)
         return coarsen_rs(A_weak, alg.θ; backend=backend, block_size=block_size)
     end

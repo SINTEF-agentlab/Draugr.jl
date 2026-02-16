@@ -71,21 +71,12 @@ function _vcycle_descend!(x::AbstractVector{Tv}, b::AbstractVector{Tv},
     r = level.r
     xc = level.xc
     bc = level.bc
-    kcache = level.kernel_cache
     # Pre-smoothing
     smooth!(x, A, b, level.smoother; steps=config.pre_smoothing_steps, backend=backend, block_size=block_size)
-    # Compute residual: r = b - A*x (using pre-compiled kernel)
-    n = size(A, 1)
-    nzv = nonzeros(A)
-    cv = colvals(A)
-    rp = rowptr(A)
-    kcache.residual_kernel(r, b, x, nzv, cv, rp; ndrange=n)
-    _synchronize(backend)
-    # Restrict residual to coarse grid (using pre-compiled kernel)
-    n_coarse = P.ncol
-    kcache.restrict_kernel(bc, level.Pt_map.offsets, level.Pt_map.fine_rows,
-            level.Pt_map.p_nz_idx, P.nzval, r; ndrange=n_coarse)
-    _synchronize(backend)
+    # Compute residual: r = b - A*x (parallelized, no allocations)
+    compute_residual!(r, A, x, b; backend=backend, block_size=block_size)
+    # Restrict residual to coarse grid
+    restrict!(bc, level.Pt_map, P, r; backend=backend, block_size=block_size)
     # Solve on coarse grid
     fill!(xc, zero(Tv))
     if lvl < nlevels
@@ -100,9 +91,8 @@ function _vcycle_descend!(x::AbstractVector{Tv}, b::AbstractVector{Tv},
         ldiv!(hierarchy.coarse_x, hierarchy.coarse_factor, hierarchy.coarse_b)
         copyto!(xc, hierarchy.coarse_x)
     end
-    # Prolongate and correct: x += P * xc (using pre-compiled kernel)
-    kcache.prolongate_kernel(x, P.rowptr, P.colval, P.nzval, xc; ndrange=P.nrow)
-    _synchronize(backend)
+    # Prolongate and correct: x += P * xc
+    prolongate!(x, P, xc; backend=backend, block_size=block_size)
     # Post-smoothing
     smooth!(x, A, b, level.smoother; steps=config.post_smoothing_steps, backend=backend, block_size=block_size)
     return x
@@ -141,17 +131,11 @@ function amg_solve!(x::AbstractVector{Tv}, b::AbstractVector{Tv},
     end
     # Use pre-allocated residual buffer (no allocations!)
     r = hierarchy.solve_r
-    n = size(A, 1)
-    nzv = nonzeros(A)
-    cv = colvals(A)
-    rp = rowptr(A)
-    rkernel! = hierarchy.solve_residual_kernel
     rnorm = bnorm
     for iter in 1:maxiter
         amg_cycle!(x, b, hierarchy, config)
-        # Check convergence using parallelized residual computation (kernel pre-built)
-        rkernel!(r, b, x, nzv, cv, rp; ndrange=n)
-        _synchronize(backend)
+        # Check convergence using parallelized residual computation
+        compute_residual!(r, A, x, b; backend=backend, block_size=block_size)
         rnorm = norm(r)
         rel_norm = rnorm / bnorm
         if config.verbose >= 2

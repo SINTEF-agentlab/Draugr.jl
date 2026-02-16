@@ -346,19 +346,6 @@ struct RestrictionMap{Ti<:Integer, Vi<:AbstractVector{Ti}}
     triple_pj_idx::Vi     # P.nzval index for p_j weight (sorted by dest NZ)
 end
 
-# ── Pre-compiled kernel cache for one AMG level ──────────────────────────────
-"""
-    LevelKernelCache
-
-Stores pre-compiled KernelAbstractions kernels for one AMG level so that
-kernel objects are created once during `amg_setup` and reused every cycle.
-"""
-struct LevelKernelCache
-    residual_kernel::Any       # compiled residual_kernel!(backend, block_size)
-    prolongate_kernel::Any     # compiled prolongate_kernel!(backend, block_size)
-    restrict_kernel::Any       # compiled restrict_kernel!(backend, block_size)
-end
-
 # ── AMG Level ─────────────────────────────────────────────────────────────────
 """
     AMGLevel{Tv, Ti}
@@ -370,9 +357,6 @@ Conversion from `StaticSparsityMatrixCSR` happens at the API boundary in
 
 Workspace vectors (`r`, `xc`, `bc`) are allocated on the same device as the
 matrix arrays to avoid host/device memory mixing in GPU kernels.
-
-The `kernel_cache` stores pre-compiled KA kernels so that kernel compilation
-happens once during setup, not on every cycle.
 """
 mutable struct AMGLevel{Tv, Ti<:Integer}
     A::CSRMatrix{Tv, Ti}
@@ -383,7 +367,6 @@ mutable struct AMGLevel{Tv, Ti<:Integer}
     r::AbstractVector{Tv}      # residual workspace
     xc::AbstractVector{Tv}     # coarse solution workspace
     bc::AbstractVector{Tv}     # coarse RHS workspace
-    kernel_cache::LevelKernelCache  # pre-compiled kernels for this level
 end
 
 # ── AMG Hierarchy ─────────────────────────────────────────────────────────────
@@ -408,7 +391,6 @@ mutable struct AMGHierarchy{Tv, Ti<:Integer}
     coarse_x::AbstractVector{Tv}       # workspace for coarsest level direct solve
     coarse_b::AbstractVector{Tv}       # workspace for coarsest level direct solve
     solve_r::AbstractVector{Tv}        # residual buffer for amg_solve! (finest level size)
-    solve_residual_kernel::Any         # pre-compiled residual kernel for amg_solve!
     backend::Any               # KernelAbstractions backend (CPU, CUDABackend, etc.)
     block_size::Int            # block size for KA kernel launches
 end

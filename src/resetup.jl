@@ -1,34 +1,31 @@
 """
-    amg_resetup!(hierarchy, A_new::StaticSparsityMatrixCSR, config)
+    amg_resetup!(hierarchy, A_new::SparseMatrixCSC, config)
 
-External API entry point: convert `StaticSparsityMatrixCSR` to `CSRMatrix` once
+External API entry point: convert `SparseMatrixCSC` to `CSRMatrix` once
 and forward to the general resetup.
 
 The backend and block_size are taken from the hierarchy (set during `amg_setup`).
 """
 function amg_resetup!(hierarchy::AMGHierarchy{Tv, Ti},
-                      A_new::StaticSparsityMatrixCSR{Tv, Ti},
+                      A_new::SparseMatrixCSC{Tv, Ti},
                       config::AMGConfig=AMGConfig()) where {Tv, Ti}
+    A_csr = csr_from_csc(A_new)
     backend = hierarchy.backend
     block_size = hierarchy.block_size
     nlevels = length(hierarchy.levels)
     if nlevels == 0
-        A_csr = csr_from_static(A_new)
         _update_coarse_solver!(hierarchy, A_csr; backend=backend, block_size=block_size)
         return hierarchy
     end
-    # Update first level's matrix (copy values from A_new into existing CSRMatrix)
     level1 = hierarchy.levels[1]
-    csr_copy_nzvals!(level1.A, A_new; backend=backend, block_size=block_size)
+    _copy_nzvals!(level1.A, A_csr; backend=backend, block_size=block_size)
     update_smoother!(level1.smoother, level1.A; backend=backend, block_size=block_size)
-    # Update subsequent levels via Galerkin products
     for lvl in 1:(nlevels - 1)
         level = hierarchy.levels[lvl]
         next_level = hierarchy.levels[lvl + 1]
         galerkin_product!(next_level.A, level.A, level.P, level.R_map; backend=backend, block_size=block_size)
         update_smoother!(next_level.smoother, next_level.A; backend=backend, block_size=block_size)
     end
-    # Recompute coarsest dense matrix
     last_level = hierarchy.levels[nlevels]
     _recompute_coarsest_dense!(hierarchy, last_level; backend=backend)
     hierarchy.coarse_factor = lu(hierarchy.coarse_A)

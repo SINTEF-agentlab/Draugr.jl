@@ -351,9 +351,8 @@ end
     AMGLevel{Tv, Ti}
 
 One level of the AMG hierarchy. The matrix `A` is stored internally as a
-`CSRMatrix` (raw CSR vectors), decoupled from Jutul's `StaticSparsityMatrixCSR`.
-Conversion from `StaticSparsityMatrixCSR` happens at the API boundary in
-`amg_setup` and `amg_resetup!`.
+`CSRMatrix` (raw CSR vectors). Conversion from external sparse CSR formats
+happens at the API boundary in `amg_setup` and `amg_resetup!`.
 
 Workspace vectors (`r`, `xc`, `bc`) are allocated on the same device as the
 matrix arrays to avoid host/device memory mixing in GPU kernels.

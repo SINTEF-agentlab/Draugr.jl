@@ -325,7 +325,7 @@ function _print_hierarchy_info(hierarchy::AMGHierarchy, config::AMGConfig, n_fin
     end
     Printf.@printf("║  Pre-smooth:      %d steps, Post-smooth: %d steps\n",
                     config.pre_smoothing_steps, config.post_smoothing_steps)
-    if config.max_row_sum > 0
+    if config.max_row_sum < 1.0
         Printf.@printf("║  Max row sum:     %.2f\n", config.max_row_sum)
     end
     println("╠══════════════════════════════════════════════════════════════════════════════╣")

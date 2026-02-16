@@ -1278,15 +1278,20 @@ end
         config = AMGConfig(max_row_sum=0.9)
         @test config.max_row_sum ≈ 0.9
         config2 = AMGConfig()
-        @test config2.max_row_sum ≈ 0.0  # disabled by default
+        @test config2.max_row_sum ≈ 1.0  # disabled by default
     end
 
     @testset "Max Row Sum - Weakening Function" begin
         A = poisson2d_csr(5)
         Ac = to_csr(A)
-        # For Poisson 2D boundary row: |a_ii|=4, |off-diag|=2, ratio=(4+2)/4=1.5
-        # With threshold=1.2, rows with ratio > 1.2 should be scaled
-        A_weak = ParallelAMG._apply_max_row_sum(Ac, 1.2)
+        # For Poisson 2D (5-point stencil):
+        #   diagonal = 4, off-diagonals = -1
+        #   Corner row (2 neighbors): row_sum = 4 - 2 = 2, |row_sum|/|diag| = 0.5
+        #   Edge row (3 neighbors): row_sum = 4 - 3 = 1, |row_sum|/|diag| = 0.25
+        #   Interior row (4 neighbors): row_sum = 4 - 4 = 0, |row_sum|/|diag| = 0.0
+        # With threshold=0.3, corner rows (ratio 0.5 > 0.3) should be zeroed
+        # but edge rows (ratio 0.25 < 0.3) should not
+        A_weak = ParallelAMG._apply_max_row_sum(Ac, 0.3)
         # The weakened matrix should have same size and structure
         @test size(A_weak) == size(Ac)
         @test nnz(A_weak) == nnz(Ac)
@@ -1294,30 +1299,23 @@ end
         nzv_orig = nonzeros(Ac)
         nzv_weak = nonzeros(A_weak)
         rp = rowptr(Ac)
-        # Interior row (center point, index 13 for 5x5): ratio = (4+4)/4 = 2.0 > 1.2
-        # Actually all rows with 4 off-diag neighbors: ratio=(4+4)/4=2.0 > 1.2, will be scaled
-        # Rows with 2 off-diag neighbors: ratio=(4+2)/4=1.5 > 1.2, also scaled
-        # So with threshold=1.2, most rows get scaled
-        # Let's use threshold=1.8 to only affect boundary rows
-        A_weak2 = ParallelAMG._apply_max_row_sum(Ac, 1.8)
-        nzv_weak2 = nonzeros(A_weak2)
-        # Interior row 13 (4 neighbors): ratio=2.0 > 1.8, should be scaled
-        has_scaled_interior = false
-        for nz in rp[13]:(rp[13+1]-1)
-            j = cv[nz]
-            if j != 13 && abs(nzv_weak2[nz]) < abs(nzv_orig[nz]) - 1e-14
-                has_scaled_interior = true
-            end
-        end
-        @test has_scaled_interior
-        # Row 1 (corner, 2 neighbors): ratio=1.5 < 1.8, should NOT be scaled
-        row1_unchanged = true
+        # Row 1 (corner, 2 neighbors): |row_sum|/|diag| = 0.5 > 0.3, off-diag should be zeroed
+        has_zeroed_corner = false
         for nz in rp[1]:(rp[1+1]-1)
-            if abs(nzv_weak2[nz] - nzv_orig[nz]) > 1e-14
-                row1_unchanged = false
+            j = cv[nz]
+            if j != 1 && abs(nzv_weak[nz]) < 1e-14
+                has_zeroed_corner = true
             end
         end
-        @test row1_unchanged
+        @test has_zeroed_corner
+        # Interior row 13 (4 neighbors): |row_sum|/|diag| = 0.0 < 0.3, should NOT be affected
+        row13_unchanged = true
+        for nz in rp[13]:(rp[13+1]-1)
+            if abs(nzv_weak[nz] - nzv_orig[nz]) > 1e-14
+                row13_unchanged = false
+            end
+        end
+        @test row13_unchanged
     end
 
     @testset "Max Row Sum - Solve" begin

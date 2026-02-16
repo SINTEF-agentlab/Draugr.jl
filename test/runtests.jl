@@ -2124,10 +2124,10 @@ end
         A = poisson2d_csr(n)
         N = n * n
         b = rand(N)
-        for me in [2, 4, 8, 0]
+        for max_elems in [2, 4, 8, 0]
             x = zeros(N)
             config = AMGConfig(
-                coarsening = HMISCoarsening(0.5, ExtendedIInterpolation(0.0, me)),
+                coarsening = HMISCoarsening(0.5, ExtendedIInterpolation(0.0, max_elems)),
                 pre_smoothing_steps = 2,
                 post_smoothing_steps = 2,
             )
@@ -2135,7 +2135,7 @@ end
             @test length(hierarchy.levels) >= 1
             x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-6, maxiter=300)
             r = b - sparse(A.At') * x
-            @test norm(r) / norm(b) < 1e-4
+            @test norm(r) / norm(b) < 1e-6
         end
     end
 

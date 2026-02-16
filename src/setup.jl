@@ -67,12 +67,6 @@ function amg_setup(A_csr::CSRMatrix{Tv, Ti}, config::AMGConfig=AMGConfig();
     # Determine if we need GPU-resident arrays: any non-CPU array type
     # (CuArray, JLArray, MtlArray, etc.) triggers GPU-resident hierarchy
     is_gpu = !(A_csr.nzval isa Array)
-    # Pre-compile level kernels once for the given backend/block_size
-    level_kcache = LevelKernelCache(
-        residual_kernel!(backend, block_size),
-        prolongate_kernel!(backend, block_size),
-        restrict_kernel!(backend, block_size),
-    )
     for lvl in 1:(config.max_levels - 1)
         n = size(A_current, 1)
         n <= config.max_coarse_size && break
@@ -99,14 +93,14 @@ function amg_setup(A_csr::CSRMatrix{Tv, Ti}, config::AMGConfig=AMGConfig();
             r = _allocate_vector(A_csr, Tv, n)
             xc = _allocate_vector(A_csr, Tv, n_coarse)
             bc = _allocate_vector(A_csr, Tv, n_coarse)
-            level = AMGLevel{Tv, Ti}(A_dev, P_dev, Pt_map_dev, r_map_dev, smoother, r, xc, bc, level_kcache)
+            level = AMGLevel{Tv, Ti}(A_dev, P_dev, Pt_map_dev, r_map_dev, smoother, r, xc, bc)
         else
             # CPU path: use arrays as-is
             smoother = build_smoother(A_cpu, config.smoother, config.jacobi_omega; backend=backend, block_size=block_size)
             r = Vector{Tv}(undef, n)
             xc = Vector{Tv}(undef, n_coarse)
             bc = Vector{Tv}(undef, n_coarse)
-            level = AMGLevel{Tv, Ti}(A_cpu, P, Pt_map, r_map, smoother, r, xc, bc, level_kcache)
+            level = AMGLevel{Tv, Ti}(A_cpu, P, Pt_map, r_map, smoother, r, xc, bc)
         end
         push!(levels, level)
         A_current = A_coarse
@@ -116,8 +110,6 @@ function amg_setup(A_csr::CSRMatrix{Tv, Ti}, config::AMGConfig=AMGConfig();
     # then copy to device so lu() dispatches to GPU (e.g., CUDA's cuSOLVER).
     # If the GPU backend doesn't support lu(), _build_coarse_lu falls back to CPU.
     n_coarse = size(A_current, 1)
-    # Pre-compile the solve-level residual kernel
-    solve_residual_k = residual_kernel!(backend, block_size)
     if is_gpu
         # Build dense on CPU first (A_current is CPU from compute_coarse_sparsity)
         A_cpu = csr_to_cpu(A_current)
@@ -143,7 +135,6 @@ function amg_setup(A_csr::CSRMatrix{Tv, Ti}, config::AMGConfig=AMGConfig();
     end
     hierarchy = AMGHierarchy{Tv, Ti}(levels, coarse_dense,
                                       coarse_factor, coarse_x, coarse_b, solve_r,
-                                      solve_residual_k,
                                       backend, block_size)
     t_setup = time() - t_setup
     if config.verbose >= 1

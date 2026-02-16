@@ -7,9 +7,11 @@ JLArrays = "27aeb0d3-9eb9-45fb-866b-73c2ecf80fcb"
 Jutul = "2b460a1a-8a2b-45b2-b125-b5c536396eb9"
 KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+LinearSolve = "7ed4a6bd-45f5-4d41-b270-4a48e9bafcae"
 Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
+SparseMatricesCSR = "a0a7dd2c-ebf4-11e9-1f05-cf50bc540ca1"
 
 [weakdeps]
 AMDGPU = "21141c5a-9bdb-4563-92ae-f87d6854732e"
@@ -28,8 +30,10 @@ CUDA = "5"
 JLArrays = "0.3"
 Jutul = "0.4.16"
 KernelAbstractions = "0.9"
+LinearSolve = "3.7.2"
 Metal = "1"
 Printf = "1.11.0"
+SparseMatricesCSR = "0.6.9"
 julia = "1.10"
 
 [extras]

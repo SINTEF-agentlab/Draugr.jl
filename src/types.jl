@@ -27,18 +27,23 @@ end
 StandardInterpolation() = StandardInterpolation(0.0)
 
 """
-    ExtendedIInterpolation(; trunc_factor=0.0)
+    ExtendedIInterpolation(; trunc_factor=0.0, max_elements=4)
 
 Extended+i interpolation (HYPRE InterpType=6): extends standard by including
 distance-2 coarse points (coarse points reachable through strong fine neighbors).
 Recommended for use with HMIS coarsening for challenging 3D problems.
 `trunc_factor`: entries with |w| < trunc_factor * max|w| per row are dropped
 (0 = no truncation). Maps to HYPRE's `AggTruncFactor`.
+`max_elements`: maximum number of interpolation entries per row (0 = no limit).
+When the number of entries exceeds this limit, only the strongest entries are kept.
+Default: 4.
 """
 struct ExtendedIInterpolation <: InterpolationType
     trunc_factor::Float64
+    max_elements::Int
 end
-ExtendedIInterpolation() = ExtendedIInterpolation(0.0)
+ExtendedIInterpolation() = ExtendedIInterpolation(0.0, 4)
+ExtendedIInterpolation(trunc_factor::Real) = ExtendedIInterpolation(Float64(trunc_factor), 4)
 
 # ── Coarsening type tags ──────────────────────────────────────────────────────
 abstract type CoarseningAlgorithm end
@@ -157,6 +162,7 @@ struct SerialGaussSeidelType <: SmootherType end
 struct SPAI0SmootherType <: SmootherType end
 struct SPAI1SmootherType <: SmootherType end
 struct L1JacobiSmootherType <: SmootherType end
+struct L1ColoredGaussSeidelType <: SmootherType end
 struct ChebyshevSmootherType <: SmootherType end
 struct ILU0SmootherType <: SmootherType end
 
@@ -190,6 +196,22 @@ mutable struct ColoredGaussSeidelSmoother{Tv, Ti, V<:AbstractVector{Tv}, Vi<:Abs
     color_order::Vi             # nodes sorted by color (device)
     num_colors::Int
     invdiag::V                  # inverse diagonal (device)
+end
+
+"""
+    L1ColoredGaussSeidelSmoother{Tv, Ti, V, Vi}
+
+L1 variant of the parallel multicolor Gauss-Seidel smoother. Uses l1 row norms
+for diagonal scaling instead of just the diagonal entry, providing more robust
+smoothing for difficult problems. Same coloring and parallelization strategy as
+`ColoredGaussSeidelSmoother`.
+"""
+mutable struct L1ColoredGaussSeidelSmoother{Tv, Ti, V<:AbstractVector{Tv}, Vi<:AbstractVector{Ti}} <: AbstractSmoother
+    colors::Vector{Ti}          # color[i] = color index for node i (CPU, used for setup only)
+    color_offsets::Vector{Int}  # color_offsets[c]:color_offsets[c+1]-1 = nodes of color c (CPU)
+    color_order::Vi             # nodes sorted by color (device)
+    num_colors::Int
+    invdiag::V                  # 1 / l1_row_norm (device)
 end
 
 """

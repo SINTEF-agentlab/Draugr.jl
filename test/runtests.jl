@@ -487,6 +487,47 @@ end
     end
 
     # ══════════════════════════════════════════════════════════════════════════
+    # L1 Colored Gauss-Seidel Smoother
+    # ══════════════════════════════════════════════════════════════════════════
+
+    @testset "L1 Colored GS Smoother - Build" begin
+        A = poisson1d_csr(10)
+        Ac = to_csr(A)
+        smoother = ParallelAMG.build_l1_colored_gs_smoother(Ac)
+        @test smoother isa L1ColoredGaussSeidelSmoother
+        @test smoother.num_colors >= 2
+        @test length(smoother.invdiag) == 10
+        # For interior row: l1 norm = |−1| + |2| + |−1| = 4, invdiag = 1/4
+        @test smoother.invdiag[5] ≈ 0.25
+        @test length(smoother.color_order) == 10
+    end
+
+    @testset "L1 Colored GS Smoother - Smoothing" begin
+        A = poisson1d_csr(10)
+        Ac = to_csr(A)
+        smoother = ParallelAMG.build_l1_colored_gs_smoother(Ac)
+        b = ones(10)
+        x = zeros(10)
+        smooth!(x, Ac, b, smoother; steps=10)
+        r = b - sparse(A.At') * x
+        @test norm(r) < norm(b)
+    end
+
+    @testset "AMG Solve - L1 Colored GS" begin
+        n = 10
+        A = poisson2d_csr(n)
+        N = n*n
+        b = rand(N)
+        x = zeros(N)
+        config = AMGConfig(smoother=L1ColoredGaussSeidelType())
+        hierarchy = amg_setup(A, config)
+        x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r = b - sparse(A.At') * x
+        @test norm(r) / norm(b) < 1e-8
+        @test niter < 200
+    end
+
+    # ══════════════════════════════════════════════════════════════════════════
     # Serial Gauss-Seidel Smoother
     # ══════════════════════════════════════════════════════════════════════════
 
@@ -634,6 +675,8 @@ end
         @test contains(output, "AMG Hierarchy Summary")
         @test contains(output, "Operator complexity")
         @test contains(output, "AMG solve converged")
+        @test contains(output, "Backend")
+        @test contains(output, "Block size")
     end
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -1536,6 +1579,7 @@ end
             ("Jacobi", AMGConfig()),
             ("l1-Jacobi", AMGConfig(smoother=L1JacobiSmootherType())),
             ("Colored GS", AMGConfig(smoother=ColoredGaussSeidelType())),
+            ("l1-Colored GS", AMGConfig(smoother=L1ColoredGaussSeidelType())),
             ("SPAI0", AMGConfig(smoother=SPAI0SmootherType())),
             ("ILU0", AMGConfig(smoother=ILU0SmootherType())),
         ]
@@ -2070,6 +2114,31 @@ end
         @test niter < 200
     end
 
+    @testset "ExtendedI max_elements" begin
+        # Test that max_elements limits the number of interpolation points per row
+        @test ExtendedIInterpolation().max_elements == 4
+        @test ExtendedIInterpolation(0.3).max_elements == 4
+        @test ExtendedIInterpolation(0.0, 8).max_elements == 8
+        # Test solving with different max_elements values
+        n = 10
+        A = poisson2d_csr(n)
+        N = n * n
+        b = rand(N)
+        for max_elems in [2, 4, 8, 0]
+            x = zeros(N)
+            config = AMGConfig(
+                coarsening = HMISCoarsening(0.5, ExtendedIInterpolation(0.0, max_elems)),
+                pre_smoothing_steps = 2,
+                post_smoothing_steps = 2,
+            )
+            hierarchy = amg_setup(A, config)
+            @test length(hierarchy.levels) >= 1
+            x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-6, maxiter=300)
+            r = b - sparse(A.At') * x
+            @test norm(r) / norm(b) < 1e-6
+        end
+    end
+
     # ══════════════════════════════════════════════════════════════════════════
     # Standalone Smoother API
     # ══════════════════════════════════════════════════════════════════════════
@@ -2102,6 +2171,9 @@ end
         # Serial GS
         s8 = build_smoother(A, SerialGaussSeidelType())
         @test s8 isa SerialGaussSeidelSmoother
+        # L1 Colored GS
+        s9 = build_smoother(A, L1ColoredGaussSeidelType())
+        @test s9 isa L1ColoredGaussSeidelSmoother
     end
 
     @testset "Standalone Smoother API - smooth! with StaticCSR" begin
@@ -2128,7 +2200,7 @@ end
         A = poisson1d_csr(10)
         b = ones(10)
         for stype in [JacobiSmootherType(), SPAI0SmootherType(), L1JacobiSmootherType(),
-                      ColoredGaussSeidelType(), ILU0SmootherType(), ChebyshevSmootherType(),
+                      ColoredGaussSeidelType(), L1ColoredGaussSeidelType(), ILU0SmootherType(), ChebyshevSmootherType(),
                       SPAI1SmootherType(), SerialGaussSeidelType()]
             smoother = build_smoother(A, stype)
             x = zeros(10)
@@ -2335,6 +2407,7 @@ end
                 L1JacobiSmootherType(),
                 ChebyshevSmootherType(),
                 ColoredGaussSeidelType(),
+                L1ColoredGaussSeidelType(),
                 ILU0SmootherType(),
             ]
             for smoother in all_smoothers

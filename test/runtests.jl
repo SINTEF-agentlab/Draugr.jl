@@ -4,6 +4,7 @@ using SparseArrays
 using LinearAlgebra
 using Random
 import Jutul
+using Jutul.StaticCSR: StaticSparsityMatrixCSR, static_sparsity_sparse
 
 # Helper: convert StaticSparsityMatrixCSR to internal CSRMatrix for unit tests
 to_csr(A) = ParallelAMG.csr_from_static(A)
@@ -645,8 +646,8 @@ end
         N = n*n
         b = rand(N)
 
-        # Create preconditioner
-        prec = ParallelAMGPreconditioner()
+        # Create preconditioner via solver dispatch
+        prec = ParallelAMGPreconditioner(solver=:jutul)
         @test prec isa Jutul.JutulPreconditioner
         @test isnothing(prec.hierarchy)
         @test Jutul.operator_nrows(prec) == 0
@@ -674,7 +675,7 @@ end
         N = n*n
         b = rand(N)
 
-        prec = ParallelAMGPreconditioner()
+        prec = ParallelAMGPreconditioner(solver=:jutul)
         ctx = Jutul.DefaultContext()
         Jutul.update_preconditioner!(prec, A, b, ctx, nothing)
 
@@ -692,6 +693,7 @@ end
 
     @testset "Jutul Interface - Custom Config" begin
         prec = ParallelAMGPreconditioner(
+            solver=:jutul,
             smoother=ColoredGaussSeidelType(),
             coarsening=PMISCoarsening(),
             pre_smoothing_steps=2,
@@ -2443,6 +2445,201 @@ end
             @test A_cpu.colval isa Vector
             @test A_cpu.nzval isa Vector
             @test size(A_cpu) == size(A_gpu)
+        end
+    end
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SparseMatricesCSR Extension
+    # ══════════════════════════════════════════════════════════════════════════
+
+    @testset "SparseMatricesCSR Extension" begin
+        using SparseMatricesCSR
+
+        function poisson1d_sparsecsr(n)
+            I = Int[]; J = Int[]; V = Float64[]
+            for i in 1:n
+                push!(I, i); push!(J, i); push!(V, 2.0)
+                if i > 1
+                    push!(I, i); push!(J, i-1); push!(V, -1.0)
+                end
+                if i < n
+                    push!(I, i); push!(J, i+1); push!(V, -1.0)
+                end
+            end
+            return sparsecsr(I, J, V, n, n)
+        end
+
+        @testset "amg_setup from SparseMatrixCSR" begin
+            A = poisson1d_sparsecsr(100)
+            h = amg_setup(A)
+            @test h isa AMGHierarchy
+            @test length(h.levels) >= 1
+        end
+
+        @testset "amg_solve from SparseMatrixCSR" begin
+            A = poisson1d_sparsecsr(100)
+            h = amg_setup(A)
+            b = ones(100)
+            x = zeros(100)
+            x, iter = amg_solve!(x, b, h)
+            # Verify convergence against CSC reference
+            A_csc = sparse(ones(Int, 0), ones(Int, 0), Float64[], 100, 100)
+            for i in 1:100
+                A_csc[i, i] = 2.0
+                if i > 1; A_csc[i, i-1] = -1.0; end
+                if i < 100; A_csc[i, i+1] = -1.0; end
+            end
+            r = b - A_csc * x
+            @test norm(r) / norm(b) < 1e-6
+        end
+
+        @testset "amg_resetup from SparseMatrixCSR" begin
+            A = poisson1d_sparsecsr(50)
+            h = amg_setup(A)
+            # Resetup with scaled values
+            I = Int[]; J = Int[]; V = Float64[]
+            for i in 1:50
+                push!(I, i); push!(J, i); push!(V, 4.0)
+                if i > 1
+                    push!(I, i); push!(J, i-1); push!(V, -2.0)
+                end
+                if i < 50
+                    push!(I, i); push!(J, i+1); push!(V, -2.0)
+                end
+            end
+            A2 = sparsecsr(I, J, V, 50, 50)
+            amg_resetup!(h, A2)
+            b = ones(50)
+            x = zeros(50)
+            x, iter = amg_solve!(x, b, h)
+            @test iter < 100
+        end
+    end
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # LinearSolve Extension
+    # ══════════════════════════════════════════════════════════════════════════
+
+    @testset "LinearSolve Extension" begin
+        using LinearSolve
+
+        @testset "ParallelAMGPreconditioner with solver=:linearsolve" begin
+            prec = ParallelAMGPreconditioner(solver=:linearsolve)
+            @test prec isa AbstractParallelAMGPreconditioner
+        end
+
+        @testset "ldiv! with LinearSolve preconditioner" begin
+            prec = ParallelAMGPreconditioner(solver=:linearsolve)
+            n = 50
+            A_csc = spdiagm(0 => fill(2.0, n), -1 => fill(-1.0, n-1), 1 => fill(-1.0, n-1))
+            ext = Base.get_extension(ParallelAMG, :ParallelAMGLinearSolveExt)
+            ext.update!(prec, A_csc)
+            b = ones(n)
+            x = zeros(n)
+            ldiv!(x, prec, b)
+            @test norm(x) > 0
+        end
+
+        @testset "LinearSolve GMRES with AMG preconditioner" begin
+            n = 50
+            A_csc = spdiagm(0 => fill(2.0, n), -1 => fill(-1.0, n-1), 1 => fill(-1.0, n-1))
+            prec = ParallelAMGPreconditioner(solver=:linearsolve)
+            ext = Base.get_extension(ParallelAMG, :ParallelAMGLinearSolveExt)
+            ext.update!(prec, A_csc)
+            b = rand(n)
+            prob = LinearProblem(A_csc, b)
+            sol = solve(prob, KrylovJL_GMRES(), Pl=prec)
+            @test norm(A_csc * sol.u - b) / norm(b) < 1e-4
+        end
+    end
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Base Preconditioner (standalone)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    @testset "Base ParallelAMGPreconditioner" begin
+        @testset "Standalone preconditioner" begin
+            prec = ParallelAMGPreconditioner()
+            @test prec isa AbstractParallelAMGPreconditioner
+            @test prec isa ParallelAMGPreconditioner
+            @test isnothing(prec.hierarchy)
+            @test ParallelAMG.preconditioner_nrows(prec) == 0
+        end
+
+        @testset "preconditioner_update! and preconditioner_apply!" begin
+            prec = ParallelAMGPreconditioner()
+            n = 50
+            A_csc = spdiagm(0 => fill(2.0, n), -1 => fill(-1.0, n-1), 1 => fill(-1.0, n-1))
+            A_csr = csr_from_csc(A_csc)
+            ParallelAMG.preconditioner_update!(prec, A_csr)
+            @test !isnothing(prec.hierarchy)
+            @test ParallelAMG.preconditioner_nrows(prec) == n
+
+            b = ones(n)
+            x = zeros(n)
+            ParallelAMG.preconditioner_apply!(x, prec, b)
+            @test norm(x) > 0
+        end
+
+        @testset "ldiv! on base preconditioner" begin
+            prec = ParallelAMGPreconditioner()
+            n = 50
+            A_csr = csr_from_csc(spdiagm(0 => fill(2.0, n), -1 => fill(-1.0, n-1), 1 => fill(-1.0, n-1)))
+            ParallelAMG.preconditioner_update!(prec, A_csr)
+            b = ones(n)
+            x = zeros(n)
+            ldiv!(x, prec, b)
+            @test norm(x) > 0
+        end
+
+        @testset "setup_specific_preconditioner error for unknown solver" begin
+            @test_throws ErrorException ParallelAMGPreconditioner(solver=:unknown_solver)
+        end
+    end
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SparseMatrixCSC convenience methods
+    # ══════════════════════════════════════════════════════════════════════════
+
+    @testset "SparseMatrixCSC convenience" begin
+        @testset "amg_setup from SparseMatrixCSC" begin
+            n = 50
+            A_csc = spdiagm(0 => fill(2.0, n), -1 => fill(-1.0, n-1), 1 => fill(-1.0, n-1))
+            h = amg_setup(A_csc)
+            @test h isa AMGHierarchy
+        end
+
+        @testset "amg_solve from SparseMatrixCSC" begin
+            n = 50
+            A_csc = spdiagm(0 => fill(2.0, n), -1 => fill(-1.0, n-1), 1 => fill(-1.0, n-1))
+            h = amg_setup(A_csc)
+            b = ones(n)
+            x = zeros(n)
+            x, iter = amg_solve!(x, b, h)
+            r = b - A_csc * x
+            @test norm(r) / norm(b) < 1e-6
+        end
+
+        @testset "amg_resetup from SparseMatrixCSC" begin
+            n = 50
+            A_csc = spdiagm(0 => fill(2.0, n), -1 => fill(-1.0, n-1), 1 => fill(-1.0, n-1))
+            h = amg_setup(A_csc)
+            A_csc2 = spdiagm(0 => fill(4.0, n), -1 => fill(-2.0, n-1), 1 => fill(-2.0, n-1))
+            amg_resetup!(h, A_csc2)
+            b = ones(n)
+            x = zeros(n)
+            x, iter = amg_solve!(x, b, h)
+            @test iter < 100
+        end
+
+        @testset "csr_from_csc" begin
+            A_csc = sparse([1,1,2,2,2,3,3], [1,2,1,2,3,2,3], [2.0,-1.0,-1.0,2.0,-1.0,-1.0,2.0], 3, 3)
+            A_csr = csr_from_csc(A_csc)
+            @test A_csr isa CSRMatrix
+            @test size(A_csr) == (3, 3)
+            @test A_csr[1,1] ≈ 2.0
+            @test A_csr[1,2] ≈ -1.0
+            @test A_csr[2,1] ≈ -1.0
         end
     end
 

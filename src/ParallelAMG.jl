@@ -6,18 +6,10 @@ using Random
 using KernelAbstractions
 using Printf
 
-# Import StaticCSR types from Jutul
-using Jutul.StaticCSR: StaticSparsityMatrixCSR, static_sparsity_sparse,
-                       nthreads, minbatch
-import Jutul.StaticCSR: colvals
-
 # Default backend for KernelAbstractions
 const DEFAULT_BACKEND = CPU(; static = true)
 
-# Local helpers for StaticCSR (not provided by Jutul)
-include("static_csr_helpers.jl")
-
-# Internal CSR matrix type (decoupled from Jutul)
+# Internal CSR matrix type
 include("csr_matrix.jl")
 
 # Type definitions
@@ -47,8 +39,8 @@ include("resetup.jl")
 # AMG cycling (V-cycle, solver)
 include("cycle.jl")
 
-# Jutul preconditioner interface
-include("jutul_interface.jl")
+# Preconditioner base types
+include("preconditioner.jl")
 
 # C-callable function interface
 include("cfunction_interface.jl")
@@ -61,10 +53,42 @@ This is a generic function extended by GPU backend extensions (CUDA, Metal).
 """
 function csr_from_gpu end
 
+"""
+    csr_from_static(A)
+
+Convert a `StaticSparsityMatrixCSR` (Jutul) to the internal `CSRMatrix`.
+Extended by the Jutul extension.
+"""
+function csr_from_static end
+
+"""
+    csr_copy_nzvals!(dest, src)
+
+Copy nonzero values from a source sparse matrix into an existing `CSRMatrix`.
+Extended by the Jutul extension for `StaticSparsityMatrixCSR`.
+"""
+function csr_copy_nzvals! end
+
+"""
+    static_csr_from_csc(A)
+
+Create a `StaticSparsityMatrixCSR` from a `SparseMatrixCSC`.
+Extended by the Jutul extension.
+"""
+function static_csr_from_csc end
+
+"""
+    find_nz_index(A, row, col)
+
+Find the index in the nonzero array for entry (row, col). Returns 0 if not found.
+Extended by the Jutul extension for `StaticSparsityMatrixCSR`.
+"""
+function find_nz_index end
+
 # Public API
-export StaticSparsityMatrixCSR, static_sparsity_sparse, static_csr_from_csc
 export colvals, rowptr
-export CSRMatrix, csr_from_gpu, csr_to_cpu
+export CSRMatrix, csr_from_gpu, csr_to_cpu, csr_from_csc, csr_from_static
+export static_csr_from_csc, find_nz_index, csr_copy_nzvals!
 export AggregationCoarsening, PMISCoarsening, HMISCoarsening, AggressiveCoarsening
 export SmoothedAggregationCoarsening, RSCoarsening
 export DirectInterpolation, StandardInterpolation, ExtendedIInterpolation
@@ -80,7 +104,8 @@ export JacobiSmootherType, ColoredGaussSeidelType, SerialGaussSeidelType
 export SPAI0SmootherType, SPAI1SmootherType
 export L1JacobiSmootherType, ChebyshevSmootherType, ILU0SmootherType
 export build_smoother, update_smoother!, smooth!
-export ParallelAMGPreconditioner
+export AbstractParallelAMGPreconditioner, ParallelAMGPreconditioner
+export setup_specific_preconditioner
 # C-callable interface
 export CoarseningEnum, SmootherEnum, InterpolationEnum, CycleEnum, StrengthEnum
 export COARSENING_AGGREGATION, COARSENING_PMIS, COARSENING_HMIS, COARSENING_RS

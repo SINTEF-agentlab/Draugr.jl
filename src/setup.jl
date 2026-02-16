@@ -38,14 +38,14 @@ function _restriction_map_to_device(ref::CSRMatrix, r_map::RestrictionMap)
 end
 
 """
-    amg_setup(A::StaticSparsityMatrixCSR, config; backend) -> AMGHierarchy
+    amg_setup(A::SparseMatrixCSC, config; backend, block_size) -> AMGHierarchy
 
-External API entry point: convert `StaticSparsityMatrixCSR` to `CSRMatrix` once
+External API entry point: convert `SparseMatrixCSC` to `CSRMatrix` once
 and forward to the general CSRMatrix-based setup.
 """
-function amg_setup(A::StaticSparsityMatrixCSR{Tv, Ti}, config::AMGConfig=AMGConfig();
+function amg_setup(A::SparseMatrixCSC{Tv, Ti}, config::AMGConfig=AMGConfig();
                    backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
-    return amg_setup(csr_from_static(A), config; backend=backend, block_size=block_size)
+    return amg_setup(csr_from_csc(A), config; backend=backend, block_size=block_size)
 end
 
 """

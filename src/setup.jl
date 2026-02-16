@@ -370,6 +370,7 @@ end
 
 _smoother_name(::JacobiSmoother) = "Jacobi"
 _smoother_name(::ColoredGaussSeidelSmoother) = "Colored GS"
+_smoother_name(::SerialGaussSeidelSmoother) = "Serial GS"
 _smoother_name(::SPAI0Smoother) = "SPAI(0)"
 _smoother_name(::SPAI1Smoother) = "SPAI(1)"
 _smoother_name(::L1JacobiSmoother) = "l1-Jacobi"

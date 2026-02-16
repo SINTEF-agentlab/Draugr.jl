@@ -153,6 +153,7 @@ struct SignedStrength <: StrengthType end
 abstract type SmootherType end
 struct JacobiSmootherType <: SmootherType end
 struct ColoredGaussSeidelType <: SmootherType end
+struct SerialGaussSeidelType <: SmootherType end
 struct SPAI0SmootherType <: SmootherType end
 struct SPAI1SmootherType <: SmootherType end
 struct L1JacobiSmootherType <: SmootherType end
@@ -189,6 +190,21 @@ mutable struct ColoredGaussSeidelSmoother{Tv, Ti, V<:AbstractVector{Tv}, Vi<:Abs
     color_order::Vi             # nodes sorted by color (device)
     num_colors::Int
     invdiag::V                  # inverse diagonal (device)
+end
+
+"""
+    SerialGaussSeidelSmoother{Tv, Ti}
+
+Serial (non-threaded, non-KA) Gauss-Seidel smoother. Performs a classic
+sequential forward sweep over all rows. Does not require graph coloring,
+threading, or KernelAbstractions.  Useful for small problems, debugging,
+or environments where parallelism overhead exceeds the benefit.
+
+All data is stored on CPU.
+"""
+mutable struct SerialGaussSeidelSmoother{Tv, Ti} <: AbstractSmoother
+    invdiag::Vector{Tv}         # inverse diagonal (CPU)
+    A_cpu::CSRMatrix{Tv, Ti}    # CPU copy of A for sequential access
 end
 
 """

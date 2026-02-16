@@ -2483,12 +2483,8 @@ end
             x = zeros(100)
             x, iter = amg_solve!(x, b, h)
             # Verify convergence against CSC reference
-            A_csc = sparse(ones(Int, 0), ones(Int, 0), Float64[], 100, 100)
-            for i in 1:100
-                A_csc[i, i] = 2.0
-                if i > 1; A_csc[i, i-1] = -1.0; end
-                if i < 100; A_csc[i, i+1] = -1.0; end
-            end
+            n = 100
+            A_csc = spdiagm(0 => fill(2.0, n), -1 => fill(-1.0, n-1), 1 => fill(-1.0, n-1))
             r = b - A_csc * x
             @test norm(r) / norm(b) < 1e-6
         end

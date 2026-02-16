@@ -1299,15 +1299,13 @@ end
         nzv_orig = nonzeros(Ac)
         nzv_weak = nonzeros(A_weak)
         rp = rowptr(Ac)
-        # Row 1 (corner, 2 neighbors): |row_sum|/|diag| = 0.5 > 0.3, off-diag should be zeroed
-        has_zeroed_corner = false
+        # Row 1 (corner, 2 neighbors): |row_sum|/|diag| = 0.5 > 0.3, all off-diag should be zeroed
         for nz in rp[1]:(rp[1+1]-1)
             j = cv[nz]
-            if j != 1 && abs(nzv_weak[nz]) < 1e-14
-                has_zeroed_corner = true
+            if j != 1
+                @test abs(nzv_weak[nz]) < 1e-14
             end
         end
-        @test has_zeroed_corner
         # Interior row 13 (4 neighbors): |row_sum|/|diag| = 0.0 < 0.3, should NOT be affected
         row13_unchanged = true
         for nz in rp[13]:(rp[13+1]-1)

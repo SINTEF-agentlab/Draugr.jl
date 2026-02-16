@@ -189,13 +189,11 @@ function _apply_max_row_sum(A::CSRMatrix{Tv, Ti}, threshold::Real) where {Tv, Ti
     @inbounds for i in 1:n
         diag = zero(Tv)
         row_sum = zero(Tv)
-        diag_nz = 0
         for nz in rp[i]:(rp[i+1]-1)
             j = cv[nz]
             row_sum += nzv_old[nz]
             if j == i
                 diag = nzv_old[nz]
-                diag_nz = nz
             end
         end
         abs_diag = abs(diag)

@@ -1,3 +1,253 @@
 # ParallelAMG.jl
 
-This is a entirely agent engineered parallel AMG solver with CUDA and Metal.jl support using Claude Opus 4.6, as a part of a research project at the SINTEF AgentLab.
+A parallel Algebraic Multigrid (AMG) solver for Julia with GPU support via
+[KernelAbstractions.jl](https://github.com/JuliaGPU/KernelAbstractions.jl).
+Supports NVIDIA (CUDA), AMD (AMDGPU/ROCm), and Apple (Metal) GPUs as well as
+CPU execution.  Built as a research project at the SINTEF AgentLab.
+
+## Installation
+
+```julia
+using Pkg
+Pkg.add("ParallelAMG")
+```
+
+For GPU backends, install the corresponding package:
+
+```julia
+Pkg.add("CUDA")    # NVIDIA GPUs
+Pkg.add("AMDGPU")  # AMD GPUs (ROCm)
+Pkg.add("Metal")   # Apple GPUs
+```
+
+## Quick Start
+
+```julia
+using ParallelAMG, SparseArrays
+
+# Build a sparse matrix in CSR format (via Jutul's StaticCSR)
+using Jutul.StaticCSR: static_sparsity_sparse
+I = [1,1,2,2,2,3,3]; J = [1,2,1,2,3,2,3]
+V = [2.0,-1.0,-1.0,2.0,-1.0,-1.0,2.0]
+A = static_sparsity_sparse(I, J, V, 3, 3)
+
+# Or convert from a standard Julia CSC sparse matrix
+A_csc = sparse(I, J, V, 3, 3)
+A     = static_csr_from_csc(A_csc)
+
+# Setup the AMG hierarchy
+config    = AMGConfig()
+hierarchy = amg_setup(A, config)
+
+# Solve Ax = b
+b = [1.0, 0.0, 1.0]
+x = zeros(3)
+x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-10, maxiter=100)
+
+# Or apply a single AMG cycle (e.g. as a preconditioner)
+fill!(x, 0.0)
+amg_cycle!(x, b, hierarchy, config)
+```
+
+## AMG Configuration
+
+`AMGConfig` controls every aspect of the solver.  All fields have sensible
+defaults:
+
+```julia
+config = AMGConfig(;
+    coarsening           = AggregationCoarsening(),  # see Coarsening below
+    smoother             = JacobiSmootherType(),      # see Smoothers below
+    max_levels           = 20,
+    max_coarse_size      = 50,
+    pre_smoothing_steps  = 1,
+    post_smoothing_steps = 1,
+    jacobi_omega         = 2/3,
+    cycle_type           = :V,          # :V or :W
+    strength_type        = AbsoluteStrength(), # or SignedStrength()
+    verbose              = 0,           # 0=silent, 1=summary, 2=per-iteration
+)
+```
+
+A HYPRE-like default for challenging 3D problems is also provided:
+
+```julia
+config = hypre_default_config()  # HMIS + aggressive coarsening + ext+i interpolation
+```
+
+### Coarsening Algorithms
+
+| Type                            | Description                                    |
+|---------------------------------|------------------------------------------------|
+| `AggregationCoarsening(θ)`      | Greedy aggregation (default, θ=0.25)           |
+| `SmoothedAggregationCoarsening` | Smoothed aggregation (Jacobi-smoothed P)       |
+| `PMISCoarsening(θ, interp)`     | Parallel Modified Independent Set              |
+| `HMISCoarsening(θ, interp)`     | Hybrid MIS (less aggressive than PMIS)         |
+| `RSCoarsening(θ, interp)`       | Classical Ruge-Stüben                          |
+| `AggressiveCoarsening(θ, base)` | Two-pass aggressive (`:pmis` or `:hmis` base)  |
+
+### Interpolation Types
+
+| Type                       | Description                              |
+|----------------------------|------------------------------------------|
+| `DirectInterpolation()`    | Direct interpolation from C-points       |
+| `StandardInterpolation()`  | Classical RS interpolation               |
+| `ExtendedIInterpolation()` | Extended+i (recommended with HMIS/aggressive) |
+
+All interpolation types accept an optional `trunc_factor` for weight truncation
+(matching HYPRE's `AggTruncFactor`).
+
+### Smoothers
+
+| Type                        | Description                                 |
+|-----------------------------|---------------------------------------------|
+| `JacobiSmootherType()`      | Weighted Jacobi (default, GPU-friendly)     |
+| `L1JacobiSmootherType()`    | l1-Jacobi (more robust for difficult cases) |
+| `ColoredGaussSeidelType()`  | Parallel multicolor Gauss-Seidel            |
+| `SerialGaussSeidelType()`   | Sequential Gauss-Seidel (CPU only)          |
+| `SPAI0SmootherType()`       | Diagonal sparse approximate inverse         |
+| `SPAI1SmootherType()`       | Sparse approximate inverse (pattern of A)   |
+| `ChebyshevSmootherType()`   | Chebyshev polynomial smoother               |
+| `ILU0SmootherType()`        | Incomplete LU(0)                            |
+
+## Resetup (Updating Coefficients)
+
+When the matrix sparsity stays the same but coefficients change (e.g. in a
+nonlinear iteration), use `amg_resetup!` to avoid redoing the symbolic phase:
+
+```julia
+# A_new has the same sparsity pattern as A
+amg_resetup!(hierarchy, A_new, config)
+```
+
+## GPU Usage
+
+ParallelAMG works on any GPU supported by KernelAbstractions.jl.  The setup
+phase (coarsening, prolongation construction) runs on CPU; the hierarchy
+data is then copied to the GPU for the solve/cycle phase.
+
+### NVIDIA GPUs (CUDA)
+
+```julia
+using CUDA, ParallelAMG
+
+A_gpu = CuSparseMatrixCSR(A_csc)          # or build from CuVectors
+hierarchy = amg_setup(A_gpu, config)       # auto-selects CUDABackend()
+
+x = CUDA.zeros(Float64, n)
+b = CuArray(b_cpu)
+amg_solve!(x, b, hierarchy, config)
+```
+
+### AMD GPUs (AMDGPU / ROCm)
+
+```julia
+using AMDGPU, ParallelAMG
+
+A_gpu = ROCSparseMatrixCSR(A_csc)          # or build from ROCVectors
+hierarchy = amg_setup(A_gpu, config)       # auto-selects ROCBackend()
+
+x = AMDGPU.zeros(Float64, n)
+b = ROCArray(b_cpu)
+amg_solve!(x, b, hierarchy, config)
+```
+
+### Apple GPUs (Metal)
+
+Metal does not have a native sparse CSR type.  Construct a `CSRMatrix` from
+`MtlVector`s directly:
+
+```julia
+using Metal, ParallelAMG
+
+rp  = MtlVector(rowptr_cpu)
+cv  = MtlVector(colval_cpu)
+nzv = MtlVector(nzval_cpu)
+A   = CSRMatrix(rp, cv, nzv, n, n)
+hierarchy = amg_setup(A, config)           # auto-selects MetalBackend()
+```
+
+## Jutul Integration
+
+ParallelAMG provides a `ParallelAMGPreconditioner` that implements the Jutul
+preconditioner interface, so it can be used as a drop-in preconditioner in
+Jutul's linear solvers:
+
+```julia
+using Jutul, ParallelAMG
+
+precond = ParallelAMGPreconditioner(;
+    coarsening = HMISCoarsening(0.5, ExtendedIInterpolation(0.3)),
+    smoother   = JacobiSmootherType(),
+    verbose    = 1,
+)
+# Pass `precond` to Jutul's solver setup
+```
+
+## C-Callable Interface
+
+ParallelAMG provides a set of `@cfunction`-compatible routines so the solver
+can be called from C, C++, Fortran, or any language that can call C functions.
+Integer enums are used to select algorithms.
+
+### Enums
+
+| Category        | Values                                                                     |
+|-----------------|----------------------------------------------------------------------------|
+| `CoarseningEnum`| `COARSENING_AGGREGATION(0)`, `COARSENING_PMIS(1)`, `COARSENING_HMIS(2)`, `COARSENING_RS(3)`, `COARSENING_AGGRESSIVE_PMIS(4)`, `COARSENING_AGGRESSIVE_HMIS(5)`, `COARSENING_SMOOTHED_AGGREGATION(6)` |
+| `SmootherEnum`  | `SMOOTHER_JACOBI(0)`, `SMOOTHER_COLORED_GS(1)`, `SMOOTHER_SERIAL_GS(2)`, `SMOOTHER_SPAI0(3)`, `SMOOTHER_SPAI1(4)`, `SMOOTHER_L1_JACOBI(5)`, `SMOOTHER_CHEBYSHEV(6)`, `SMOOTHER_ILU0(7)` |
+| `InterpolationEnum` | `INTERPOLATION_DIRECT(0)`, `INTERPOLATION_STANDARD(1)`, `INTERPOLATION_EXTENDED_I(2)` |
+| `CycleEnum`     | `CYCLE_V(0)`, `CYCLE_W(1)` |
+| `StrengthEnum`  | `STRENGTH_ABSOLUTE(0)`, `STRENGTH_SIGNED(1)` |
+
+### Workflow from Julia
+
+```julia
+using ParallelAMG
+
+# 1. Create a config handle
+cfg = amg_c_config_create(
+    Int32(0),   # coarsening: AGGREGATION
+    Int32(0),   # smoother:   JACOBI
+    Int32(0),   # interpolation: DIRECT
+    Int32(0),   # strength:   ABSOLUTE
+    Int32(0),   # cycle:      V
+    0.25,       # θ
+    0.0,        # trunc_factor
+    2/3,        # jacobi_omega
+    Int32(20),  # max_levels
+    Int32(50),  # max_coarse_size
+    Int32(1),   # pre_smoothing_steps
+    Int32(1),   # post_smoothing_steps
+    Int32(0),   # verbose
+)
+
+# 2. Setup (rowptr, colval, nzval are 1-based Int32/Float64 arrays)
+h = amg_c_setup(Int32(n), Int32(nnz), pointer(rowptr), pointer(colval), pointer(nzval), cfg)
+
+# 3. Solve
+niter = amg_c_solve!(h, Int32(n), pointer(x), pointer(b), cfg, 1e-10, Int32(100))
+
+# 4. Apply a single cycle
+amg_c_cycle!(h, Int32(n), pointer(x), pointer(b), cfg)
+
+# 5. Resetup with new coefficients (same sparsity)
+amg_c_resetup!(h, Int32(n), Int32(nnz), pointer(rowptr), pointer(colval), pointer(nzval_new), cfg)
+
+# 6. Cleanup
+amg_c_free!(h)
+amg_c_config_free!(cfg)
+```
+
+### Getting `@cfunction` Pointers
+
+To pass function pointers to a C library:
+
+```julia
+cfuncs = amg_c_get_cfunctions()
+# cfuncs.setup, cfuncs.solve, cfuncs.cycle, etc. are Ptr{Cvoid}
+```
+
+## License
+
+See the repository for license details.

@@ -9,22 +9,33 @@ using KernelAbstractions
 # ── CSR conversion from SparseMatrixCSR ──────────────────────────────────────
 
 """
-    csr_from_sparse_csr(A::SparseMatrixCSR{Bi}) -> CSRMatrix
+    csr_from_sparse_csr(A::SparseMatrixCSR{Bi}; do_collect=false) -> CSRMatrix
 
 Convert a `SparseMatrixCSR` from SparseMatricesCSR.jl to the internal `CSRMatrix`
 representation by extracting its raw CSR vectors.
 
 Handles both 0-based and 1-based indexing (Bi parameter).
+
+When `do_collect` is `false` (default) and indexing is 1-based, the resulting
+`CSRMatrix` directly references the internal arrays without copying.
+When `do_collect` is `true`, `collect` is called to produce independent copies.
+Zero-based indexing always requires a copy since the indices must be converted.
 """
-function csr_from_sparse_csr(A::SparseMatrixCSR{Bi, Tv, Ti}) where {Bi, Tv, Ti}
-    rp = collect(SparseMatricesCSR.getrowptr(A))
-    cv = collect(SparseMatricesCSR.getcolval(A))
-    nzv = collect(nonzeros(A))
+function csr_from_sparse_csr(A::SparseMatrixCSR{Bi, Tv, Ti}; do_collect::Bool=false) where {Bi, Tv, Ti}
+    rp = SparseMatricesCSR.getrowptr(A)
+    cv = SparseMatricesCSR.getcolval(A)
+    nzv = nonzeros(A)
     # SparseMatrixCSR uses Bi-based indexing; convert to 1-based if needed
     if Bi != 1
+        # Zero-based indexing always requires a copy
         offset = Ti(1 - Bi)
-        rp .+= offset
-        cv .+= offset
+        rp = collect(rp) .+ offset
+        cv = collect(cv) .+ offset
+        nzv = collect(nzv)
+    elseif do_collect
+        rp = collect(rp)
+        cv = collect(cv)
+        nzv = collect(nzv)
     end
     return CSRMatrix(rp, cv, nzv, size(A, 1), size(A, 2))
 end

@@ -232,3 +232,20 @@ function _allocate_dense_matrix(A::CSRMatrix, ::Type{Tv}, m::Int, n::Int) where 
     be = _get_backend(A.nzval)
     return KernelAbstractions.zeros(be, Tv, m, n)
 end
+
+"""Find column `col` in row range [start, stop] of colval array using binary search."""
+function _find_nz_in_row(cv::AbstractVector{Ti}, start, stop, col) where Ti
+    lo, hi = Ti(start), Ti(stop)
+    while lo <= hi
+        mid = (lo + hi) >> 1
+        @inbounds c = cv[mid]
+        if c == col
+            return mid
+        elseif c < col
+            lo = mid + one(Ti)
+        else
+            hi = mid - one(Ti)
+        end
+    end
+    return zero(Ti)
+end

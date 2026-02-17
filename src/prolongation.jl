@@ -656,7 +656,7 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                 end
             end
             denom = one(Tv) - sum_removed
-            if abs(denom) > eps(real(Tv))
+            if abs(denom) > Tv(1e-12)
                 row_scale = one(Tv) / denom
             end
         end

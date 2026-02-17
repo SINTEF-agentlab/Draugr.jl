@@ -278,9 +278,45 @@ _get_trunc_factor(::InterpolationType) = 0.0
 Truncate interpolation weights: for each row, drop entries with
 |w| < trunc_factor * max|w| and rescale remaining entries to preserve row sum.
 This is equivalent to HYPRE's AggTruncFactor.
+Preserves `trunc_scaling` from the input P when present, filtering it in
+sync with the nzval entries.
 """
 function _truncate_interpolation(P::ProlongationOp{Ti, Tv}, trunc_factor::Real) where {Ti, Tv}
-    return _filter_prolongation(P, trunc_factor)
+    P_new = _filter_prolongation(P, trunc_factor)
+    if P.trunc_scaling !== nothing
+        # Re-filter trunc_scaling using same logic as _filter_prolongation
+        S_new = Tv[]
+        @inbounds for i in 1:P.nrow
+            rstart = P.rowptr[i]
+            rend = P.rowptr[i+1] - 1
+            rstart > rend && continue
+            max_val = zero(real(Tv))
+            for nz in rstart:rend
+                max_val = max(max_val, abs(P.nzval[nz]))
+            end
+            threshold = Tv(trunc_factor) * max_val
+            row_count = 0
+            for nz in rstart:rend
+                if abs(P.nzval[nz]) >= threshold
+                    push!(S_new, P.trunc_scaling[nz])
+                    row_count += 1
+                end
+            end
+            if row_count == 0
+                best_nz = rstart
+                best_val = zero(real(Tv))
+                for nz in rstart:rend
+                    if abs(P.nzval[nz]) > best_val
+                        best_val = abs(P.nzval[nz])
+                        best_nz = nz
+                    end
+                end
+                push!(S_new, P.trunc_scaling[best_nz])
+            end
+        end
+        P_new.trunc_scaling = S_new
+    end
+    return P_new
 end
 
 # ── Pretty-printing helpers ──────────────────────────────────────────────────

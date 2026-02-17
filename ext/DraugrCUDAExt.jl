@@ -36,36 +36,14 @@ end
 """
     amg_resetup!(hierarchy, A_new::CuSparseMatrixCSR, config)
 
-AMG resetup accepting a CUDA sparse CSR matrix. Uses backend and block_size
-from the hierarchy.
+AMG resetup accepting a CUDA sparse CSR matrix. Converts to a CPU
+`CSRMatrix` and forwards to the main `CSRMatrix`-based resetup.
 """
 function Draugr.amg_resetup!(hierarchy::AMGHierarchy{Tv, Ti},
                                   A_new::CuSparseMatrixCSR{Tv, Ti},
                                   config::AMGConfig=AMGConfig()) where {Tv, Ti}
-    backend = hierarchy.backend
-    block_size = hierarchy.block_size
     A_csr = Draugr.csr_to_cpu(Draugr.csr_from_gpu(A_new))
-    nlevels = length(hierarchy.levels)
-    if nlevels == 0
-        Draugr._update_coarse_solver!(hierarchy, A_csr; block_size=block_size)
-        return hierarchy
-    end
-    # Copy nonzero values from new matrix into existing level 1
-    level1 = hierarchy.levels[1]
-    Draugr._copy_nzvals!(level1.A, A_csr; block_size=block_size)
-    Draugr.update_smoother!(level1.smoother, level1.A; block_size=block_size)
-    # Update subsequent levels via Galerkin products
-    for lvl in 1:(nlevels - 1)
-        level = hierarchy.levels[lvl]
-        next_level = hierarchy.levels[lvl + 1]
-        Draugr.galerkin_product!(next_level.A, level.A, level.P, level.R_map; block_size=block_size)
-        Draugr.update_smoother!(next_level.smoother, next_level.A; block_size=block_size)
-    end
-    # Recompute coarsest dense matrix and LU
-    last_level = hierarchy.levels[nlevels]
-    Draugr._recompute_coarsest_dense!(hierarchy, last_level)
-    hierarchy.coarse_factor = lu(hierarchy.coarse_A)
-    return hierarchy
+    return Draugr.amg_resetup!(hierarchy, A_csr, config)
 end
 
 end # module

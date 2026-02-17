@@ -1891,6 +1891,102 @@ end
     end
 
     # ══════════════════════════════════════════════════════════════════════════
+    # Serial ILU(0) Smoother
+    # ══════════════════════════════════════════════════════════════════════════
+
+    @testset "Serial ILU(0) Smoother - Build" begin
+        A = poisson1d_csr(10)
+        Ac = to_csr(A)
+        smoother = Draugr.build_serial_ilu0_smoother(Ac)
+        @test smoother isa SerialILU0Smoother
+        @test length(smoother.L_nzval) == nnz(A)
+        @test length(smoother.U_nzval) == nnz(A)
+        @test length(smoother.diag_idx) == 10
+    end
+
+    @testset "Serial ILU(0) Smoother - Smoothing" begin
+        A = poisson1d_csr(10)
+        Ac = to_csr(A)
+        smoother = Draugr.build_serial_ilu0_smoother(Ac)
+        b = ones(10)
+        x = zeros(10)
+        smooth!(x, Ac, b, smoother; steps=3)
+        r = b - sparse(A.At') * x
+        @test norm(r) < norm(b)
+    end
+
+    @testset "Serial ILU(0) Smoother - AMG Solve" begin
+        n = 10
+        A = poisson2d_csr(n)
+        N = n*n
+        b = rand(N)
+        x = zeros(N)
+        config = AMGConfig(smoother=SerialILU0SmootherType())
+        hierarchy = amg_setup(A, config)
+        x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r = b - sparse(A.At') * x
+        @test norm(r) / norm(b) < 1e-8
+        @test niter < 200
+    end
+
+    @testset "Serial ILU(0) Smoother - Resetup" begin
+        n = 8
+        A = poisson2d_csr(n)
+        N = n*n
+        config = AMGConfig(smoother=SerialILU0SmootherType())
+        hierarchy = amg_setup(A, config)
+        b = rand(N)
+        x1 = zeros(N)
+        x1, _ = amg_solve!(x1, b, hierarchy, config; tol=1e-8, maxiter=200)
+        nonzeros(A) .*= 2.0
+        amg_resetup!(hierarchy, A, config)
+        x2 = zeros(N)
+        x2, _ = amg_solve!(x2, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r2 = b - sparse(A.At') * x2
+        @test norm(r2) / norm(b) < 1e-8
+    end
+
+    @testset "Serial ILU(0) - Anisotropic" begin
+        A = anisotropic_csr(8, 8)
+        N = 64
+        b = rand(N)
+        x = zeros(N)
+        config = AMGConfig(smoother=SerialILU0SmootherType())
+        hierarchy = amg_setup(A, config)
+        x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r = b - sparse(A.At') * x
+        @test norm(r) / norm(b) < 1e-8
+    end
+
+    @testset "Serial ILU(0) - Reservoir-like" begin
+        A = reservoir_like_csr(50)
+        N = 50
+        b = rand(N)
+        x = zeros(N)
+        config = AMGConfig(smoother=SerialILU0SmootherType())
+        hierarchy = amg_setup(A, config)
+        x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r = b - sparse(A.At') * x
+        @test norm(r) / norm(b) < 1e-8
+    end
+
+    @testset "Parallel and Serial ILU(0) produce same factorization" begin
+        A = poisson2d_csr(6)
+        Ac = to_csr(A)
+        s_par = Draugr.build_ilu0_smoother(Ac)
+        s_ser = Draugr.build_serial_ilu0_smoother(Ac)
+        @test s_par.L_nzval ≈ s_ser.L_nzval
+        @test s_par.U_nzval ≈ s_ser.U_nzval
+        @test s_par.diag_idx == s_ser.diag_idx
+    end
+
+    @testset "Serial ILU(0) build_smoother dispatch" begin
+        A = poisson1d_csr(10)
+        s = build_smoother(A, SerialILU0SmootherType())
+        @test s isa SerialILU0Smoother
+    end
+
+    # ══════════════════════════════════════════════════════════════════════════
     # Coarsening stalling fix
     # ══════════════════════════════════════════════════════════════════════════
 
@@ -2267,6 +2363,9 @@ end
         # L1 Colored GS
         s9 = build_smoother(A, L1ColoredGaussSeidelType())
         @test s9 isa L1ColoredGaussSeidelSmoother
+        # Serial ILU0
+        s10 = build_smoother(A, SerialILU0SmootherType())
+        @test s10 isa SerialILU0Smoother
     end
 
     @testset "Standalone Smoother API - smooth! with StaticCSR" begin
@@ -2294,7 +2393,7 @@ end
         b = ones(10)
         for stype in [JacobiSmootherType(), SPAI0SmootherType(), L1JacobiSmootherType(),
                       ColoredGaussSeidelType(), L1ColoredGaussSeidelType(), ILU0SmootherType(), ChebyshevSmootherType(),
-                      SPAI1SmootherType(), SerialGaussSeidelType()]
+                      SPAI1SmootherType(), SerialGaussSeidelType(), SerialILU0SmootherType()]
             smoother = build_smoother(A, stype)
             x = zeros(10)
             smooth!(x, A, b, smoother; steps=10)

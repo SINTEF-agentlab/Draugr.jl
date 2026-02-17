@@ -415,6 +415,82 @@ function build_smoother(A::CSRMatrix, ::SerialGaussSeidelType, ω::Real; backend
 end
 
 # ══════════════════════════════════════════════════════════════════════════════
+# L1 Serial (non-threaded) Gauss-Seidel Smoother
+# ══════════════════════════════════════════════════════════════════════════════
+
+"""
+    build_l1_serial_gs_smoother(A)
+
+Build a serial L1 Gauss-Seidel smoother matching hypre's default l1-GS relaxation.
+Uses l1 row norms for diagonal scaling. All data is stored on CPU.
+No graph coloring, threading, or KernelAbstractions are used.
+"""
+function build_l1_serial_gs_smoother(A::CSRMatrix{Tv, Ti}) where {Tv, Ti}
+    A_cpu = csr_to_cpu(A)
+    n = size(A_cpu, 1)
+    invdiag = Vector{Tv}(undef, n)
+    _serial_l1_gs_compute_invdiag!(invdiag, nonzeros(A_cpu), colvals(A_cpu), rowptr(A_cpu), n)
+    return L1SerialGaussSeidelSmoother{Tv, Ti}(invdiag, A_cpu)
+end
+
+"""
+    _serial_l1_gs_compute_invdiag!(invdiag, nzv, cv, rp, n)
+
+Compute inverse l1 row norms for serial L1 GS smoother.
+"""
+function _serial_l1_gs_compute_invdiag!(invdiag::Vector{Tv}, nzv, cv, rp, n::Int) where {Tv}
+    @inbounds for i in 1:n
+        l1_norm = zero(real(Tv))
+        for nz in rp[i]:(rp[i+1]-1)
+            l1_norm += _entry_norm(nzv[nz])
+        end
+        invdiag[i] = l1_norm > eps(real(Tv)) ? inv(l1_norm) : zero(Tv)
+    end
+    return invdiag
+end
+
+function update_smoother!(smoother::L1SerialGaussSeidelSmoother{Tv, Ti}, A::CSRMatrix;
+                          backend=_get_backend(nonzeros(A)), block_size::Int=64) where {Tv, Ti}
+    A_cpu = csr_to_cpu(A)
+    copyto!(smoother.A_cpu.nzval, A_cpu.nzval)
+    n = size(A_cpu, 1)
+    _serial_l1_gs_compute_invdiag!(smoother.invdiag, nonzeros(smoother.A_cpu), colvals(smoother.A_cpu), rowptr(smoother.A_cpu), n)
+    return smoother
+end
+
+"""
+    smooth!(x, A, b, smoother::L1SerialGaussSeidelSmoother; steps=1)
+
+Apply serial L1 Gauss-Seidel smoothing. Performs a sequential forward sweep
+over all rows using l1 row norms for diagonal scaling. For GPU arrays,
+copies data to CPU, applies GS, and copies back.
+"""
+function smooth!(x::AbstractVector, A::CSRMatrix{Tv, Ti}, b::AbstractVector,
+                 smoother::L1SerialGaussSeidelSmoother; steps::Int=1, backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
+    n = size(A, 1)
+    is_gpu = !(x isa Array)
+    if is_gpu
+        x_cpu = Array(x)
+        b_cpu = Array(b)
+    else
+        x_cpu = x
+        b_cpu = b
+    end
+    # Reuses the same forward sweep as standard serial GS; the L1 variant
+    # differs only in how invdiag is computed (l1 row norms vs diagonal entries).
+    _serial_gs_sweep!(x_cpu, b_cpu, nonzeros(smoother.A_cpu), colvals(smoother.A_cpu),
+                      rowptr(smoother.A_cpu), smoother.invdiag, n, steps)
+    if is_gpu
+        copyto!(x, x_cpu)
+    end
+    return x
+end
+
+function build_smoother(A::CSRMatrix, ::L1SerialGaussSeidelType, ω::Real; backend=DEFAULT_BACKEND, block_size::Int=64)
+    return build_l1_serial_gs_smoother(A)
+end
+
+# ══════════════════════════════════════════════════════════════════════════════
 # SPAI(0) Smoother - Diagonal Sparse Approximate Inverse
 # ══════════════════════════════════════════════════════════════════════════════
 

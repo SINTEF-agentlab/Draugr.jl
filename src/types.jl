@@ -458,8 +458,8 @@ struct AMGConfig
 end
 
 function AMGConfig(;
-    coarsening::CoarseningAlgorithm = AggregationCoarsening(),
-    smoother::SmootherType = JacobiSmootherType(),
+    coarsening::CoarseningAlgorithm = HMISCoarsening(0.5, ExtendedIInterpolation()),
+    smoother::SmootherType = L1ColoredGaussSeidelType(),
     max_levels::Int = 20,
     max_coarse_size::Int = 50,
     pre_smoothing_steps::Int = 1,
@@ -471,11 +471,6 @@ function AMGConfig(;
     max_row_sum::Float64 = 1.0,
     cycle_type::Symbol = :V,
     strength_type::StrengthType = AbsoluteStrength(),
-    # Deprecated: accepted for backward compatibility but not stored in config.
-    # block_size is passed through to `amg_setup` and stored in the hierarchy.
-    block_size::Int = 64,
-    min_coarse_ratio::Float64 = 0.5,
-    max_stall_levels::Int = 2,
 )
     @assert cycle_type in (:V, :W) "cycle_type must be :V or :W"
     verbose_int = verbose isa Bool ? Int(verbose) : verbose

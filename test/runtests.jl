@@ -1821,7 +1821,7 @@ end
         @test length(smoother.L_nzval) == nnz(A)
         @test length(smoother.U_nzval) == nnz(A)
         @test length(smoother.diag_idx) == 10
-        @test smoother.num_colors >= 2
+        @test smoother.num_fwd_levels >= 2
     end
 
     @testset "ILU(0) Smoother - Smoothing" begin

@@ -1,4 +1,4 @@
-name = "ParallelAMG"
+name = "Draugr"
 uuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
 version = "0.1.0"
 
@@ -19,13 +19,13 @@ Metal = "dde4c033-4e86-420c-a63e-0dd931031962"
 SparseMatricesCSR = "a0a7dd2c-ebf4-11e9-1f05-cf50bc540ca1"
 
 [extensions]
-ParallelAMGAMDGPUExt = "AMDGPU"
-ParallelAMGCUDAExt = "CUDA"
-ParallelAMGJLArraysExt = "JLArrays"
-ParallelAMGJutulExt = "Jutul"
-ParallelAMGLinearSolveExt = "LinearSolve"
-ParallelAMGMetalExt = "Metal"
-ParallelAMGSparseMatricesCSRExt = "SparseMatricesCSR"
+DraugrAMDGPUExt = "AMDGPU"
+DraugrCUDAExt = "CUDA"
+DraugrJLArraysExt = "JLArrays"
+DraugrJutulExt = "Jutul"
+DraugrLinearSolveExt = "LinearSolve"
+DraugrMetalExt = "Metal"
+DraugrSparseMatricesCSRExt = "SparseMatricesCSR"
 
 [compat]
 AMDGPU = "1, 2"

@@ -117,7 +117,8 @@ export SMOOTHER_L1_COLORED_GS, SMOOTHER_SERIAL_ILU0, SMOOTHER_L1_SERIAL_GS
 export INTERPOLATION_DIRECT, INTERPOLATION_STANDARD, INTERPOLATION_EXTENDED_I
 export CYCLE_V, CYCLE_W
 export STRENGTH_ABSOLUTE, STRENGTH_SIGNED
-export amg_c_config_create, amg_c_setup, amg_c_resetup!, amg_c_solve!, amg_c_cycle!
-export amg_c_free!, amg_c_config_free!, amg_c_get_cfunctions
+export draugr_amg_config_create, draugr_amg_setup, draugr_amg_resetup
+export draugr_amg_solve, draugr_amg_cycle, draugr_amg_free, draugr_amg_config_free
+export draugr_amg_get_cfunctions
 
 end # module

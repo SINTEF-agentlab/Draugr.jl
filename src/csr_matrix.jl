@@ -12,6 +12,9 @@ External API entry points accept various sparse CSR formats and convert to
 
 The vector types are parameterized as `AbstractVector` subtypes so the format
 works with GPU arrays or other custom vector implementations.
+
+The `block_size` and `backend` fields control KernelAbstractions kernel launches
+for operations like `mul!`. The backend is inferred from the array types by default.
 """
 struct CSRMatrix{Tv, Ti<:Integer, Vr<:AbstractVector{Ti}, Vc<:AbstractVector{Ti}, Vv<:AbstractVector{Tv}}
     rowptr::Vr
@@ -19,6 +22,14 @@ struct CSRMatrix{Tv, Ti<:Integer, Vr<:AbstractVector{Ti}, Vc<:AbstractVector{Ti}
     nzval::Vv
     nrow::Int
     ncol::Int
+    block_size::Int
+    backend::Any
+end
+
+function CSRMatrix(rowptr::Vr, colval::Vc, nzval::Vv, nrow::Int, ncol::Int;
+                   block_size::Int=64, backend=nothing) where {Ti<:Integer, Tv, Vr<:AbstractVector{Ti}, Vc<:AbstractVector{Ti}, Vv<:AbstractVector{Tv}}
+    be = backend === nothing ? KernelAbstractions.get_backend(nzval) : backend
+    return CSRMatrix{Tv, Ti, Vr, Vc, Vv}(rowptr, colval, nzval, nrow, ncol, block_size, be)
 end
 
 Base.size(A::CSRMatrix) = (A.nrow, A.ncol)
@@ -52,7 +63,8 @@ function csr_to_cpu(A::CSRMatrix{Tv, Ti, <:Array, <:Array, <:Array}) where {Tv, 
 end
 
 function csr_to_cpu(A::CSRMatrix{Tv, Ti}) where {Tv, Ti}
-    return CSRMatrix(Array(A.rowptr), Array(A.colval), Array(A.nzval), A.nrow, A.ncol)
+    return CSRMatrix(Array(A.rowptr), Array(A.colval), Array(A.nzval), A.nrow, A.ncol;
+                     block_size=A.block_size)
 end
 
 """
@@ -81,7 +93,8 @@ function _csr_to_device(ref::CSRMatrix, A_cpu::CSRMatrix)
     rp = _to_device(ref, A_cpu.rowptr)
     cv = _to_device(ref, A_cpu.colval)
     nzv = _to_device(ref, A_cpu.nzval)
-    return CSRMatrix(rp, cv, nzv, A_cpu.nrow, A_cpu.ncol)
+    return CSRMatrix(rp, cv, nzv, A_cpu.nrow, A_cpu.ncol;
+                     block_size=ref.block_size, backend=ref.backend)
 end
 
 """
@@ -134,19 +147,31 @@ end
     @inbounds dst[i] = src[i]
 end
 
+@kernel function csr_mul_kernel!(y, @Const(nzval), @Const(colval), @Const(rp), @Const(x))
+    i = @index(Global)
+    @inbounds begin
+        s = zero(eltype(y))
+        for nz in rp[i]:(rp[i+1]-1)
+            s += nzval[nz] * x[colval[nz]]
+        end
+        y[i] = s
+    end
+end
+
 """
     LinearAlgebra.mul!(y, A::CSRMatrix, x)
 
 CSR matrix-vector product y = A * x.
+Uses KernelAbstractions for dispatch, with the backend and block_size
+selected from the CSRMatrix fields.
 """
 function LinearAlgebra.mul!(y::AbstractVector, A::CSRMatrix, x::AbstractVector)
-    @inbounds for i in 1:A.nrow
-        s = zero(eltype(y))
-        for nz in A.rowptr[i]:(A.rowptr[i+1]-1)
-            s += A.nzval[nz] * x[A.colval[nz]]
-        end
-        y[i] = s
-    end
+    n = A.nrow
+    backend = A.backend
+    block_size = A.block_size
+    kernel! = csr_mul_kernel!(backend, block_size)
+    kernel!(y, A.nzval, A.colval, A.rowptr, x; ndrange=n)
+    _synchronize(backend)
     return y
 end
 

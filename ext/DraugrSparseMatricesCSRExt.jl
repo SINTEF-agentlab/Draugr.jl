@@ -58,31 +58,13 @@ end
     amg_resetup!(hierarchy, A_new::SparseMatrixCSR, config)
 
 AMG resetup accepting a `SparseMatrixCSR` from SparseMatricesCSR.jl.
+Converts to the internal `CSRMatrix` and forwards to the main resetup.
 """
 function Draugr.amg_resetup!(hierarchy::AMGHierarchy{Tv, Ti},
                                   A_new::SparseMatrixCSR{Bi, Tv, Ti},
                                   config::AMGConfig=AMGConfig()) where {Bi, Tv, Ti}
     A_csr = csr_from_sparse_csr(A_new)
-    backend = hierarchy.backend
-    block_size = hierarchy.block_size
-    nlevels = length(hierarchy.levels)
-    if nlevels == 0
-        Draugr._update_coarse_solver!(hierarchy, A_csr; backend=backend, block_size=block_size)
-        return hierarchy
-    end
-    level1 = hierarchy.levels[1]
-    Draugr._copy_nzvals!(level1.A, A_csr; backend=backend, block_size=block_size)
-    Draugr.update_smoother!(level1.smoother, level1.A; backend=backend, block_size=block_size)
-    for lvl in 1:(nlevels - 1)
-        level = hierarchy.levels[lvl]
-        next_level = hierarchy.levels[lvl + 1]
-        Draugr.galerkin_product!(next_level.A, level.A, level.P, level.R_map; backend=backend, block_size=block_size)
-        Draugr.update_smoother!(next_level.smoother, next_level.A; backend=backend, block_size=block_size)
-    end
-    last_level = hierarchy.levels[nlevels]
-    Draugr._recompute_coarsest_dense!(hierarchy, last_level; backend=backend)
-    hierarchy.coarse_factor = lu(hierarchy.coarse_A)
-    return hierarchy
+    return Draugr.amg_resetup!(hierarchy, A_csr, config)
 end
 
 # ── Smoother wrappers for SparseMatrixCSR ────────────────────────────────────

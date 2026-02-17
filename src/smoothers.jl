@@ -1247,27 +1247,7 @@ function build_ilu0_smoother(A::CSRMatrix{Tv, Ti}) where {Tv, Ti}
     _ilu0_factorize!(L_nzval, U_nzval, diag_idx, A_cpu)
 
     tmp = zeros(Tv, n)
-    # Store level-scheduling data in the coloring fields for compatibility.
-    # colors stores fwd_offsets (forward level offsets)
-    # color_offsets stores bwd_offsets (backward level offsets)
-    # color_order stores fwd_order (forward level ordering)
-    # num_colors = num_fwd_levels
-    # We also need backward data, so we repurpose the fields and store bwd separately.
-    # To keep the struct, we use: colors = bwd_order, color_offsets = fwd_offsets,
-    # color_order = fwd_order, num_colors = num_fwd_levels.
-    # We'll store bwd_offsets and num_bwd_levels in a concatenated form.
-    # Actually, let's just store all level data:
-    # colors -> bwd_order
-    # color_offsets -> [fwd_offsets..., bwd_offsets...]
-    # color_order -> fwd_order
-    # num_colors -> num_fwd_levels (we compute bwd from the offsets)
-
-    # Pack level scheduling data into ILU0Smoother fields:
-    # - color_order -> fwd_order (rows sorted by forward level)
-    # - color_offsets -> fwd_offsets (forward level boundaries)
-    # - num_colors -> num_fwd_levels
-    # - colors -> bwd_order (rows sorted by backward level)
-    # For backward offsets, we store them at the end of color_offsets
+    # Concatenate forward and backward level offsets for compact storage
     combined_offsets = vcat(fwd_offsets, bwd_offsets)
     return ILU0Smoother{Tv, Ti}(L_nzval, U_nzval, diag_idx, bwd_order,
                                  combined_offsets, fwd_order, num_fwd_levels, tmp, A_cpu)
@@ -1311,12 +1291,12 @@ function smooth!(x::AbstractVector, A::CSRMatrix{Tv, Ti}, b::AbstractVector,
     rp = rowptr(A_cpu)
     tmp = smoother.tmp  # always CPU
 
-    fwd_order = smoother.color_order
-    num_fwd_levels = smoother.num_colors
-    # Forward offsets are stored in combined_offsets[1 : num_fwd_levels+1]
-    combined_offsets = smoother.color_offsets
-    bwd_order = smoother.colors
-    # Backward offsets are stored in combined_offsets[num_fwd_levels+2 : end]
+    fwd_order = smoother.fwd_order
+    num_fwd_levels = smoother.num_fwd_levels
+    # Forward offsets are in level_offsets[1 : num_fwd_levels+1]
+    combined_offsets = smoother.level_offsets
+    bwd_order = smoother.bwd_order
+    # Backward offsets start after the forward offsets (at index num_fwd_levels + 2)
     bwd_offset_start = num_fwd_levels + 2
     num_bwd_levels = length(combined_offsets) - bwd_offset_start
 

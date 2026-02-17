@@ -594,6 +594,64 @@ end
     end
 
     # ══════════════════════════════════════════════════════════════════════════
+    # L1 Serial Gauss-Seidel Smoother
+    # ══════════════════════════════════════════════════════════════════════════
+
+    @testset "L1 Serial GS Smoother - Build" begin
+        A = poisson1d_csr(10)
+        Ac = to_csr(A)
+        smoother = Draugr.build_l1_serial_gs_smoother(Ac)
+        @test smoother isa L1SerialGaussSeidelSmoother
+        @test length(smoother.invdiag) == 10
+        # For interior row: l1 norm = |−1| + |2| + |−1| = 4, invdiag = 1/4
+        @test smoother.invdiag[5] ≈ 0.25
+        # For boundary row: l1 norm = |2| + |−1| = 3, invdiag = 1/3
+        @test smoother.invdiag[1] ≈ 1.0/3.0
+    end
+
+    @testset "L1 Serial GS Smoother - Smoothing" begin
+        A = poisson1d_csr(10)
+        Ac = to_csr(A)
+        smoother = Draugr.build_l1_serial_gs_smoother(Ac)
+        b = ones(10)
+        x = zeros(10)
+        smooth!(x, Ac, b, smoother; steps=10)
+        r = b - sparse(A.At') * x
+        @test norm(r) < norm(b)
+    end
+
+    @testset "L1 Serial GS Smoother - AMG Solve" begin
+        n = 10
+        A = poisson2d_csr(n)
+        N = n*n
+        b = rand(N)
+        x = zeros(N)
+        config = AMGConfig(smoother=L1SerialGaussSeidelType())
+        hierarchy = amg_setup(A, config)
+        x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r = b - sparse(A.At') * x
+        @test norm(r) / norm(b) < 1e-8
+        @test niter < 200
+    end
+
+    @testset "L1 Serial GS Smoother - Update" begin
+        A = poisson1d_csr(10)
+        Ac = to_csr(A)
+        smoother = Draugr.build_l1_serial_gs_smoother(Ac)
+        @test smoother.invdiag[5] ≈ 0.25
+        # Update with same matrix
+        update_smoother!(smoother, Ac)
+        @test smoother.invdiag[5] ≈ 0.25
+    end
+
+    @testset "L1 Serial GS Smoother - build_smoother dispatch" begin
+        A = poisson1d_csr(10)
+        Ac = to_csr(A)
+        smoother = Draugr.build_smoother(Ac, L1SerialGaussSeidelType(), 1.0)
+        @test smoother isa L1SerialGaussSeidelSmoother
+    end
+
+    # ══════════════════════════════════════════════════════════════════════════
     # SPAI(0) Smoother
     # ══════════════════════════════════════════════════════════════════════════
 
@@ -1598,6 +1656,7 @@ end
             ("l1-Jacobi", AMGConfig(smoother=L1JacobiSmootherType())),
             ("Colored GS", AMGConfig(smoother=ColoredGaussSeidelType())),
             ("l1-Colored GS", AMGConfig(smoother=L1ColoredGaussSeidelType())),
+            ("l1-Serial GS", AMGConfig(smoother=L1SerialGaussSeidelType())),
             ("SPAI0", AMGConfig(smoother=SPAI0SmootherType())),
             ("ILU0", AMGConfig(smoother=ILU0SmootherType())),
         ]
@@ -2366,6 +2425,9 @@ end
         # Serial ILU0
         s10 = build_smoother(A, SerialILU0SmootherType())
         @test s10 isa SerialILU0Smoother
+        # L1 Serial GS
+        s10 = build_smoother(A, L1SerialGaussSeidelType())
+        @test s10 isa L1SerialGaussSeidelSmoother
     end
 
     @testset "Standalone Smoother API - smooth! with StaticCSR" begin
@@ -2394,6 +2456,7 @@ end
         for stype in [JacobiSmootherType(), SPAI0SmootherType(), L1JacobiSmootherType(),
                       ColoredGaussSeidelType(), L1ColoredGaussSeidelType(), ILU0SmootherType(), ChebyshevSmootherType(),
                       SPAI1SmootherType(), SerialGaussSeidelType(), SerialILU0SmootherType()]
+                      SPAI1SmootherType(), SerialGaussSeidelType(), L1SerialGaussSeidelType()]
             smoother = build_smoother(A, stype)
             x = zeros(10)
             smooth!(x, A, b, smoother; steps=10)

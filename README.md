@@ -3,7 +3,7 @@
 A parallel Algebraic Multigrid (AMG) solver for Julia with GPU support via
 [KernelAbstractions.jl](https://github.com/JuliaGPU/KernelAbstractions.jl).
 Supports NVIDIA (CUDA), AMD (AMDGPU/ROCm), and Apple (Metal) GPUs as well as
-CPU execution.  Built as a research project at the SINTEF AgentLab. The code is heavily based on the feature set of [hypre's BoomerAMG](https://github.com/hypre-space/hypre) (for classical AMG variants) and [amgcl](https://github.com/ddemidov/amgcl) (for aggregation variants).
+CPU execution.  Built as a research project at the SINTEF AgentLab. The initial public release of the code is entirely coded by Claude Opus 4.6 with manual testing and feedback. The code is heavily based on the feature set of [hypre's BoomerAMG](https://github.com/hypre-space/hypre) (for classical AMG variants) and [amgcl](https://github.com/ddemidov/amgcl) (for aggregation variants).
 
 Main design considerations:
 

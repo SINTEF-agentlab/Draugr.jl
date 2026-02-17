@@ -1,24 +1,25 @@
 """
-    amg_resetup!(hierarchy, A_new::SparseMatrixCSC, config)
+    amg_resetup!(hierarchy, A_new::CSRMatrix, config)
 
-External API entry point: convert `SparseMatrixCSC` to `CSRMatrix` once
-and forward to the general resetup.
+Main resetup implementation using the internal `CSRMatrix` type.
+All other `amg_resetup!` methods (for `SparseMatrixCSC`, GPU types, etc.)
+should convert their input to `CSRMatrix` via `csr_from_csc` or equivalent
+and forward to this method.
 
 The backend and block_size are taken from the hierarchy (set during `amg_setup`).
 """
 function amg_resetup!(hierarchy::AMGHierarchy{Tv, Ti},
-                      A_new::SparseMatrixCSC{Tv, Ti},
+                      A_new::CSRMatrix{Tv, Ti},
                       config::AMGConfig=AMGConfig()) where {Tv, Ti}
-    A_csr = csr_from_csc(A_new)
     backend = hierarchy.backend
     block_size = hierarchy.block_size
     nlevels = length(hierarchy.levels)
     if nlevels == 0
-        _update_coarse_solver!(hierarchy, A_csr; backend=backend, block_size=block_size)
+        _update_coarse_solver!(hierarchy, A_new; backend=backend, block_size=block_size)
         return hierarchy
     end
     level1 = hierarchy.levels[1]
-    _copy_nzvals!(level1.A, A_csr; backend=backend, block_size=block_size)
+    _copy_nzvals!(level1.A, A_new; backend=backend, block_size=block_size)
     update_smoother!(level1.smoother, level1.A; backend=backend, block_size=block_size)
     for lvl in 1:(nlevels - 1)
         level = hierarchy.levels[lvl]
@@ -30,6 +31,19 @@ function amg_resetup!(hierarchy::AMGHierarchy{Tv, Ti},
     _recompute_coarsest_dense!(hierarchy, last_level; backend=backend)
     hierarchy.coarse_factor = lu(hierarchy.coarse_A)
     return hierarchy
+end
+
+"""
+    amg_resetup!(hierarchy, A_new::SparseMatrixCSC, config)
+
+External API entry point: convert `SparseMatrixCSC` to `CSRMatrix` via
+`csr_from_csc` and forward to the main `CSRMatrix`-based resetup.
+"""
+function amg_resetup!(hierarchy::AMGHierarchy{Tv, Ti},
+                      A_new::SparseMatrixCSC{Tv, Ti},
+                      config::AMGConfig=AMGConfig()) where {Tv, Ti}
+    A_csr = csr_from_csc(A_new)
+    return amg_resetup!(hierarchy, A_csr, config)
 end
 
 """

@@ -476,6 +476,8 @@ function smooth!(x::AbstractVector, A::CSRMatrix{Tv, Ti}, b::AbstractVector,
         x_cpu = x
         b_cpu = b
     end
+    # Reuses the same forward sweep as standard serial GS; the L1 variant
+    # differs only in how invdiag is computed (l1 row norms vs diagonal entries).
     _serial_gs_sweep!(x_cpu, b_cpu, nonzeros(smoother.A_cpu), colvals(smoother.A_cpu),
                       rowptr(smoother.A_cpu), smoother.invdiag, n, steps)
     if is_gpu

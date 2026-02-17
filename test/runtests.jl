@@ -2772,7 +2772,7 @@ end
             rowptr = Int32[1, 3, 6, 8]
             colval = Int32[1, 2, 1, 2, 3, 2, 3]
             nzval  = [2.0, -1.0, -1.0, 2.0, -1.0, -1.0, 2.0]
-            A = csr_from_raw(copy(rowptr), copy(colval), copy(nzval), 3, 3; index_base=1)
+            A = csr_from_raw(rowptr, colval, nzval, 3, 3; index_base=1)
             @test A isa CSRMatrix
             @test size(A) == (3, 3)
             @test A[1,1] ≈ 2.0

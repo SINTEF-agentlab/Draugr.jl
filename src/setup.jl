@@ -9,7 +9,8 @@ function _prolongation_to_device(ref::CSRMatrix, P::ProlongationOp)
     rp = _to_device(ref, P.rowptr)
     cv = _to_device(ref, P.colval)
     nzv = _to_device(ref, P.nzval)
-    return ProlongationOp(rp, cv, nzv, P.nrow, P.ncol)
+    ts = P.trunc_scaling === nothing ? nothing : _to_device(ref, P.trunc_scaling)
+    return ProlongationOp(rp, cv, nzv, P.nrow, P.ncol, ts)
 end
 
 """

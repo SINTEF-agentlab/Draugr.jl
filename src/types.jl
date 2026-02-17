@@ -27,7 +27,7 @@ end
 StandardInterpolation() = StandardInterpolation(0.0)
 
 """
-    ExtendedIInterpolation(; trunc_factor=0.0, max_elements=4)
+    ExtendedIInterpolation(; trunc_factor=0.0, max_elements=0, norm_p=1, rescale=false)
 
 Extended+i interpolation (HYPRE InterpType=6): extends standard by including
 distance-2 coarse points (coarse points reachable through strong fine neighbors).
@@ -37,13 +37,24 @@ Recommended for use with HMIS coarsening for challenging 3D problems.
 `max_elements`: maximum number of interpolation entries per row (0 = no limit).
 When the number of entries exceeds this limit, only the strongest entries are kept.
 Default: 0.
+`norm_p`: norm exponent used for measuring entry magnitude during truncation.
+Default: 1 (absolute value). Higher values (e.g. 2) penalize small entries less
+aggressively relative to the maximum.
+`rescale`: if true, after truncation the surviving entries are divided by
+`1 - sum_removed` where `sum_removed` is the sum of removed row entries,
+preserving the original row sum. The per-entry scaling factors are stored in the
+prolongation operator so that they can be reused during resetup without
+recomputing the truncated elements. Default: false.
 """
 struct ExtendedIInterpolation <: InterpolationType
     trunc_factor::Float64
     max_elements::Int
+    norm_p::Int
+    rescale::Bool
 end
-ExtendedIInterpolation() = ExtendedIInterpolation(0.0, 0)
-ExtendedIInterpolation(trunc_factor::Real) = ExtendedIInterpolation(Float64(trunc_factor), 0)
+ExtendedIInterpolation() = ExtendedIInterpolation(0.0, 0, 1, false)
+ExtendedIInterpolation(trunc_factor::Real) = ExtendedIInterpolation(Float64(trunc_factor), 0, 1, false)
+ExtendedIInterpolation(trunc_factor::Real, max_elements::Integer) = ExtendedIInterpolation(Float64(trunc_factor), Int(max_elements), 1, false)
 
 # ── Coarsening type tags ──────────────────────────────────────────────────────
 abstract type CoarseningAlgorithm end
@@ -315,6 +326,10 @@ end
 Stores the prolongation operator implicitly.
 - `rowptr`, `colval`, `nzval` define the sparse P in CSR layout.
 - `nrow` and `ncol` are the dimensions (n_fine × n_coarse).
+- `trunc_scaling`: optional per-entry scaling factors from truncation with
+  rescaling enabled. When not `nothing`, entry `k` of `nzval` was multiplied
+  by `trunc_scaling[k]` during setup. During resetup the same factor is
+  reapplied so that truncated elements need not be recomputed.
 Vector types are parameterized to support GPU arrays.
 """
 mutable struct ProlongationOp{Ti<:Integer, Tv, Vi<:AbstractVector{Ti}, Vv<:AbstractVector{Tv}}
@@ -323,12 +338,13 @@ mutable struct ProlongationOp{Ti<:Integer, Tv, Vi<:AbstractVector{Ti}, Vv<:Abstr
     nzval::Vv
     nrow::Int
     ncol::Int
+    trunc_scaling::Union{Nothing, Vv}
 end
 
 # Convenience constructor for CPU vectors
 # Convenience constructor for CPU vectors (used during setup which runs on CPU)
 function ProlongationOp{Ti, Tv}(rowptr::Vector{Ti}, colval::Vector{Ti}, nzval::Vector{Tv}, nrow::Int, ncol::Int) where {Ti, Tv}
-    return ProlongationOp{Ti, Tv, Vector{Ti}, Vector{Tv}}(rowptr, colval, nzval, nrow, ncol)
+    return ProlongationOp{Ti, Tv, Vector{Ti}, Vector{Tv}}(rowptr, colval, nzval, nrow, ncol, nothing)
 end
 
 """

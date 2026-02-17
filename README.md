@@ -3,13 +3,23 @@
 A parallel Algebraic Multigrid (AMG) solver for Julia with GPU support via
 [KernelAbstractions.jl](https://github.com/JuliaGPU/KernelAbstractions.jl).
 Supports NVIDIA (CUDA), AMD (AMDGPU/ROCm), and Apple (Metal) GPUs as well as
-CPU execution.  Built as a research project at the SINTEF AgentLab. The code is heavily based on the feature set of HYPRE's BoomerAMG.
+CPU execution.  Built as a research project at the SINTEF AgentLab. The code is heavily based on the feature set of [hypre's BoomerAMG](https://github.com/hypre-space/hypre) (for classical AMG variants) and [amgcl](https://github.com/ddemidov/amgcl) (for aggregation variants).
+
+Main design considerations:
+
+- Use KernelAbstractions.jl for portable GPU support across vendors.
+- Allow fast resetup (reuse of the AMG hierarchy when coefficients change but sparsity does not) by recomputing Galerkin products and smoothers.
+- Support both CSC and CSR input formats (with internal conversion as needed), but rely on CSR internally. You should use a CSR format for best performance and to avoid copies.
+- Provide a flexible configuration system to enable a wide range of AMG variants (coarsening, interpolation, smoothers, etc.) while maintaining good defaults for typical use cases.
+- Provide a C-callable interface for use from other languages.
 
 ## Installation
 
+This package is not registered in the General registry yet, so you need to install it directly from the GitHub repository:
+
 ```julia
 using Pkg
-Pkg.add("Draugr")
+Pkg.add(url="https://github.com/moyner/Draugr.jl")
 ```
 
 For GPU backends, install the corresponding package:
@@ -251,4 +261,4 @@ cfuncs = amg_c_get_cfunctions()
 
 ## License
 
-See the repository for license details.
+This module is MIT licensed.

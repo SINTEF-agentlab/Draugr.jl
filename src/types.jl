@@ -43,7 +43,7 @@ struct ExtendedIInterpolation <: InterpolationType
     max_elements::Int
 end
 ExtendedIInterpolation() = ExtendedIInterpolation(0.0, 0)
-ExtendedIInterpolation(trunc_factor::Real) = ExtendedIInterpolation(Float64(trunc_factor), 4)
+ExtendedIInterpolation(trunc_factor::Real) = ExtendedIInterpolation(Float64(trunc_factor), 0)
 
 # ── Coarsening type tags ──────────────────────────────────────────────────────
 abstract type CoarseningAlgorithm end

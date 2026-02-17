@@ -1,15 +1,15 @@
-# ParallelAMG.jl
+# Draugr.jl
 
 A parallel Algebraic Multigrid (AMG) solver for Julia with GPU support via
 [KernelAbstractions.jl](https://github.com/JuliaGPU/KernelAbstractions.jl).
 Supports NVIDIA (CUDA), AMD (AMDGPU/ROCm), and Apple (Metal) GPUs as well as
-CPU execution.  Built as a research project at the SINTEF AgentLab.
+CPU execution.  Built as a research project at the SINTEF AgentLab. The code is heavily based on the feature set of HYPRE's BoomerAMG.
 
 ## Installation
 
 ```julia
 using Pkg
-Pkg.add("ParallelAMG")
+Pkg.add("Draugr")
 ```
 
 For GPU backends, install the corresponding package:
@@ -23,7 +23,7 @@ Pkg.add("Metal")   # Apple GPUs
 ## Quick Start
 
 ```julia
-using ParallelAMG, SparseArrays
+using Draugr, SparseArrays
 
 # Build a standard Julia CSC sparse matrix
 I = [1,1,2,2,2,3,3]; J = [1,2,1,2,3,2,3]
@@ -123,14 +123,14 @@ amg_resetup!(hierarchy, A_new, config)
 
 ## GPU Usage
 
-ParallelAMG works on any GPU supported by KernelAbstractions.jl.  The setup
+Draugr works on any GPU supported by KernelAbstractions.jl.  The setup
 phase (coarsening, prolongation construction) runs on CPU; the hierarchy
 data is then copied to the GPU for the solve/cycle phase.
 
 ### NVIDIA GPUs (CUDA)
 
 ```julia
-using CUDA, ParallelAMG
+using CUDA, Draugr
 
 A_gpu = CuSparseMatrixCSR(A_csc)          # or build from CuVectors
 hierarchy = amg_setup(A_gpu, config)       # auto-selects CUDABackend()
@@ -143,7 +143,7 @@ amg_solve!(x, b, hierarchy, config)
 ### AMD GPUs (AMDGPU / ROCm)
 
 ```julia
-using AMDGPU, ParallelAMG
+using AMDGPU, Draugr
 
 A_gpu = ROCSparseMatrixCSR(A_csc)          # or build from ROCVectors
 hierarchy = amg_setup(A_gpu, config)       # auto-selects ROCBackend()
@@ -159,7 +159,7 @@ Metal does not have a native sparse CSR type.  Construct a `CSRMatrix` from
 `MtlVector`s directly:
 
 ```julia
-using Metal, ParallelAMG
+using Metal, Draugr
 
 rp  = MtlVector(rowptr_cpu)
 cv  = MtlVector(colval_cpu)
@@ -170,14 +170,14 @@ hierarchy = amg_setup(A, config)           # auto-selects MetalBackend()
 
 ## Jutul Integration
 
-ParallelAMG provides a `ParallelAMGPreconditioner` that implements the Jutul
+Draugr provides a `DraugrPreconditioner` that implements the Jutul
 preconditioner interface, so it can be used as a drop-in preconditioner in
 Jutul's linear solvers:
 
 ```julia
-using Jutul, ParallelAMG
+using Jutul, Draugr
 
-precond = ParallelAMGPreconditioner(;
+precond = DraugrPreconditioner(;
     coarsening = HMISCoarsening(0.5, ExtendedIInterpolation(0.3)),
     smoother   = JacobiSmootherType(),
     verbose    = 1,
@@ -187,7 +187,7 @@ precond = ParallelAMGPreconditioner(;
 
 ## C-Callable Interface
 
-ParallelAMG provides a set of `@cfunction`-compatible routines so the solver
+Draugr provides a set of `@cfunction`-compatible routines so the solver
 can be called from C, C++, Fortran, or any language that can call C functions.
 Integer enums are used to select algorithms.
 
@@ -204,7 +204,7 @@ Integer enums are used to select algorithms.
 ### Workflow from Julia
 
 ```julia
-using ParallelAMG
+using Draugr
 
 # 1. Create a config handle
 cfg = amg_c_config_create(

@@ -2157,6 +2157,81 @@ end
         end
     end
 
+    @testset "ExtendedI norm_p and rescale fields" begin
+        # Default constructor
+        e = ExtendedIInterpolation()
+        @test e.norm_p == 1
+        @test e.rescale == false
+        # Single-arg constructor
+        e1 = ExtendedIInterpolation(0.3)
+        @test e1.norm_p == 1
+        @test e1.rescale == false
+        # Two-arg constructor
+        e2 = ExtendedIInterpolation(0.3, 4)
+        @test e2.norm_p == 1
+        @test e2.rescale == false
+        # Full constructor
+        e3 = ExtendedIInterpolation(0.3, 4, 2, true)
+        @test e3.trunc_factor == 0.3
+        @test e3.max_elements == 4
+        @test e3.norm_p == 2
+        @test e3.rescale == true
+    end
+
+    @testset "ExtendedI norm_p truncation" begin
+        # Verify that norm_p changes truncation behavior and solver converges
+        n = 10
+        A = poisson2d_csr(n)
+        N = n * n
+        b = rand(N)
+        for np in [1, 2]
+            x = zeros(N)
+            config = AMGConfig(
+                coarsening = HMISCoarsening(0.5, ExtendedIInterpolation(0.3, 0, np, false)),
+                pre_smoothing_steps = 2,
+                post_smoothing_steps = 2,
+            )
+            hierarchy = amg_setup(A, config)
+            @test length(hierarchy.levels) >= 1
+            x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-6, maxiter=300)
+            r = b - sparse(A.At') * x
+            @test norm(r) / norm(b) < 1e-6
+        end
+    end
+
+    @testset "ExtendedI rescale" begin
+        # Verify rescaling option works and solver converges
+        n = 10
+        A = poisson2d_csr(n)
+        N = n * n
+        b = rand(N)
+        for do_rescale in [false, true]
+            x = zeros(N)
+            config = AMGConfig(
+                coarsening = HMISCoarsening(0.5, ExtendedIInterpolation(0.3, 0, 1, do_rescale)),
+                pre_smoothing_steps = 2,
+                post_smoothing_steps = 2,
+            )
+            hierarchy = amg_setup(A, config)
+            @test length(hierarchy.levels) >= 1
+            # When rescale is true and truncation occurs, trunc_scaling should be stored
+            if do_rescale
+                for lvl in hierarchy.levels
+                    P = lvl.P
+                    @test P.trunc_scaling !== nothing
+                end
+            else
+                for lvl in hierarchy.levels
+                    P = lvl.P
+                    @test P.trunc_scaling === nothing
+                end
+            end
+            x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-6, maxiter=300)
+            r = b - sparse(A.At') * x
+            @test norm(r) / norm(b) < 1e-6
+        end
+    end
+
     # ══════════════════════════════════════════════════════════════════════════
     # Standalone Smoother API
     # ══════════════════════════════════════════════════════════════════════════

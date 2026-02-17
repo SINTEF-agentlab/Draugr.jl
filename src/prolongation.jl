@@ -478,6 +478,8 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
 
     trunc_factor = interp.trunc_factor
     max_elements = interp.max_elements
+    norm_p = interp.norm_p
+    do_rescale = interp.rescale
 
     # Build strength-based sparse matrix S for determining C-hat
     # S_diag[i] contains strong neighbors of i (like hypre's S_diag)
@@ -501,10 +503,12 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
     I_p = Ti[]
     J_p = Ti[]
     V_p = Tv[]
+    S_p = do_rescale ? Tv[] : nothing  # per-entry scaling factors
 
     @inbounds for i in 1:n_fine
         if cf[i] == 1
             push!(I_p, Ti(i)); push!(J_p, Ti(coarse_map[i])); push!(V_p, one(Tv))
+            if do_rescale; push!(S_p, one(Tv)); end
             continue
         end
 
@@ -537,6 +541,7 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
             # No C-hat: fallback to nearest coarse point
             best_j = _find_nearest_coarse(A, i, cf, coarse_map)
             push!(I_p, Ti(i)); push!(J_p, Ti(best_j)); push!(V_p, one(Tv))
+            if do_rescale; push!(S_p, one(Tv)); end
             # Reset markers
             for j in strong_nbrs[i]
                 P_marker[j] = -1
@@ -630,18 +635,34 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
         if trunc_factor > 0 && n_chat > 0
             max_w = zero(real(Tv))
             for idx in 1:n_chat
-                max_w = max(max_w, abs(P_data[idx]))
+                max_w = max(max_w, abs(P_data[idx])^norm_p)
             end
             threshold = trunc_factor * max_w
-            keep = [idx for idx in 1:n_chat if abs(P_data[idx]) >= threshold]
+            keep = [idx for idx in 1:n_chat if abs(P_data[idx])^norm_p >= threshold]
         end
         # Then, apply max_elements limit: keep only the strongest entries
         if max_elements > 0 && length(keep) > max_elements
             sort!(keep; by = idx -> abs(P_data[idx]), rev = true)
             resize!(keep, max_elements)
         end
+        # Compute rescaling factor if enabled
+        row_scale = one(Tv)
+        if do_rescale && length(keep) < n_chat
+            sum_removed = zero(Tv)
+            kept_set = Set(keep)
+            for idx in 1:n_chat
+                if !(idx in kept_set)
+                    sum_removed += P_data[idx]
+                end
+            end
+            denom = one(Tv) - sum_removed
+            if abs(denom) > Tv(1e-12)
+                row_scale = one(Tv) / denom
+            end
+        end
         for idx in keep
-            push!(I_p, Ti(i)); push!(J_p, Ti(coarse_map[chat_indices[idx]])); push!(V_p, P_data[idx])
+            push!(I_p, Ti(i)); push!(J_p, Ti(coarse_map[chat_indices[idx]])); push!(V_p, P_data[idx] * row_scale)
+            if do_rescale; push!(S_p, row_scale); end
         end
 
         # ── Reset markers ──
@@ -659,7 +680,13 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
         strong_f_marker -= 1
     end
 
-    return _coo_to_prolongation(I_p, J_p, V_p, n_fine, n_coarse)
+    P = _coo_to_prolongation(I_p, J_p, V_p, n_fine, n_coarse)
+    if do_rescale
+        # Attach per-entry scaling factors (sorted with same permutation as nzval)
+        perm = sortperm(collect(zip(I_p, J_p)))
+        P.trunc_scaling = S_p[perm]
+    end
+    return P
 end
 
 # ── Helpers ──────────────────────────────────────────────────────────────────

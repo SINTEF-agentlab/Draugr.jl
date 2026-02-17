@@ -87,7 +87,7 @@ function find_nz_index end
 
 # Public API
 export colvals, rowptr
-export CSRMatrix, csr_from_gpu, csr_to_cpu, csr_from_csc, csr_from_static
+export CSRMatrix, csr_from_gpu, csr_to_cpu, csr_from_csc, csr_from_static, csr_from_raw
 export static_csr_from_csc, find_nz_index, csr_copy_nzvals!
 export AggregationCoarsening, PMISCoarsening, HMISCoarsening, AggressiveCoarsening
 export SmoothedAggregationCoarsening, RSCoarsening

@@ -1,10 +1,13 @@
 # ══════════════════════════════════════════════════════════════════════════════
 # C-callable interface for Draugr
 #
-# Provides @cfunction-compatible wrappers around the core AMG routines
-# (setup, resetup, solve, cycle) using integer enums to select coarsening,
-# smoother, and interpolation options.  Hierarchies are stored in a
-# global handle table so that C callers receive an opaque Int32 handle.
+# Provides Base.@ccallable wrappers around the core AMG routines so that
+# PackageCompiler can export them as C symbols in a compiled shared library.
+# Also provides @cfunction pointers for the Julia-embedding use case.
+#
+# Integer enums select coarsening, smoother, and interpolation options.
+# Hierarchies and configs are stored in a global handle table so that C
+# callers receive an opaque Int32 handle.
 # ══════════════════════════════════════════════════════════════════════════════
 
 # ── Enum definitions ─────────────────────────────────────────────────────────
@@ -150,29 +153,38 @@ function _new_handle()::Int32
 end
 
 # ── Public C-callable functions ──────────────────────────────────────────────
+# These use Base.@ccallable so PackageCompiler exports them as C symbols.
+# C-compatible names (no '!' suffix) are used for the exported symbols.
+# Julia-idiomatic aliases with '!' are provided below for backward compat.
 
 """
-    amg_c_config_create(coarsening, smoother, interpolation, strength,
-                        cycle, θ, trunc_factor, jacobi_omega,
-                        max_levels, max_coarse_size,
-                        pre_smoothing_steps, post_smoothing_steps,
-                        verbose) -> Int32
+    draugr_amg_config_create(coarsening, smoother, interpolation, strength,
+                             cycle, theta, trunc_factor, jacobi_omega,
+                             max_levels, max_coarse_size,
+                             pre_smoothing_steps, post_smoothing_steps,
+                             verbose, initial_coarsening,
+                             initial_coarsening_levels, max_row_sum,
+                             coarse_solve_on_cpu) -> Int32
 
 Create an AMG configuration and return a handle.
 All enum arguments are Int32 values matching the `CoarseningEnum`, etc.
 
 Returns a config handle (> 0) on success, or -1 on error.
 """
-function amg_c_config_create(coarsening::Int32, smoother::Int32,
-                             interpolation::Int32, strength::Int32,
-                             cycle::Int32, θ::Float64,
-                             trunc_factor::Float64, jacobi_omega::Float64,
-                             max_levels::Int32, max_coarse_size::Int32,
-                             pre_smoothing_steps::Int32, post_smoothing_steps::Int32,
-                             verbose::Int32)::Int32
+Base.@ccallable function draugr_amg_config_create(coarsening::Int32, smoother::Int32,
+                                                  interpolation::Int32, strength::Int32,
+                                                  cycle::Int32, theta::Float64,
+                                                  trunc_factor::Float64, jacobi_omega::Float64,
+                                                  max_levels::Int32, max_coarse_size::Int32,
+                                                  pre_smoothing_steps::Int32, post_smoothing_steps::Int32,
+                                                  verbose::Int32,
+                                                  initial_coarsening::Int32,
+                                                  initial_coarsening_levels::Int32,
+                                                  max_row_sum::Float64,
+                                                  coarse_solve_on_cpu::Int32)::Int32
     try
         config = AMGConfig(;
-            coarsening = _coarsening_from_enum(CoarseningEnum(coarsening), θ,
+            coarsening = _coarsening_from_enum(CoarseningEnum(coarsening), theta,
                                                InterpolationEnum(interpolation), trunc_factor),
             smoother   = _smoother_from_enum(SmootherEnum(smoother)),
             strength_type = _strength_from_enum(StrengthEnum(strength)),
@@ -183,6 +195,11 @@ function amg_c_config_create(coarsening::Int32, smoother::Int32,
             pre_smoothing_steps  = Int(pre_smoothing_steps),
             post_smoothing_steps = Int(post_smoothing_steps),
             verbose = Int(verbose),
+            initial_coarsening = _coarsening_from_enum(CoarseningEnum(initial_coarsening), theta,
+                                                       InterpolationEnum(interpolation), trunc_factor),
+            initial_coarsening_levels = Int(initial_coarsening_levels),
+            max_row_sum = max_row_sum,
+            coarse_solve_on_cpu = coarse_solve_on_cpu != 0,
         )
         lock(_HANDLE_LOCK) do
             h = _new_handle()
@@ -190,39 +207,40 @@ function amg_c_config_create(coarsening::Int32, smoother::Int32,
             return h
         end
     catch e
-        @error "amg_c_config_create failed" exception=(e, catch_backtrace())
+        @error "draugr_amg_config_create failed" exception=(e, catch_backtrace())
         return Int32(-1)
     end
 end
 
 """
-    amg_c_setup(n, nnz, rowptr, colval, nzval, config_handle; index_base=1) -> Int32
+    draugr_amg_setup(n, nnz, rowptr, colval, nzval, config_handle, index_base) -> Int32
 
 Build an AMG hierarchy from CSR data and return a hierarchy handle.
 
 Arguments:
 - `n`:             Number of rows (== columns, square matrix)
-- `nnz`:           Number of nonzeros (unused, length of colval/nzval)
+- `nnz`:           Number of nonzeros (length of colval/nzval)
 - `rowptr`:        Ptr{Int32} to row-pointer array (length n+1)
 - `colval`:        Ptr{Int32} to column-index array (length nnz)
 - `nzval`:         Ptr{Float64} to values array  (length nnz)
-- `config_handle`: Config handle from `amg_c_config_create`
+- `config_handle`: Config handle from `draugr_amg_config_create`
 - `index_base`:    Index base of incoming arrays: 0 for C-style zero-based,
-                   1 for Fortran/Julia-style one-based (default: 1).
-                   When 0, rowptr and colval are converted to 1-based in-place
-                   on owned copies (no extra allocation).
+                   1 for Fortran/Julia-style one-based.
+                   When 0, rowptr and colval are converted to 1-based on
+                   owned copies (no extra allocation).
 
 Returns a hierarchy handle (> 0) on success, or -1 on error.
 """
-function amg_c_setup(n::Int32, nnz_count::Int32,
-                     rowptr::Ptr{Int32}, colval::Ptr{Int32}, nzval::Ptr{Float64},
-                     config_handle::Int32; index_base::Int=1)::Int32
+Base.@ccallable function draugr_amg_setup(n::Int32, nnz_count::Int32,
+                                          rowptr::Ptr{Int32}, colval::Ptr{Int32},
+                                          nzval::Ptr{Float64},
+                                          config_handle::Int32,
+                                          index_base::Int32)::Int32
     try
         rp = unsafe_wrap(Array, rowptr, Int(n) + 1)
         cv = unsafe_wrap(Array, colval, Int(nnz_count))
         nzv = unsafe_wrap(Array, nzval, Int(nnz_count))
-        # Copy to owned arrays and convert indexing if needed
-        A = csr_from_raw(copy(rp), copy(cv), copy(nzv), Int(n), Int(n); index_base=index_base)
+        A = csr_from_raw(copy(rp), copy(cv), copy(nzv), Int(n), Int(n); index_base=Int(index_base))
         config = lock(_HANDLE_LOCK) do
             get(_CONFIG_HANDLES, config_handle, nothing)
         end
@@ -237,29 +255,31 @@ function amg_c_setup(n::Int32, nnz_count::Int32,
             return h
         end
     catch e
-        @error "amg_c_setup failed" exception=(e, catch_backtrace())
+        @error "draugr_amg_setup failed" exception=(e, catch_backtrace())
         return Int32(-1)
     end
 end
 
 """
-    amg_c_resetup!(handle, n, nnz, rowptr, colval, nzval, config_handle; index_base=1) -> Int32
+    draugr_amg_resetup(handle, n, nnz, rowptr, colval, nzval, config_handle, index_base) -> Int32
 
 Update the AMG hierarchy with new matrix coefficients (same sparsity pattern).
 
 When `index_base=0`, the incoming rowptr/colval use zero-based indexing and are
-converted to one-based in-place on owned copies (no extra allocation).
+converted to one-based on owned copies (no extra allocation).
 
 Returns 0 on success, -1 on error.
 """
-function amg_c_resetup!(handle::Int32, n::Int32, nnz_count::Int32,
-                        rowptr::Ptr{Int32}, colval::Ptr{Int32}, nzval::Ptr{Float64},
-                        config_handle::Int32; index_base::Int=1)::Int32
+Base.@ccallable function draugr_amg_resetup(handle::Int32, n::Int32, nnz_count::Int32,
+                                            rowptr::Ptr{Int32}, colval::Ptr{Int32},
+                                            nzval::Ptr{Float64},
+                                            config_handle::Int32,
+                                            index_base::Int32)::Int32
     try
         rp = unsafe_wrap(Array, rowptr, Int(n) + 1)
         cv = unsafe_wrap(Array, colval, Int(nnz_count))
         nzv = unsafe_wrap(Array, nzval, Int(nnz_count))
-        A_csr = csr_from_raw(copy(rp), copy(cv), copy(nzv), Int(n), Int(n); index_base=index_base)
+        A_csr = csr_from_raw(copy(rp), copy(cv), copy(nzv), Int(n), Int(n); index_base=Int(index_base))
         hierarchy, config = lock(_HANDLE_LOCK) do
             h = get(_HIERARCHY_HANDLES, handle, nothing)
             c = get(_CONFIG_HANDLES, config_handle, nothing)
@@ -290,22 +310,22 @@ function amg_c_resetup!(handle::Int32, n::Int32, nnz_count::Int32,
         hierarchy.coarse_factor = lu(hierarchy.coarse_A)
         return Int32(0)
     catch e
-        @error "amg_c_resetup! failed" exception=(e, catch_backtrace())
+        @error "draugr_amg_resetup failed" exception=(e, catch_backtrace())
         return Int32(-1)
     end
 end
 
 """
-    amg_c_solve!(handle, n, x, b, config_handle, tol, maxiter) -> Int32
+    draugr_amg_solve(handle, n, x, b, config_handle, tol, maxiter) -> Int32
 
 Solve Ax = b using AMG. The solution is written into `x`.
 
 Returns the number of iterations on success, or -1 on error.
 """
-function amg_c_solve!(handle::Int32, n::Int32,
-                      x::Ptr{Float64}, b::Ptr{Float64},
-                      config_handle::Int32,
-                      tol::Float64, maxiter::Int32)::Int32
+Base.@ccallable function draugr_amg_solve(handle::Int32, n::Int32,
+                                          x::Ptr{Float64}, b::Ptr{Float64},
+                                          config_handle::Int32,
+                                          tol::Float64, maxiter::Int32)::Int32
     try
         xv = unsafe_wrap(Array, x, Int(n))
         bv = unsafe_wrap(Array, b, Int(n))
@@ -321,21 +341,21 @@ function amg_c_solve!(handle::Int32, n::Int32,
         _, niter = amg_solve!(xv, bv, hierarchy, config; tol=tol, maxiter=Int(maxiter))
         return Int32(niter)
     catch e
-        @error "amg_c_solve! failed" exception=(e, catch_backtrace())
+        @error "draugr_amg_solve failed" exception=(e, catch_backtrace())
         return Int32(-1)
     end
 end
 
 """
-    amg_c_cycle!(handle, n, x, b, config_handle) -> Int32
+    draugr_amg_cycle(handle, n, x, b, config_handle) -> Int32
 
 Apply one AMG cycle (V or W, as configured) to improve x for Ax = b.
 
 Returns 0 on success, -1 on error.
 """
-function amg_c_cycle!(handle::Int32, n::Int32,
-                      x::Ptr{Float64}, b::Ptr{Float64},
-                      config_handle::Int32)::Int32
+Base.@ccallable function draugr_amg_cycle(handle::Int32, n::Int32,
+                                          x::Ptr{Float64}, b::Ptr{Float64},
+                                          config_handle::Int32)::Int32
     try
         xv = unsafe_wrap(Array, x, Int(n))
         bv = unsafe_wrap(Array, b, Int(n))
@@ -351,19 +371,19 @@ function amg_c_cycle!(handle::Int32, n::Int32,
         amg_cycle!(xv, bv, hierarchy, config)
         return Int32(0)
     catch e
-        @error "amg_c_cycle! failed" exception=(e, catch_backtrace())
+        @error "draugr_amg_cycle failed" exception=(e, catch_backtrace())
         return Int32(-1)
     end
 end
 
 """
-    amg_c_free!(handle) -> Int32
+    draugr_amg_free(handle) -> Int32
 
 Free the AMG hierarchy associated with `handle`.
 
 Returns 0 on success, -1 if handle not found.
 """
-function amg_c_free!(handle::Int32)::Int32
+Base.@ccallable function draugr_amg_free(handle::Int32)::Int32
     lock(_HANDLE_LOCK) do
         if haskey(_HIERARCHY_HANDLES, handle)
             delete!(_HIERARCHY_HANDLES, handle)
@@ -375,13 +395,13 @@ function amg_c_free!(handle::Int32)::Int32
 end
 
 """
-    amg_c_config_free!(handle) -> Int32
+    draugr_amg_config_free(handle) -> Int32
 
 Free the AMG configuration associated with `handle`.
 
 Returns 0 on success, -1 if handle not found.
 """
-function amg_c_config_free!(handle::Int32)::Int32
+Base.@ccallable function draugr_amg_config_free(handle::Int32)::Int32
     lock(_HANDLE_LOCK) do
         if haskey(_CONFIG_HANDLES, handle)
             delete!(_CONFIG_HANDLES, handle)
@@ -392,42 +412,35 @@ function amg_c_config_free!(handle::Int32)::Int32
     end
 end
 
-# ── @cfunction pointers ─────────────────────────────────────────────────────
+
+# ── @cfunction pointers (for Julia-embedding use case) ───────────────────────
 
 """
-    amg_c_get_cfunctions() -> NamedTuple
+    draugr_amg_get_cfunctions() -> NamedTuple
 
-Return a named tuple of `@cfunction` pointers that can be passed to C code.
-
-Fields:
-- `config_create`: Ptr to `amg_c_config_create`
-- `setup`:         Ptr to `amg_c_setup`
-- `resetup`:       Ptr to `amg_c_resetup!`
-- `solve`:         Ptr to `amg_c_solve!`
-- `cycle`:         Ptr to `amg_c_cycle!`
-- `free`:          Ptr to `amg_c_free!`
-- `config_free`:   Ptr to `amg_c_config_free!`
+Return a named tuple of `@cfunction` pointers for the embedding use case.
 """
-function amg_c_get_cfunctions()
+function draugr_amg_get_cfunctions()
     return (
-        config_create = @cfunction(amg_c_config_create,
+        config_create = @cfunction(draugr_amg_config_create,
             Int32,
             (Int32, Int32, Int32, Int32, Int32,
              Float64, Float64, Float64,
-             Int32, Int32, Int32, Int32, Int32)),
-        setup = @cfunction(amg_c_setup,
+             Int32, Int32, Int32, Int32, Int32,
+             Int32, Int32, Float64, Int32)),
+        setup = @cfunction(draugr_amg_setup,
             Int32,
-            (Int32, Int32, Ptr{Int32}, Ptr{Int32}, Ptr{Float64}, Int32)),
-        resetup = @cfunction(amg_c_resetup!,
+            (Int32, Int32, Ptr{Int32}, Ptr{Int32}, Ptr{Float64}, Int32, Int32)),
+        resetup = @cfunction(draugr_amg_resetup,
             Int32,
-            (Int32, Int32, Int32, Ptr{Int32}, Ptr{Int32}, Ptr{Float64}, Int32)),
-        solve = @cfunction(amg_c_solve!,
+            (Int32, Int32, Int32, Ptr{Int32}, Ptr{Int32}, Ptr{Float64}, Int32, Int32)),
+        solve = @cfunction(draugr_amg_solve,
             Int32,
             (Int32, Int32, Ptr{Float64}, Ptr{Float64}, Int32, Float64, Int32)),
-        cycle = @cfunction(amg_c_cycle!,
+        cycle = @cfunction(draugr_amg_cycle,
             Int32,
             (Int32, Int32, Ptr{Float64}, Ptr{Float64}, Int32)),
-        free = @cfunction(amg_c_free!, Int32, (Int32,)),
-        config_free = @cfunction(amg_c_config_free!, Int32, (Int32,)),
+        free = @cfunction(draugr_amg_free, Int32, (Int32,)),
+        config_free = @cfunction(draugr_amg_config_free, Int32, (Int32,)),
     )
 end

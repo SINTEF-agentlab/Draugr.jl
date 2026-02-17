@@ -1,4 +1,4 @@
-module ParallelAMG
+module Draugr
 
 using SparseArrays
 using LinearAlgebra
@@ -104,7 +104,7 @@ export JacobiSmootherType, ColoredGaussSeidelType, SerialGaussSeidelType
 export SPAI0SmootherType, SPAI1SmootherType
 export L1JacobiSmootherType, L1ColoredGaussSeidelType, ChebyshevSmootherType, ILU0SmootherType
 export build_smoother, update_smoother!, smooth!
-export AbstractParallelAMGPreconditioner, ParallelAMGPreconditioner
+export AbstractDraugrPreconditioner, DraugrPreconditioner
 export setup_specific_preconditioner
 # C-callable interface
 export CoarseningEnum, SmootherEnum, InterpolationEnum, CycleEnum, StrengthEnum

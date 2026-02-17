@@ -190,29 +190,33 @@ function amg_c_config_create(coarsening::Int32, smoother::Int32,
 end
 
 """
-    amg_c_setup(n, nnz, rowptr, colval, nzval, config_handle) -> Int32
+    amg_c_setup(n, nnz, rowptr, colval, nzval, config_handle; index_base=1) -> Int32
 
 Build an AMG hierarchy from CSR data and return a hierarchy handle.
 
 Arguments:
 - `n`:             Number of rows (== columns, square matrix)
 - `nnz`:           Number of nonzeros (unused, length of colval/nzval)
-- `rowptr`:        Ptr{Int32} to row-pointer array (length n+1, 1-based)
-- `colval`:        Ptr{Int32} to column-index array (length nnz, 1-based)
+- `rowptr`:        Ptr{Int32} to row-pointer array (length n+1)
+- `colval`:        Ptr{Int32} to column-index array (length nnz)
 - `nzval`:         Ptr{Float64} to values array  (length nnz)
 - `config_handle`: Config handle from `amg_c_config_create`
+- `index_base`:    Index base of incoming arrays: 0 for C-style zero-based,
+                   1 for Fortran/Julia-style one-based (default: 1).
+                   When 0, rowptr and colval are converted to 1-based in-place
+                   on owned copies (no extra allocation).
 
 Returns a hierarchy handle (> 0) on success, or -1 on error.
 """
 function amg_c_setup(n::Int32, nnz_count::Int32,
                      rowptr::Ptr{Int32}, colval::Ptr{Int32}, nzval::Ptr{Float64},
-                     config_handle::Int32)::Int32
+                     config_handle::Int32; index_base::Int=1)::Int32
     try
         rp = unsafe_wrap(Array, rowptr, Int(n) + 1)
         cv = unsafe_wrap(Array, colval, Int(nnz_count))
         nzv = unsafe_wrap(Array, nzval, Int(nnz_count))
-        # Copy to owned arrays
-        A = CSRMatrix(copy(rp), copy(cv), copy(nzv), Int(n), Int(n))
+        # Copy to owned arrays and convert indexing if needed
+        A = csr_from_raw(copy(rp), copy(cv), copy(nzv), Int(n), Int(n); index_base=index_base)
         config = lock(_HANDLE_LOCK) do
             get(_CONFIG_HANDLES, config_handle, nothing)
         end
@@ -233,20 +237,23 @@ function amg_c_setup(n::Int32, nnz_count::Int32,
 end
 
 """
-    amg_c_resetup!(handle, n, nnz, rowptr, colval, nzval, config_handle) -> Int32
+    amg_c_resetup!(handle, n, nnz, rowptr, colval, nzval, config_handle; index_base=1) -> Int32
 
 Update the AMG hierarchy with new matrix coefficients (same sparsity pattern).
+
+When `index_base=0`, the incoming rowptr/colval use zero-based indexing and are
+converted to one-based in-place on owned copies (no extra allocation).
 
 Returns 0 on success, -1 on error.
 """
 function amg_c_resetup!(handle::Int32, n::Int32, nnz_count::Int32,
                         rowptr::Ptr{Int32}, colval::Ptr{Int32}, nzval::Ptr{Float64},
-                        config_handle::Int32)::Int32
+                        config_handle::Int32; index_base::Int=1)::Int32
     try
         rp = unsafe_wrap(Array, rowptr, Int(n) + 1)
         cv = unsafe_wrap(Array, colval, Int(nnz_count))
         nzv = unsafe_wrap(Array, nzval, Int(nnz_count))
-        A_csr = CSRMatrix(copy(rp), copy(cv), copy(nzv), Int(n), Int(n))
+        A_csr = csr_from_raw(copy(rp), copy(cv), copy(nzv), Int(n), Int(n); index_base=index_base)
         hierarchy, config = lock(_HANDLE_LOCK) do
             h = get(_HIERARCHY_HANDLES, handle, nothing)
             c = get(_CONFIG_HANDLES, config_handle, nothing)

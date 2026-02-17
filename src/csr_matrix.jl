@@ -106,6 +106,29 @@ function csr_from_csc(A::SparseMatrixCSC{Tv, Ti}; do_collect::Bool=false) where 
     return CSRMatrix(rp, cv, nzv, size(A, 1), size(A, 2))
 end
 
+"""
+    csr_from_raw(rowptr, colval, nzval, nrow, ncol; index_base=1) -> CSRMatrix
+
+Create a `CSRMatrix` from raw CSR arrays. When `index_base=0`, the row-pointer
+and column-index arrays are assumed to use zero-based indexing (as in C/C++) and
+are converted to one-based indexing **in-place** (no copy). When `index_base=1`
+(the default), arrays are used as-is.
+
+The caller must own the arrays (e.g., via `copy`) because this function may
+mutate `rowptr` and `colval` when `index_base=0`.
+"""
+function csr_from_raw(rowptr::AbstractVector{Ti}, colval::AbstractVector{Ti},
+                      nzval::AbstractVector{Tv}, nrow::Int, ncol::Int;
+                      index_base::Int=1) where {Tv, Ti<:Integer}
+    if index_base == 0
+        rowptr .+= Ti(1)
+        colval .+= Ti(1)
+    elseif index_base != 1
+        throw(ArgumentError("index_base must be 0 or 1, got $index_base"))
+    end
+    return CSRMatrix(rowptr, colval, nzval, nrow, ncol)
+end
+
 @kernel function copy_kernel!(dst, @Const(src))
     i = @index(Global)
     @inbounds dst[i] = src[i]

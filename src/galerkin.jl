@@ -16,10 +16,21 @@ function compute_coarse_sparsity(A_fine::CSRMatrix{Tv, Ti},
     nzv_a = nonzeros(A_fine)
     # Determine which (I,J) pairs exist in A_c and collect triples
     coarse_entries = Dict{Tuple{Int,Int}, Tv}()
+    # Estimate the number of triples for sizehint!:
+    # Each triple comes from (pnz_i, anz, pnz_j) in the triple loop.
+    # A rough estimate is nnz(A) * (nnz(P)/n_fine)^2, clamped to a reasonable range.
+    nnz_a = length(nzv_a)
+    nnz_p = length(P.nzval)
+    avg_p_per_row = n_fine > 0 ? nnz_p / n_fine : 1.0
+    est_triples = max(nnz_a, round(Int, nnz_a * avg_p_per_row * avg_p_per_row))
     raw_ci = Ti[]  # coarse NZ index (placeholder)
     raw_pi = Ti[]  # P.nzval index for p_i
     raw_ai = Ti[]  # A.nzval index for a_ij
     raw_pj = Ti[]  # P.nzval index for p_j
+    sizehint!(raw_ci, est_triples)
+    sizehint!(raw_pi, est_triples)
+    sizehint!(raw_ai, est_triples)
+    sizehint!(raw_pj, est_triples)
     @inbounds for i in 1:n_fine
         for pnz_i in P.rowptr[i]:(P.rowptr[i+1]-1)
             I = P.colval[pnz_i]

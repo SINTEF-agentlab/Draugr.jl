@@ -2565,6 +2565,8 @@ end
             # Resetup should also work with coarse_solve_on_cpu
             amg_resetup!(hierarchy, A_jl, config)
             @test hierarchy.coarse_A isa Matrix
+            @test hierarchy.coarse_x isa Vector
+            @test hierarchy.coarse_b isa Vector
             x2 = JLArray(zeros(n))
             x2, niter2 = amg_solve!(x2, b, hierarchy, config; tol=1e-8, maxiter=100)
             @test niter2 < 100

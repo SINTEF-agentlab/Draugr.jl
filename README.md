@@ -1,4 +1,6 @@
 # Draugr.jl
+> [!NOTE]
+> This code is part of a research project on how agents can write and maintain targeted, complex scientific code under expert guidance. A part from minor changes (e.g. tweaking default parameters or options), all code has been written using agents. If you have feedback or questions, [the issue page is manned by humans](https://github.com/SINTEF-agentlab/Draugr.jl/issues).
 
 A parallel Algebraic Multigrid (AMG) solver for Julia with GPU support via
 [KernelAbstractions.jl](https://github.com/JuliaGPU/KernelAbstractions.jl).
@@ -8,10 +10,13 @@ CPU execution.  Built as a research project at the SINTEF AgentLab. The initial 
 Main design considerations:
 
 - Use KernelAbstractions.jl for portable GPU support across vendors.
+- Solution of "tough" scalar problems with high variation in coefficients in a shared memory environment.
 - Allow fast resetup (reuse of the AMG hierarchy when coefficients change but sparsity does not) by recomputing Galerkin products and smoothers.
 - Support both CSC and CSR input formats (with internal conversion as needed), but rely on CSR internally. You should use a CSR format for best performance and to avoid copies.
 - Provide a flexible configuration system to enable a wide range of AMG variants (coarsening, interpolation, smoothers, etc.) while maintaining good defaults for typical use cases.
 - Provide a C-callable interface for use from other languages.
+
+If you want to test the capabilities of this code, we encourage you to report your findings. For human-written AMG solvers in Julia, you can have a look at some of the alternatives: [HYPRE](https://github.com/fredrikekre/HYPRE.jl), [AlgebraicMultigrid.jl](https://github.com/JuliaLinearAlgebra/AlgebraicMultigrid.jl), [AMGCLWrap.jl](https://github.com/j-fu/AMGCLWrap.jl).
 
 ## Installation
 
@@ -21,6 +26,8 @@ This package is not registered in the General registry yet, so you need to insta
 using Pkg
 Pkg.add(url="https://github.com/moyner/Draugr.jl")
 ```
+
+A potential future registration in the Julia registry is pending a validation performed by humans.
 
 For GPU backends, install the corresponding package:
 

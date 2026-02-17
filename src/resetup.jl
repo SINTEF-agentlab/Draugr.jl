@@ -109,6 +109,7 @@ end
 
 Update the direct solver at the coarsest level using high-level lu().
 Handles cross-device scenarios where coarse_A may be CPU while A is on GPU.
+When `hierarchy.coarse_solve_on_cpu` is true, always converts to CPU for the solve.
 """
 function _update_coarse_solver!(hierarchy::AMGHierarchy{Tv}, A::CSRMatrix{Tv};
                                 backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv}

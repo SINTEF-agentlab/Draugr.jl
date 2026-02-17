@@ -428,6 +428,7 @@ _smoother_name(::SPAI1Smoother) = "SPAI(1)"
 _smoother_name(::L1JacobiSmoother) = "l1-Jacobi"
 _smoother_name(::ChebyshevSmoother) = "Chebyshev"
 _smoother_name(::ILU0Smoother) = "ILU(0)"
+_smoother_name(::SerialILU0Smoother) = "Serial ILU(0)"
 
 """
     _csr_to_dense!(M, A; backend=DEFAULT_BACKEND)

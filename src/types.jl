@@ -177,6 +177,7 @@ struct L1ColoredGaussSeidelType <: SmootherType end
 struct L1SerialGaussSeidelType <: SmootherType end
 struct ChebyshevSmootherType <: SmootherType end
 struct ILU0SmootherType <: SmootherType end
+struct SerialILU0SmootherType <: SmootherType end
 
 # ── Abstract smoother ─────────────────────────────────────────────────────────
 abstract type AbstractSmoother end
@@ -315,8 +316,8 @@ end
     ILU0Smoother{Tv, Ti}
 
 Parallel ILU(0) smoother. Computes an incomplete LU factorization with the same
-sparsity pattern as A, then applies forward/backward substitution using graph
-coloring for parallelism.
+sparsity pattern as A, then applies forward/backward substitution using level
+scheduling for parallelism.
 
 The factorization data is always stored on CPU since ILU factorization and
 triangular solves require sequential scalar indexing. The apply step copies
@@ -326,10 +327,27 @@ mutable struct ILU0Smoother{Tv, Ti} <: AbstractSmoother
     L_nzval::Vector{Tv}       # strictly lower triangle values (same pattern positions as A)
     U_nzval::Vector{Tv}       # upper triangle + diagonal values
     diag_idx::Vector{Ti}      # index of diagonal in each row's nzrange
-    colors::Vector{Ti}
-    color_offsets::Vector{Int}
-    color_order::Vector{Ti}
-    num_colors::Int
+    bwd_order::Vector{Ti}     # rows sorted by backward level
+    level_offsets::Vector{Int} # [fwd_offsets..., bwd_offsets...] concatenated
+    fwd_order::Vector{Ti}     # rows sorted by forward level
+    num_fwd_levels::Int       # number of forward levels
+    tmp::Vector{Tv}
+    A_cpu::CSRMatrix{Tv, Ti}  # CPU copy of A's structure for sequential triangular solves
+end
+
+"""
+    SerialILU0Smoother{Tv, Ti}
+
+Serial ILU(0) smoother. Computes an incomplete LU factorization with the same
+sparsity pattern as A, then applies plain sequential forward/backward
+substitution without graph coloring or parallelism.
+
+All data is stored on CPU. For GPU arrays, copies data to/from CPU as needed.
+"""
+mutable struct SerialILU0Smoother{Tv, Ti} <: AbstractSmoother
+    L_nzval::Vector{Tv}       # strictly lower triangle values (same pattern positions as A)
+    U_nzval::Vector{Tv}       # upper triangle + diagonal values
+    diag_idx::Vector{Ti}      # index of diagonal in each row's nzrange
     tmp::Vector{Tv}
     A_cpu::CSRMatrix{Tv, Ti}  # CPU copy of A's structure for sequential triangular solves
 end

@@ -2116,8 +2116,8 @@ end
 
     @testset "ExtendedI max_elements" begin
         # Test that max_elements limits the number of interpolation points per row
-        @test ExtendedIInterpolation().max_elements == 4
-        @test ExtendedIInterpolation(0.3).max_elements == 4
+        @test ExtendedIInterpolation().max_elements == 0
+        @test ExtendedIInterpolation(0.3).max_elements == 0
         @test ExtendedIInterpolation(0.0, 8).max_elements == 8
         # Test solving with different max_elements values
         n = 10

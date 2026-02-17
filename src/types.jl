@@ -83,9 +83,9 @@ end
 PMISCoarsening() = PMISCoarsening(0.25, DirectInterpolation())
 PMISCoarsening(θ::Real) = PMISCoarsening(θ, DirectInterpolation())
 
-"""Hybrid Modified Independent Set coarsening. Uses the symmetrized strength graph
-(intersection of S and S^T) for independent set selection, producing generally
-less aggressive coarsening than PMIS."""
+"""Hybrid Modified Independent Set coarsening. Performs an RS first pass
+(greedy bucket-based coarsening) followed by PMIS on remaining undecided
+points, matching hypre's `hypre_BoomerAMGCoarsenHMIS`."""
 struct HMISCoarsening <: CoarseningAlgorithm
     θ::Float64
     interpolation::InterpolationType
@@ -174,6 +174,7 @@ struct SPAI0SmootherType <: SmootherType end
 struct SPAI1SmootherType <: SmootherType end
 struct L1JacobiSmootherType <: SmootherType end
 struct L1ColoredGaussSeidelType <: SmootherType end
+struct L1SerialGaussSeidelType <: SmootherType end
 struct ChebyshevSmootherType <: SmootherType end
 struct ILU0SmootherType <: SmootherType end
 struct SerialILU0SmootherType <: SmootherType end
@@ -238,6 +239,20 @@ All data is stored on CPU.
 """
 mutable struct SerialGaussSeidelSmoother{Tv, Ti} <: AbstractSmoother
     invdiag::Vector{Tv}         # inverse diagonal (CPU)
+    A_cpu::CSRMatrix{Tv, Ti}    # CPU copy of A for sequential access
+end
+
+"""
+    L1SerialGaussSeidelSmoother{Tv, Ti}
+
+Serial (non-threaded, non-KA) L1 Gauss-Seidel smoother matching hypre's default
+l1-GS relaxation. Uses l1 row norms for diagonal scaling instead of just the
+diagonal entry. Performs a sequential forward sweep over all rows.
+
+All data is stored on CPU.
+"""
+mutable struct L1SerialGaussSeidelSmoother{Tv, Ti} <: AbstractSmoother
+    invdiag::Vector{Tv}         # 1 / l1_row_norm (CPU)
     A_cpu::CSRMatrix{Tv, Ti}    # CPU copy of A for sequential access
 end
 

@@ -270,8 +270,6 @@ function coarsen_pmis(A_in::CSRMatrix{Tv, Ti}, θ::Real;
             cf[i] = 1
         end
     end
-    # Second pass: ensure every F-point has at least one strong C-neighbor
-    _ensure_fine_have_coarse_neighbor!(cf, A, is_strong)
     # Build coarse map
     n_coarse = 0
     coarse_map = zeros(Int, n)
@@ -383,9 +381,6 @@ function coarsen_hmis(A_in::CSRMatrix{Tv, Ti}, θ::Real;
 
     # PMIS iterations on remaining undecided nodes
     _pmis_on_undecided!(cf, A, is_strong, pmis_measure)
-
-    # Ensure every F-point has at least one strong C-neighbor
-    _ensure_fine_have_coarse_neighbor!(cf, A, is_strong)
 
     n_coarse = 0
     coarse_map = zeros(Int, n)

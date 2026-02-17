@@ -371,6 +371,24 @@ end
         @test niter < 200
     end
 
+    @testset "AMG Solve - coarse_solve_on_cpu" begin
+        n = 10
+        A = poisson2d_csr(n)
+        N = n*n
+        b = rand(N)
+        x = zeros(N)
+        config = AMGConfig(coarse_solve_on_cpu=true)
+        hierarchy = amg_setup(A, config)
+        @test hierarchy.coarse_solve_on_cpu == true
+        @test hierarchy.coarse_A isa Matrix
+        @test hierarchy.coarse_x isa Vector
+        @test hierarchy.coarse_b isa Vector
+        x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r = b - sparse(A.At') * x
+        @test norm(r) / norm(b) < 1e-8
+        @test niter < 200
+    end
+
     @testset "AMG Resetup" begin
         n = 10
         A = poisson2d_csr(n)
@@ -2514,6 +2532,44 @@ end
             @test A_cpu.colval isa Vector
             @test A_cpu.nzval isa Vector
             @test size(A_cpu) == size(A_gpu)
+        end
+
+        @testset "coarse_solve_on_cpu with JLArrays" begin
+            A_jl = poisson1d_jl(100)
+            config = AMGConfig(coarse_solve_on_cpu=true)
+            hierarchy = amg_setup(A_jl, config)
+            @test hierarchy.coarse_solve_on_cpu == true
+            # coarse_A and coarse_x/coarse_b should be CPU arrays
+            @test hierarchy.coarse_A isa Matrix
+            @test hierarchy.coarse_x isa Vector
+            @test hierarchy.coarse_b isa Vector
+            # Solve should still converge
+            n = 100
+            b = JLArray(ones(n))
+            x = JLArray(zeros(n))
+            x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=100)
+            x_cpu = Array(x)
+            b_cpu = Array(b)
+            A_cpu = csr_to_cpu(csr_from_gpu(A_jl))
+            r = zeros(n)
+            rp = A_cpu.rowptr; cv = A_cpu.colval; nzv = A_cpu.nzval
+            for i in 1:n
+                Ax_i = 0.0
+                for nz in rp[i]:(rp[i+1]-1)
+                    Ax_i += nzv[nz] * x_cpu[cv[nz]]
+                end
+                r[i] = b_cpu[i] - Ax_i
+            end
+            @test norm(r) / norm(b_cpu) < 1e-6
+            @test niter < 100
+            # Resetup should also work with coarse_solve_on_cpu
+            amg_resetup!(hierarchy, A_jl, config)
+            @test hierarchy.coarse_A isa Matrix
+            @test hierarchy.coarse_x isa Vector
+            @test hierarchy.coarse_b isa Vector
+            x2 = JLArray(zeros(n))
+            x2, niter2 = amg_solve!(x2, b, hierarchy, config; tol=1e-8, maxiter=100)
+            @test niter2 < 100
         end
     end
 

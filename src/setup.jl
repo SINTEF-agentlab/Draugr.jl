@@ -108,17 +108,24 @@ function amg_setup(A_csr::CSRMatrix{Tv, Ti}, config::AMGConfig=AMGConfig();
     # Set up direct solver at coarsest level using high-level lu()
     # For GPU: build dense matrix on CPU (A_current may be CPU from coarsening),
     # then copy to device so lu() dispatches to GPU (e.g., CUDA's cuSOLVER).
-    # If the GPU backend doesn't support lu(), _build_coarse_lu falls back to CPU.
+    # If coarse_solve_on_cpu is set, or the GPU backend doesn't support lu(),
+    # _build_coarse_lu falls back to CPU.
     n_coarse = size(A_current, 1)
     if is_gpu
         # Build dense on CPU first (A_current is CPU from compute_coarse_sparsity)
         A_cpu = csr_to_cpu(A_current)
         coarse_cpu = Matrix{Tv}(undef, n_coarse, n_coarse)
         _csr_to_dense!(coarse_cpu, A_cpu)
-        # Copy to device and attempt GPU LU; falls back to CPU if unsupported
-        coarse_dev = _allocate_dense_matrix(A_csr, Tv, n_coarse, n_coarse)
-        copyto!(coarse_dev, coarse_cpu)
-        coarse_dense, coarse_factor = _build_coarse_lu(coarse_dev)
+        if config.coarse_solve_on_cpu
+            # Force coarse solve on CPU
+            coarse_dense = coarse_cpu
+            coarse_factor = lu(coarse_dense)
+        else
+            # Copy to device and attempt GPU LU; falls back to CPU if unsupported
+            coarse_dev = _allocate_dense_matrix(A_csr, Tv, n_coarse, n_coarse)
+            copyto!(coarse_dev, coarse_cpu)
+            coarse_dense, coarse_factor = _build_coarse_lu(coarse_dev)
+        end
         coarse_x = similar(coarse_dense, Tv, n_coarse)
         fill!(coarse_x, zero(Tv))
         coarse_b = similar(coarse_dense, Tv, n_coarse)
@@ -135,7 +142,7 @@ function amg_setup(A_csr::CSRMatrix{Tv, Ti}, config::AMGConfig=AMGConfig();
     end
     hierarchy = AMGHierarchy{Tv, Ti}(levels, coarse_dense,
                                       coarse_factor, coarse_x, coarse_b, solve_r,
-                                      backend, block_size)
+                                      backend, block_size, config.coarse_solve_on_cpu)
     t_setup = time() - t_setup
     if config.verbose >= 1
         _print_hierarchy_info(hierarchy, config, n_finest, t_setup)
@@ -313,6 +320,7 @@ function _print_hierarchy_info(hierarchy::AMGHierarchy, config::AMGConfig, n_fin
     println("  Cycle type:      $(config.cycle_type)-cycle")
     println("  Backend:         $(_backend_name(hierarchy.backend))")
     println("  Block size:      $(hierarchy.block_size)")
+    println("  Coarse solve:    $(hierarchy.coarse_solve_on_cpu ? "CPU (forced)" : "default")")
     println("  Strength:        $(typeof(config.strength_type).name.name)")
     # Coarsening info
     coarsening_str = _coarsening_name(config.coarsening)

@@ -398,9 +398,9 @@ Complete AMG hierarchy with multiple levels and a direct solver at the coarsest 
 The coarse LU factorization uses high-level `lu` / `lu!` so that GPU backends
 (CUDA, Metal) can dispatch to their own implementations.
 
-The coarsest-level workspace (`coarse_x`, `coarse_b`) is always on CPU since
-LU direct solves use LAPACK. Level workspace and smoother arrays are allocated
-on the same device as the input matrix.
+The coarsest-level workspace (`coarse_x`, `coarse_b`) lives on the same device as
+`coarse_A`. When `coarse_solve_on_cpu` is `true`, these are always on CPU.
+Level workspace and smoother arrays are allocated on the same device as the input matrix.
 
 The `backend` and `block_size` are stored in the hierarchy so that cycle/solve/resetup
 functions automatically use the correct backend without requiring explicit kwargs.
@@ -414,6 +414,7 @@ mutable struct AMGHierarchy{Tv, Ti<:Integer}
     solve_r::AbstractVector{Tv}        # residual buffer for amg_solve! (finest level size)
     backend::Any               # KernelAbstractions backend (CPU, CUDABackend, etc.)
     block_size::Int            # block size for KA kernel launches
+    coarse_solve_on_cpu::Bool  # if true, coarse LU solve is always on CPU
 end
 
 # ── AMG Configuration ─────────────────────────────────────────────────────────
@@ -440,6 +441,9 @@ Fields:
 - `cycle_type`: AMG cycle type, `:V` for V-cycle or `:W` for W-cycle (default: `:V`)
 - `strength_type`: Strength of connection algorithm (default: `AbsoluteStrength()`).
   Use `SignedStrength()` for non-M-matrices with positive off-diagonals.
+- `coarse_solve_on_cpu`: If `true`, the coarsest-level LU factorization and direct
+  solve are performed on CPU even when using a GPU backend. Required for backends
+  that do not support `lu` on device (e.g., Apple Metal). Default: `false`.
 """
 struct AMGConfig
     coarsening::CoarseningAlgorithm
@@ -455,6 +459,7 @@ struct AMGConfig
     max_row_sum::Float64
     cycle_type::Symbol
     strength_type::StrengthType
+    coarse_solve_on_cpu::Bool
 end
 
 function AMGConfig(;
@@ -471,13 +476,14 @@ function AMGConfig(;
     max_row_sum::Float64 = 1.0,
     cycle_type::Symbol = :V,
     strength_type::StrengthType = AbsoluteStrength(),
+    coarse_solve_on_cpu::Bool = false,
 )
     @assert cycle_type in (:V, :W) "cycle_type must be :V or :W"
     verbose_int = verbose isa Bool ? Int(verbose) : verbose
     return AMGConfig(coarsening, smoother, max_levels, max_coarse_size,
                      pre_smoothing_steps, post_smoothing_steps, jacobi_omega, verbose_int,
                      initial_coarsening, initial_coarsening_levels,
-                     max_row_sum, cycle_type, strength_type)
+                     max_row_sum, cycle_type, strength_type, coarse_solve_on_cpu)
 end
 
 """

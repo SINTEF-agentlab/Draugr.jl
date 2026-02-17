@@ -176,6 +176,7 @@ struct L1JacobiSmootherType <: SmootherType end
 struct L1ColoredGaussSeidelType <: SmootherType end
 struct ChebyshevSmootherType <: SmootherType end
 struct ILU0SmootherType <: SmootherType end
+struct SerialILU0SmootherType <: SmootherType end
 
 # ── Abstract smoother ─────────────────────────────────────────────────────────
 abstract type AbstractSmoother end
@@ -315,6 +316,23 @@ mutable struct ILU0Smoother{Tv, Ti} <: AbstractSmoother
     color_offsets::Vector{Int}
     color_order::Vector{Ti}
     num_colors::Int
+    tmp::Vector{Tv}
+    A_cpu::CSRMatrix{Tv, Ti}  # CPU copy of A's structure for sequential triangular solves
+end
+
+"""
+    SerialILU0Smoother{Tv, Ti}
+
+Serial ILU(0) smoother. Computes an incomplete LU factorization with the same
+sparsity pattern as A, then applies plain sequential forward/backward
+substitution without graph coloring or parallelism.
+
+All data is stored on CPU. For GPU arrays, copies data to/from CPU as needed.
+"""
+mutable struct SerialILU0Smoother{Tv, Ti} <: AbstractSmoother
+    L_nzval::Vector{Tv}       # strictly lower triangle values (same pattern positions as A)
+    U_nzval::Vector{Tv}       # upper triangle + diagonal values
+    diag_idx::Vector{Ti}      # index of diagonal in each row's nzrange
     tmp::Vector{Tv}
     A_cpu::CSRMatrix{Tv, Ti}  # CPU copy of A's structure for sequential triangular solves
 end

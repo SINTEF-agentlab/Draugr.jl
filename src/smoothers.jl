@@ -927,64 +927,8 @@ function build_smoother(A::CSRMatrix, ::ChebyshevSmootherType, ω::Real; backend
 end
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ILU(0) Smoother
+# ILU(0) Smoother — shared helpers
 # ══════════════════════════════════════════════════════════════════════════════
-
-"""
-    build_ilu0_smoother(A)
-
-Build a parallel ILU(0) smoother. Computes an incomplete LU factorization with
-the same sparsity pattern as A, using graph coloring for parallel forward/backward
-substitution. All factorization data is stored on CPU; GPU matrices are
-automatically converted.
-"""
-function build_ilu0_smoother(A::CSRMatrix{Tv, Ti}) where {Tv, Ti}
-    A_cpu = csr_to_cpu(A)
-    n = size(A_cpu, 1)
-    cv = colvals(A_cpu)
-    nzv = nonzeros(A_cpu)
-    rp = rowptr(A_cpu)
-    ti_one = one(Ti)
-
-    # Compute coloring for parallel triangular solves (on CPU)
-    colors, num_colors = greedy_coloring(A_cpu)
-    color_counts = zeros(Int, num_colors)
-    @inbounds for i in 1:n
-        color_counts[colors[i]] += 1
-    end
-    color_offsets = Vector{Int}(undef, num_colors + 1)
-    color_offsets[1] = 1
-    for c in 1:num_colors
-        color_offsets[c+1] = color_offsets[c] + color_counts[c]
-    end
-    color_order = Vector{Ti}(undef, n)
-    pos = copy(color_offsets[1:num_colors])
-    @inbounds for i in 1:n
-        c = colors[i]
-        color_order[pos[c]] = Ti(i)
-        pos[c] += 1
-    end
-
-    # Find diagonal indices
-    diag_idx = Vector{Ti}(undef, n)
-    @inbounds for i in 1:n
-        for nz in rp[i]:(rp[i+ti_one]-ti_one)
-            if cv[nz] == i
-                diag_idx[i] = Ti(nz)
-                break
-            end
-        end
-    end
-
-    # ILU(0) factorization (on CPU)
-    L_nzval = zeros(Tv, nnz(A_cpu))
-    U_nzval = copy(nzv)
-    _ilu0_factorize!(L_nzval, U_nzval, diag_idx, A_cpu)
-
-    tmp = zeros(Tv, n)
-    return ILU0Smoother{Tv, Ti}(L_nzval, U_nzval, diag_idx, colors,
-                                 color_offsets, color_order, num_colors, tmp, A_cpu)
-end
 
 """
     _ilu0_factorize!(L_nzval, U_nzval, diag_idx, A)
@@ -1059,25 +1003,53 @@ function _ilu0_factorize!(L_nzval::Vector{Tv}, U_nzval::Vector{Tv},
     return nothing
 end
 
-"""Find column `col` in row range [start, stop] of colval array."""
-function _find_nz_in_row(cv::AbstractVector{Ti}, start, stop, col) where Ti
-    # Binary search since columns are sorted in CSR
-    lo, hi = Ti(start), Ti(stop)
-    while lo <= hi
-        mid = (lo + hi) >> 1
-        @inbounds c = cv[mid]
-        if c == col
-            return mid
-        elseif c < col
-            lo = mid + one(Ti)
-        else
-            hi = mid - one(Ti)
+"""Compute diagonal indices for ILU(0) factorization."""
+function _ilu0_diag_indices(A_cpu::CSRMatrix{Tv, Ti}) where {Tv, Ti}
+    n = size(A_cpu, 1)
+    cv = colvals(A_cpu)
+    rp = rowptr(A_cpu)
+    ti_one = one(Ti)
+    diag_idx = Vector{Ti}(undef, n)
+    @inbounds for i in 1:n
+        for nz in rp[i]:(rp[i+ti_one]-ti_one)
+            if cv[nz] == i
+                diag_idx[i] = Ti(nz)
+                break
+            end
         end
     end
-    return zero(Ti)
+    return diag_idx
 end
 
-function update_smoother!(smoother::ILU0Smoother, A::CSRMatrix;
+# ══════════════════════════════════════════════════════════════════════════════
+# Serial ILU(0) Smoother
+# ══════════════════════════════════════════════════════════════════════════════
+
+"""
+    build_serial_ilu0_smoother(A)
+
+Build a serial ILU(0) smoother. Computes an incomplete LU factorization with
+the same sparsity pattern as A, using plain sequential forward/backward
+substitution (no graph coloring). All factorization data is stored on CPU;
+GPU matrices are automatically converted.
+"""
+function build_serial_ilu0_smoother(A::CSRMatrix{Tv, Ti}) where {Tv, Ti}
+    A_cpu = csr_to_cpu(A)
+    n = size(A_cpu, 1)
+    nzv = nonzeros(A_cpu)
+
+    diag_idx = _ilu0_diag_indices(A_cpu)
+
+    # ILU(0) factorization (on CPU)
+    L_nzval = zeros(Tv, nnz(A_cpu))
+    U_nzval = copy(nzv)
+    _ilu0_factorize!(L_nzval, U_nzval, diag_idx, A_cpu)
+
+    tmp = zeros(Tv, n)
+    return SerialILU0Smoother{Tv, Ti}(L_nzval, U_nzval, diag_idx, tmp, A_cpu)
+end
+
+function update_smoother!(smoother::SerialILU0Smoother, A::CSRMatrix;
                           backend=_get_backend(nonzeros(A)), block_size::Int=64)
     A_cpu = csr_to_cpu(A)
     copyto!(smoother.A_cpu.nzval, A_cpu.nzval)
@@ -1086,14 +1058,14 @@ function update_smoother!(smoother::ILU0Smoother, A::CSRMatrix;
 end
 
 """
-    smooth!(x, A, b, smoother::ILU0Smoother; steps=1)
+    smooth!(x, A, b, smoother::SerialILU0Smoother; steps=1)
 
-Apply ILU(0) smoothing: x += (LU)⁻¹ (b - Ax).
-Uses sequential forward/backward substitution on CPU.
+Apply serial ILU(0) smoothing: x += (LU)⁻¹ (b - Ax).
+Uses plain sequential forward/backward substitution on CPU.
 For GPU arrays, copies data to CPU, applies ILU, and copies back.
 """
 function smooth!(x::AbstractVector, A::CSRMatrix{Tv, Ti}, b::AbstractVector,
-                 smoother::ILU0Smoother; steps::Int=1, backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
+                 smoother::SerialILU0Smoother; steps::Int=1, backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
     n = size(A, 1)
     ti_one = one(Ti)
 
@@ -1141,6 +1113,256 @@ function smooth!(x::AbstractVector, A::CSRMatrix{Tv, Ti}, b::AbstractVector,
             end
             u_ii = smoother.U_nzval[smoother.diag_idx[i]]
             tmp[i] = _entry_norm(u_ii) > eps(real(Tv)) ? u_ii \ tmp[i] : zero(Tv)
+        end
+
+        # Update: x += dx (with NaN protection)
+        @inbounds for i in 1:n
+            v = tmp[i]
+            if _is_finite_entry(v)
+                x_cpu[i] += v
+            end
+        end
+    end
+
+    # Copy result back to GPU if needed
+    if is_gpu
+        copyto!(x, x_cpu)
+    end
+    return x
+end
+
+function build_smoother(A::CSRMatrix, ::SerialILU0SmootherType, ω::Real; backend=DEFAULT_BACKEND, block_size::Int=64)
+    return build_serial_ilu0_smoother(A)
+end
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Parallel ILU(0) Smoother (with coloring)
+# ══════════════════════════════════════════════════════════════════════════════
+
+"""
+    _compute_ilu_levels(A_cpu, diag_idx)
+
+Compute level scheduling for parallel triangular solves. Returns level
+assignments and ordering for both forward and backward substitution.
+
+For forward substitution (L solve), row i depends on rows j < i where
+L[i,j] ≠ 0. The level of row i is 1 + max(level(j)) over all such j.
+
+For backward substitution (U solve), row i depends on rows j > i where
+U[i,j] ≠ 0. The level of row i is 1 + max(level(j)) over all such j.
+
+Returns (fwd_order, fwd_offsets, num_fwd_levels, bwd_order, bwd_offsets, num_bwd_levels).
+"""
+function _compute_ilu_levels(A_cpu::CSRMatrix{Tv, Ti}, diag_idx::Vector{Ti}) where {Tv, Ti}
+    n = size(A_cpu, 1)
+    cv = colvals(A_cpu)
+    rp = rowptr(A_cpu)
+    ti_one = one(Ti)
+
+    # Forward solve levels: row i depends on j < i in L's sparsity
+    fwd_level = Vector{Int}(undef, n)
+    @inbounds for i in 1:n
+        max_dep = 0
+        for nz in rp[i]:(diag_idx[i]-ti_one)
+            j = cv[nz]
+            max_dep = max(max_dep, fwd_level[j])
+        end
+        fwd_level[i] = max_dep + 1
+    end
+    num_fwd_levels = n > 0 ? maximum(fwd_level) : 0
+
+    # Backward solve levels: row i depends on j > i in U's sparsity
+    bwd_level = Vector{Int}(undef, n)
+    @inbounds for i in n:-1:1
+        max_dep = 0
+        for nz in (diag_idx[i]+ti_one):(rp[i+ti_one]-ti_one)
+            j = cv[nz]
+            max_dep = max(max_dep, bwd_level[j])
+        end
+        bwd_level[i] = max_dep + 1
+    end
+    num_bwd_levels = n > 0 ? maximum(bwd_level) : 0
+
+    # Build forward level ordering
+    fwd_counts = zeros(Int, num_fwd_levels)
+    @inbounds for i in 1:n
+        fwd_counts[fwd_level[i]] += 1
+    end
+    fwd_offsets = Vector{Int}(undef, num_fwd_levels + 1)
+    fwd_offsets[1] = 1
+    for c in 1:num_fwd_levels
+        fwd_offsets[c+1] = fwd_offsets[c] + fwd_counts[c]
+    end
+    fwd_order = Vector{Ti}(undef, n)
+    pos = copy(fwd_offsets[1:num_fwd_levels])
+    @inbounds for i in 1:n
+        c = fwd_level[i]
+        fwd_order[pos[c]] = Ti(i)
+        pos[c] += 1
+    end
+
+    # Build backward level ordering
+    bwd_counts = zeros(Int, num_bwd_levels)
+    @inbounds for i in 1:n
+        bwd_counts[bwd_level[i]] += 1
+    end
+    bwd_offsets = Vector{Int}(undef, num_bwd_levels + 1)
+    bwd_offsets[1] = 1
+    for c in 1:num_bwd_levels
+        bwd_offsets[c+1] = bwd_offsets[c] + bwd_counts[c]
+    end
+    bwd_order = Vector{Ti}(undef, n)
+    pos = copy(bwd_offsets[1:num_bwd_levels])
+    @inbounds for i in 1:n
+        c = bwd_level[i]
+        bwd_order[pos[c]] = Ti(i)
+        pos[c] += 1
+    end
+
+    return fwd_order, fwd_offsets, num_fwd_levels, bwd_order, bwd_offsets, num_bwd_levels
+end
+
+"""
+    build_ilu0_smoother(A)
+
+Build a parallel ILU(0) smoother. Computes an incomplete LU factorization with
+the same sparsity pattern as A, using level scheduling for parallel forward/backward
+substitution. All factorization data is stored on CPU; GPU matrices are
+automatically converted.
+"""
+function build_ilu0_smoother(A::CSRMatrix{Tv, Ti}) where {Tv, Ti}
+    A_cpu = csr_to_cpu(A)
+    n = size(A_cpu, 1)
+    nzv = nonzeros(A_cpu)
+
+    diag_idx = _ilu0_diag_indices(A_cpu)
+
+    # Compute level scheduling for parallel triangular solves
+    fwd_order, fwd_offsets, num_fwd_levels, bwd_order, bwd_offsets, num_bwd_levels =
+        _compute_ilu_levels(A_cpu, diag_idx)
+
+    # ILU(0) factorization (on CPU)
+    L_nzval = zeros(Tv, nnz(A_cpu))
+    U_nzval = copy(nzv)
+    _ilu0_factorize!(L_nzval, U_nzval, diag_idx, A_cpu)
+
+    tmp = zeros(Tv, n)
+    # Store level-scheduling data in the coloring fields for compatibility.
+    # colors stores fwd_offsets (forward level offsets)
+    # color_offsets stores bwd_offsets (backward level offsets)
+    # color_order stores fwd_order (forward level ordering)
+    # num_colors = num_fwd_levels
+    # We also need backward data, so we repurpose the fields and store bwd separately.
+    # To keep the struct, we use: colors = bwd_order, color_offsets = fwd_offsets,
+    # color_order = fwd_order, num_colors = num_fwd_levels.
+    # We'll store bwd_offsets and num_bwd_levels in a concatenated form.
+    # Actually, let's just store all level data:
+    # colors -> bwd_order
+    # color_offsets -> [fwd_offsets..., bwd_offsets...]
+    # color_order -> fwd_order
+    # num_colors -> num_fwd_levels (we compute bwd from the offsets)
+
+    # Pack level scheduling data into ILU0Smoother fields:
+    # - color_order -> fwd_order (rows sorted by forward level)
+    # - color_offsets -> fwd_offsets (forward level boundaries)
+    # - num_colors -> num_fwd_levels
+    # - colors -> bwd_order (rows sorted by backward level)
+    # For backward offsets, we store them at the end of color_offsets
+    combined_offsets = vcat(fwd_offsets, bwd_offsets)
+    return ILU0Smoother{Tv, Ti}(L_nzval, U_nzval, diag_idx, bwd_order,
+                                 combined_offsets, fwd_order, num_fwd_levels, tmp, A_cpu)
+end
+
+function update_smoother!(smoother::ILU0Smoother, A::CSRMatrix;
+                          backend=_get_backend(nonzeros(A)), block_size::Int=64)
+    A_cpu = csr_to_cpu(A)
+    copyto!(smoother.A_cpu.nzval, A_cpu.nzval)
+    _ilu0_factorize!(smoother.L_nzval, smoother.U_nzval, smoother.diag_idx, smoother.A_cpu)
+    return smoother
+end
+
+"""
+    smooth!(x, A, b, smoother::ILU0Smoother; steps=1)
+
+Apply parallel ILU(0) smoothing: x += (LU)⁻¹ (b - Ax).
+Uses level scheduling to process independent rows in parallel during
+the forward/backward substitution phases.
+For GPU arrays, copies data to CPU, applies ILU, and copies back.
+"""
+function smooth!(x::AbstractVector, A::CSRMatrix{Tv, Ti}, b::AbstractVector,
+                 smoother::ILU0Smoother; steps::Int=1, backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
+    n = size(A, 1)
+    ti_one = one(Ti)
+
+    # Use CPU arrays for ILU solve
+    is_gpu = !(x isa Array)
+    if is_gpu
+        x_cpu = Array(x)
+        b_cpu = Array(b)
+        A_cpu = smoother.A_cpu
+    else
+        x_cpu = x
+        b_cpu = b
+        A_cpu = A
+    end
+
+    nzv = nonzeros(A_cpu)
+    cv = colvals(A_cpu)
+    rp = rowptr(A_cpu)
+    tmp = smoother.tmp  # always CPU
+
+    fwd_order = smoother.color_order
+    num_fwd_levels = smoother.num_colors
+    # Forward offsets are stored in combined_offsets[1 : num_fwd_levels+1]
+    combined_offsets = smoother.color_offsets
+    bwd_order = smoother.colors
+    # Backward offsets are stored in combined_offsets[num_fwd_levels+2 : end]
+    bwd_offset_start = num_fwd_levels + 2
+    num_bwd_levels = length(combined_offsets) - bwd_offset_start
+
+    L_nzval = smoother.L_nzval
+    U_nzval = smoother.U_nzval
+    diag_idx = smoother.diag_idx
+
+    for _ in 1:steps
+        # Compute residual: tmp = b - A*x (on CPU)
+        @inbounds for i in 1:n
+            Ax_i = zero(Tv)
+            for nz in rp[i]:(rp[i+ti_one]-ti_one)
+                j = cv[nz]
+                Ax_i += nzv[nz] * x_cpu[j]
+            end
+            tmp[i] = b_cpu[i] - Ax_i
+        end
+
+        # Forward substitution: L * z = tmp, using level scheduling.
+        # Within each level, rows are independent and can be processed in parallel.
+        @inbounds for lev in 1:num_fwd_levels
+            lev_start = combined_offsets[lev]
+            lev_end = combined_offsets[lev+1] - 1
+            Threads.@threads for idx in lev_start:lev_end
+                i = fwd_order[idx]
+                for nz in rp[i]:(diag_idx[i]-ti_one)
+                    j = cv[nz]
+                    tmp[i] -= L_nzval[nz] * tmp[j]
+                end
+            end
+        end
+
+        # Backward substitution: U * dx = z, using level scheduling.
+        # Within each level, rows are independent and can be processed in parallel.
+        @inbounds for lev in 1:num_bwd_levels
+            lev_start = combined_offsets[bwd_offset_start + lev - 1]
+            lev_end = combined_offsets[bwd_offset_start + lev] - 1
+            Threads.@threads for idx in lev_start:lev_end
+                i = bwd_order[idx]
+                for nz in (diag_idx[i]+ti_one):(rp[i+ti_one]-ti_one)
+                    j = cv[nz]
+                    tmp[i] -= U_nzval[nz] * tmp[j]
+                end
+                u_ii = U_nzval[diag_idx[i]]
+                tmp[i] = _entry_norm(u_ii) > eps(real(Tv)) ? u_ii \ tmp[i] : zero(Tv)
+            end
         end
 
         # Update: x += dx (with NaN protection)

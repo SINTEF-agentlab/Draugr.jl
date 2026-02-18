@@ -7,7 +7,7 @@
  *
  * Lifecycle:
  *   1. Call init_julia(argc, argv) once at startup.
- *   2. Create configs and hierarchies, solve, cycle, resetup as needed.
+ *   2. Create configs, build hierarchies, solve/cycle as needed.
  *   3. Free handles when done.
  *   4. Call shutdown_julia(0) once at shutdown.
  */
@@ -35,78 +35,63 @@ void init_julia(int argc, char **argv);
  */
 void shutdown_julia(int retcode);
 
-/* ── Enum values ───────────────────────────────────────────────────────── */
-
-/* Coarsening algorithms */
-#define DRAUGR_AMG_COARSENING_AGGREGATION           0
-#define DRAUGR_AMG_COARSENING_PMIS                  1
-#define DRAUGR_AMG_COARSENING_HMIS                  2
-#define DRAUGR_AMG_COARSENING_RS                    3
-#define DRAUGR_AMG_COARSENING_AGGRESSIVE_PMIS       4
-#define DRAUGR_AMG_COARSENING_AGGRESSIVE_HMIS       5
-#define DRAUGR_AMG_COARSENING_SMOOTHED_AGGREGATION  6
-
-/* Smoother types */
-#define DRAUGR_AMG_SMOOTHER_JACOBI          0
-#define DRAUGR_AMG_SMOOTHER_COLORED_GS      1
-#define DRAUGR_AMG_SMOOTHER_SERIAL_GS       2
-#define DRAUGR_AMG_SMOOTHER_SPAI0           3
-#define DRAUGR_AMG_SMOOTHER_SPAI1           4
-#define DRAUGR_AMG_SMOOTHER_L1_JACOBI       5
-#define DRAUGR_AMG_SMOOTHER_CHEBYSHEV       6
-#define DRAUGR_AMG_SMOOTHER_ILU0            7
-#define DRAUGR_AMG_SMOOTHER_L1_COLORED_GS   8
-
-/* Interpolation types */
-#define DRAUGR_AMG_INTERPOLATION_DIRECT      0
-#define DRAUGR_AMG_INTERPOLATION_STANDARD    1
-#define DRAUGR_AMG_INTERPOLATION_EXTENDED_I  2
-
-/* Cycle types */
-#define DRAUGR_AMG_CYCLE_V  0
-#define DRAUGR_AMG_CYCLE_W  1
-
-/* Strength of connection */
-#define DRAUGR_AMG_STRENGTH_ABSOLUTE  0
-#define DRAUGR_AMG_STRENGTH_SIGNED    1
-
-/* ── Config ────────────────────────────────────────────────────────────── */
+/* ── Error reporting ───────────────────────────────────────────────────── */
 
 /**
- * Create an AMG configuration.
+ * Retrieve the last error message from a failed draugr_amg_* call.
  *
- * @param coarsening           CoarseningEnum value (DRAUGR_AMG_COARSENING_*)
- * @param smoother             SmootherEnum value   (DRAUGR_AMG_SMOOTHER_*)
- * @param interpolation        InterpolationEnum    (DRAUGR_AMG_INTERPOLATION_*)
- * @param strength             StrengthEnum         (DRAUGR_AMG_STRENGTH_*)
- * @param cycle                CycleEnum            (DRAUGR_AMG_CYCLE_*)
- * @param theta                Strength threshold (e.g. 0.25)
- * @param trunc_factor         Interpolation truncation factor (0 = none)
- * @param jacobi_omega         Jacobi relaxation weight (e.g. 2/3)
- * @param max_levels           Maximum AMG levels (e.g. 20)
- * @param max_coarse_size      Coarsest-level size for direct solve (e.g. 50)
- * @param pre_smoothing_steps  Pre-smoothing sweeps per level (e.g. 1)
- * @param post_smoothing_steps Post-smoothing sweeps per level (e.g. 1)
- * @param verbose              Verbosity: 0=silent, 1=summary, 2=per-iter
- * @param initial_coarsening   CoarseningEnum value for initial levels
- * @param initial_coarsening_levels Number of levels that use initial_coarsening
- * @param max_row_sum          hypre-like max_row_sum threshold (1.0 disables)
- * @param coarse_solve_on_cpu  0=false, 1=true
- *
- * @return  Config handle (> 0) on success, -1 on error.
+ * @return  Null-terminated error string.  Empty string if no error.
+ *          The pointer is valid until the next draugr_amg_* call.
  */
-int32_t draugr_amg_config_create(int32_t coarsening, int32_t smoother,
-                                 int32_t interpolation, int32_t strength,
-                                 int32_t cycle, double theta,
-                                 double trunc_factor, double jacobi_omega,
-                                 int32_t max_levels, int32_t max_coarse_size,
-                                 int32_t pre_smoothing_steps,
-                                 int32_t post_smoothing_steps,
-                                 int32_t verbose,
-                                 int32_t initial_coarsening,
-                                 int32_t initial_coarsening_levels,
-                                 double max_row_sum,
-                                 int32_t coarse_solve_on_cpu);
+const char *draugr_amg_last_error(void);
+
+/* ── Config (JSON-based) ───────────────────────────────────────────────── */
+
+/**
+ * Create an AMG configuration from a JSON string.
+ *
+ * All keys are optional.  Pass "{}" or NULL for defaults (see AMGConfig()
+ * in types.jl for the default values).
+ *
+ * Unknown keys are silently ignored (allows pass-through from host apps).
+ *
+ * Supported JSON keys:
+ *
+ *   coarsening             (string)  "aggregation", "pmis", "hmis", "rs",
+ *                                    "aggressive_pmis", "aggressive_hmis",
+ *                                    "smoothed_aggregation"
+ *
+ *   interpolation          (string or object)
+ *                          String:   "direct", "standard", "extended_i"
+ *                          Object:   {"type": "...", "trunc_factor": ...,
+ *                                     "max_elements": ..., "norm_p": ...,
+ *                                     "rescale": ...}
+ *
+ *   smoother               (string or object)
+ *                          String:   "jacobi", "colored_gs", "serial_gs",
+ *                                    "spai0", "spai1", "l1_jacobi",
+ *                                    "l1_colored_gs", "chebyshev", "ilu0"
+ *                          Object:   {"type": "...", "omega": ...}
+ *
+ *   strength               (string)  "absolute", "signed"
+ *   cycle                  (string)  "v", "w"
+ *   theta                  (double)  Strength-of-connection threshold
+ *   max_levels             (int)
+ *   max_coarse_size        (int)
+ *   pre_smoothing_steps    (int)
+ *   post_smoothing_steps   (int)
+ *   verbose                (int)     0=silent, 1=summary, 2=per-iter
+ *   jacobi_omega           (double)  Also settable via smoother "omega"
+ *   max_row_sum            (double)  Dependency weakening threshold
+ *   coarse_solve_on_cpu    (bool)
+ *   initial_coarsening     (string)  Coarsening for first N levels
+ *   initial_coarsening_levels (int)
+ *
+ * @param json_str  Null-terminated JSON string. Pass "{}" or NULL for defaults.
+ * @return  Config handle (> 0) on success, -1 on error.
+ *          Call draugr_amg_last_error() for the error message.
+ */
+int32_t draugr_amg_config_from_json(const char *json_str);
 
 /* ── Setup / resetup ───────────────────────────────────────────────────── */
 
@@ -118,7 +103,7 @@ int32_t draugr_amg_config_create(int32_t coarsening, int32_t smoother,
  * @param rowptr         Row-pointer array, length n+1
  * @param colval         Column-index array, length nnz
  * @param nzval          Nonzero-value array, length nnz
- * @param config_handle  Config handle from draugr_amg_config_create()
+ * @param config_handle  Config handle from draugr_amg_config_from_json()
  * @param index_base     0 for C-style zero-based indexing,
  *                       1 for Fortran/Julia-style one-based indexing
  *

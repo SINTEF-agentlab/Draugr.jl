@@ -5,139 +5,160 @@
 # PackageCompiler can export them as C symbols in a compiled shared library.
 # Also provides @cfunction pointers for the Julia-embedding use case.
 #
-# Integer enums select coarsening, smoother, and interpolation options.
+# Configuration is passed as a JSON string via draugr_amg_config_from_json().
+#
 # Hierarchies and configs are stored in a global handle table so that C
 # callers receive an opaque Int32 handle.
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ── Enum definitions ─────────────────────────────────────────────────────────
+using JSON3
 
-"""
-Integer codes for coarsening algorithms (passed from C).
-"""
-@enum CoarseningEnum::Int32 begin
-    COARSENING_AGGREGATION          = 0
-    COARSENING_PMIS                 = 1
-    COARSENING_HMIS                 = 2
-    COARSENING_RS                   = 3
-    COARSENING_AGGRESSIVE_PMIS      = 4
-    COARSENING_AGGRESSIVE_HMIS      = 5
-    COARSENING_SMOOTHED_AGGREGATION = 6
+# ── Error reporting ──────────────────────────────────────────────────────────
+
+const _LAST_ERROR_BUF = Ref{Vector{UInt8}}(UInt8[0])
+
+function _set_last_error(msg::String)
+    buf = Vector{UInt8}(msg)
+    push!(buf, 0x00)
+    _LAST_ERROR_BUF[] = buf
 end
 
-"""
-Integer codes for smoother types (passed from C).
-"""
-@enum SmootherEnum::Int32 begin
-    SMOOTHER_JACOBI            = 0
-    SMOOTHER_COLORED_GS        = 1
-    SMOOTHER_SERIAL_GS         = 2
-    SMOOTHER_SPAI0             = 3
-    SMOOTHER_SPAI1             = 4
-    SMOOTHER_L1_JACOBI         = 5
-    SMOOTHER_CHEBYSHEV         = 6
-    SMOOTHER_ILU0              = 7
-    SMOOTHER_L1_COLORED_GS     = 8
-    SMOOTHER_SERIAL_ILU0       = 9
-    SMOOTHER_L1_SERIAL_GS      = 10
+Base.@ccallable function draugr_amg_last_error()::Ptr{UInt8}
+    return pointer(_LAST_ERROR_BUF[])
 end
 
-"""
-Integer codes for interpolation types (passed from C).
-"""
-@enum InterpolationEnum::Int32 begin
-    INTERPOLATION_DIRECT     = 0
-    INTERPOLATION_STANDARD   = 1
-    INTERPOLATION_EXTENDED_I = 2
+# ── Type coercion helpers ────────────────────────────────────────────────────
+# JSON values may arrive as strings (e.g. "0.5", "20", "true") rather than
+# native JSON types. These helpers handle both forms transparently.
+
+_to_float(v::Number) = Float64(v)
+_to_float(v) = parse(Float64, string(v))
+
+_to_int(v::Number) = Int(round(v))
+_to_int(v) = parse(Int, string(v))
+
+_to_bool(v::Bool) = v
+_to_bool(v) = lowercase(string(v)) in ("true", "1")
+
+_to_string(v) = lowercase(string(v))
+
+# ── JSON ↔ Julia type tables ──────────────────────────────────────────────────
+
+function _lookup(table, name, label)
+    haskey(table, name) && return table[name]
+    valid = join(sort(collect(keys(table))), ", ")
+    error("Unknown $label: \"$name\". Valid: $valid")
 end
 
-"""
-Integer codes for cycle types (passed from C).
-"""
-@enum CycleEnum::Int32 begin
-    CYCLE_V = 0
-    CYCLE_W = 1
+# Smoother: name ↔ type
+const _SMOOTHER_TYPES = Dict(
+    "jacobi"        => JacobiSmootherType,
+    "colored_gs"    => ColoredGaussSeidelType,
+    "serial_gs"     => SerialGaussSeidelType,
+    "spai0"         => SPAI0SmootherType,
+    "spai1"         => SPAI1SmootherType,
+    "l1_jacobi"     => L1JacobiSmootherType,
+    "l1_colored_gs" => L1ColoredGaussSeidelType,
+    "l1_serial_gs"  => L1SerialGaussSeidelType,
+    "chebyshev"     => ChebyshevSmootherType,
+    "ilu0"          => ILU0SmootherType,
+    "serial_ilu0"   => SerialILU0SmootherType,
+)
+const _SMOOTHER_NAMES = Dict(v => k for (k, v) in _SMOOTHER_TYPES)
+
+# Interpolation: name ↔ type, constructors with defaults from type instances
+const _INTERPOLATION_NAMES = Dict(
+    DirectInterpolation     => "direct",
+    StandardInterpolation   => "standard",
+    ExtendedIInterpolation  => "extended_i",
+)
+
+const _INTERPOLATION_CONSTRUCTORS = let
+    dd = DirectInterpolation()
+    sd = StandardInterpolation()
+    ed = ExtendedIInterpolation()
+    Dict(
+        "direct"     => d -> DirectInterpolation(
+            _to_float(get(d, "trunc_factor", dd.trunc_factor))),
+        "standard"   => d -> StandardInterpolation(
+            _to_float(get(d, "trunc_factor", sd.trunc_factor))),
+        "extended_i" => d -> ExtendedIInterpolation(
+            _to_float(get(d, "trunc_factor", ed.trunc_factor)),
+            _to_int(get(d, "max_elements", ed.max_elements)),
+            _to_int(get(d, "norm_p", ed.norm_p)),
+            _to_bool(get(d, "rescale", ed.rescale))),
+    )
 end
 
-"""
-Integer codes for strength of connection types (passed from C).
-"""
-@enum StrengthEnum::Int32 begin
-    STRENGTH_ABSOLUTE = 0
-    STRENGTH_SIGNED   = 1
-end
+# Coarsening: name ↔ type, constructors
+const _COARSENING_NAMES = Dict(
+    AggregationCoarsening          => "aggregation",
+    PMISCoarsening                 => "pmis",
+    HMISCoarsening                 => "hmis",
+    RSCoarsening                   => "rs",
+    AggressiveCoarsening           => "aggressive",
+    SmoothedAggregationCoarsening  => "smoothed_aggregation",
+)
 
-# ── Enum → Julia type conversion helpers ─────────────────────────────────────
+const _COARSENING_CONSTRUCTORS = Dict(
+    "aggregation"          => (θ, ip) -> AggregationCoarsening(θ),
+    "pmis"                 => (θ, ip) -> PMISCoarsening(θ, ip),
+    "hmis"                 => (θ, ip) -> HMISCoarsening(θ, ip),
+    "rs"                   => (θ, ip) -> RSCoarsening(θ, ip),
+    "aggressive_pmis"      => (θ, ip) -> AggressiveCoarsening(θ, :pmis, ip),
+    "aggressive_hmis"      => (θ, ip) -> AggressiveCoarsening(θ, :hmis, ip),
+    "smoothed_aggregation" => (θ, ip) -> SmoothedAggregationCoarsening(θ),
+)
 
-function _interpolation_from_enum(e::InterpolationEnum, trunc::Float64)
-    if e == INTERPOLATION_DIRECT
-        return DirectInterpolation(trunc)
-    elseif e == INTERPOLATION_STANDARD
-        return StandardInterpolation(trunc)
-    elseif e == INTERPOLATION_EXTENDED_I
-        return ExtendedIInterpolation(trunc)
+# Strength / cycle: name ↔ value
+const _STRENGTH_MAP   = Dict("absolute" => AbsoluteStrength(), "signed" => SignedStrength())
+const _STRENGTH_NAMES = Dict(typeof(v) => k for (k, v) in _STRENGTH_MAP)
+
+const _CYCLE_MAP   = Dict("v" => :V, "w" => :W)
+const _CYCLE_NAMES = Dict(v => k for (k, v) in _CYCLE_MAP)
+
+# ── Parsers ───────────────────────────────────────────────────────────────────
+
+function _parse_interpolation(v, default_name)
+    if v isa AbstractString
+        return _lookup(_INTERPOLATION_CONSTRUCTORS, lowercase(v), "interpolation")(Dict())
+    elseif v isa AbstractDict
+        name = _to_string(get(v, "type", default_name))
+        return _lookup(_INTERPOLATION_CONSTRUCTORS, name, "interpolation")(v)
     else
-        return DirectInterpolation(trunc)
+        error("\"interpolation\" must be a string or object, got: $(typeof(v))")
     end
 end
 
-function _smoother_from_enum(e::SmootherEnum)
-    if e == SMOOTHER_JACOBI
-        return JacobiSmootherType()
-    elseif e == SMOOTHER_COLORED_GS
-        return ColoredGaussSeidelType()
-    elseif e == SMOOTHER_SERIAL_GS
-        return SerialGaussSeidelType()
-    elseif e == SMOOTHER_SPAI0
-        return SPAI0SmootherType()
-    elseif e == SMOOTHER_SPAI1
-        return SPAI1SmootherType()
-    elseif e == SMOOTHER_L1_JACOBI
-        return L1JacobiSmootherType()
-    elseif e == SMOOTHER_CHEBYSHEV
-        return ChebyshevSmootherType()
-    elseif e == SMOOTHER_ILU0
-        return ILU0SmootherType()
-    elseif e == SMOOTHER_L1_COLORED_GS
-        return L1ColoredGaussSeidelType()
-    elseif e == SMOOTHER_SERIAL_ILU0
-        return SerialILU0SmootherType()
-    elseif e == SMOOTHER_L1_SERIAL_GS
-        return L1SerialGaussSeidelType()
+function _parse_smoother(v, default_name)
+    if v isa AbstractString
+        return (_lookup(_SMOOTHER_TYPES, lowercase(v), "smoother")(), nothing)
+    elseif v isa AbstractDict
+        name  = _to_string(get(v, "type", default_name))
+        omega = haskey(v, "omega") ? _to_float(v["omega"]) : nothing
+        return (_lookup(_SMOOTHER_TYPES, name, "smoother")(), omega)
     else
-        return JacobiSmootherType()
+        error("\"smoother\" must be a string or object, got: $(typeof(v))")
     end
 end
 
-function _coarsening_from_enum(e::CoarseningEnum, θ::Float64,
-                               interp::InterpolationEnum, trunc::Float64)
-    ip = _interpolation_from_enum(interp, trunc)
-    if e == COARSENING_AGGREGATION
-        return AggregationCoarsening(θ)
-    elseif e == COARSENING_PMIS
-        return PMISCoarsening(θ, ip)
-    elseif e == COARSENING_HMIS
-        return HMISCoarsening(θ, ip)
-    elseif e == COARSENING_RS
-        return RSCoarsening(θ, ip)
-    elseif e == COARSENING_AGGRESSIVE_PMIS
-        return AggressiveCoarsening(θ, :pmis, ip)
-    elseif e == COARSENING_AGGRESSIVE_HMIS
-        return AggressiveCoarsening(θ, :hmis, ip)
-    elseif e == COARSENING_SMOOTHED_AGGREGATION
-        return SmoothedAggregationCoarsening(θ)
-    else
-        return AggregationCoarsening(θ)
-    end
+function _parse_coarsening(name_str, θ::Float64, interp::InterpolationType)
+    name = _to_string(name_str)
+    return _lookup(_COARSENING_CONSTRUCTORS, name, "coarsening")(θ, interp)
 end
 
-function _cycle_from_enum(e::CycleEnum)
-    return e == CYCLE_W ? :W : :V
-end
+_parse_strength(v) = _lookup(_STRENGTH_MAP, _to_string(v), "strength")
+_parse_cycle(v)    = _lookup(_CYCLE_MAP, _to_string(v), "cycle")
 
-function _strength_from_enum(e::StrengthEnum)
-    return e == STRENGTH_SIGNED ? SignedStrength() : AbsoluteStrength()
-end
+# ── Defaults (single source of truth: AMGConfig() in types.jl) ───────────────
+
+const _DEFAULTS = AMGConfig()
+
+const _DEFAULT_INTERP_NAME     = _INTERPOLATION_NAMES[typeof(_DEFAULTS.coarsening.interpolation)]
+const _DEFAULT_COARSENING_NAME = _COARSENING_NAMES[typeof(_DEFAULTS.coarsening)]
+const _DEFAULT_SMOOTHER_NAME   = _SMOOTHER_NAMES[typeof(_DEFAULTS.smoother)]
+const _DEFAULT_STRENGTH_NAME   = _STRENGTH_NAMES[typeof(_DEFAULTS.strength_type)]
+const _DEFAULT_CYCLE_NAME      = _CYCLE_NAMES[_DEFAULTS.cycle_type]
 
 # ── Handle table ─────────────────────────────────────────────────────────────
 
@@ -153,64 +174,70 @@ function _new_handle()::Int32
 end
 
 # ── Public C-callable functions ──────────────────────────────────────────────
-# These use Base.@ccallable so PackageCompiler exports them as C symbols.
-# C-compatible names (no '!' suffix) are used for the exported symbols.
-# Julia-idiomatic aliases with '!' are provided below for backward compat.
 
 """
-    draugr_amg_config_create(coarsening, smoother, interpolation, strength,
-                             cycle, theta, trunc_factor, jacobi_omega,
-                             max_levels, max_coarse_size,
-                             pre_smoothing_steps, post_smoothing_steps,
-                             verbose, initial_coarsening,
-                             initial_coarsening_levels, max_row_sum,
-                             coarse_solve_on_cpu) -> Int32
+    draugr_amg_config_from_json(json_ptr) -> Int32
 
-Create an AMG configuration and return a handle.
-All enum arguments are Int32 values matching the `CoarseningEnum`, etc.
+Create an AMG configuration from a JSON string and return a handle.
+All keys are optional; defaults match `AMGConfig()` in types.jl.
+Unknown keys are ignored.
 
+Pass NULL or "{}" for all defaults.
 Returns a config handle (> 0) on success, or -1 on error.
+Call `draugr_amg_last_error()` for the error message on failure.
 """
-Base.@ccallable function draugr_amg_config_create(coarsening::Int32, smoother::Int32,
-                                                  interpolation::Int32, strength::Int32,
-                                                  cycle::Int32, theta::Float64,
-                                                  trunc_factor::Float64, jacobi_omega::Float64,
-                                                  max_levels::Int32, max_coarse_size::Int32,
-                                                  pre_smoothing_steps::Int32, post_smoothing_steps::Int32,
-                                                  verbose::Int32,
-                                                  initial_coarsening::Int32,
-                                                  initial_coarsening_levels::Int32,
-                                                  max_row_sum::Float64,
-                                                  coarse_solve_on_cpu::Int32)::Int32
+Base.@ccallable function draugr_amg_config_from_json(json_ptr::Ptr{UInt8})::Int32
     try
+        _set_last_error("")
+        json_str = (json_ptr == C_NULL) ? "{}" : unsafe_string(json_ptr)
+        d = JSON3.read(json_str, Dict{String, Any})
+
+        interp     = _parse_interpolation(get(d, "interpolation", _DEFAULT_INTERP_NAME), _DEFAULT_INTERP_NAME)
+        θ          = _to_float(get(d, "theta", _DEFAULTS.coarsening.θ))
+        coarsening = _parse_coarsening(get(d, "coarsening", _DEFAULT_COARSENING_NAME), θ, interp)
+
+        ic_raw = get(d, "initial_coarsening", nothing)
+        initial_coarsening = ic_raw === nothing ? coarsening :
+            _parse_coarsening(ic_raw, θ, interp)
+
+        smoother, omega_override = _parse_smoother(get(d, "smoother", _DEFAULT_SMOOTHER_NAME), _DEFAULT_SMOOTHER_NAME)
+        jacobi_omega = something(omega_override,
+            _to_float(get(d, "jacobi_omega", _DEFAULTS.jacobi_omega)))
+
         config = AMGConfig(;
-            coarsening = _coarsening_from_enum(CoarseningEnum(coarsening), theta,
-                                               InterpolationEnum(interpolation), trunc_factor),
-            smoother   = _smoother_from_enum(SmootherEnum(smoother)),
-            strength_type = _strength_from_enum(StrengthEnum(strength)),
-            cycle_type    = _cycle_from_enum(CycleEnum(cycle)),
-            jacobi_omega  = jacobi_omega,
-            max_levels    = Int(max_levels),
-            max_coarse_size = Int(max_coarse_size),
-            pre_smoothing_steps  = Int(pre_smoothing_steps),
-            post_smoothing_steps = Int(post_smoothing_steps),
-            verbose = Int(verbose),
-            initial_coarsening = _coarsening_from_enum(CoarseningEnum(initial_coarsening), theta,
-                                                       InterpolationEnum(interpolation), trunc_factor),
-            initial_coarsening_levels = Int(initial_coarsening_levels),
-            max_row_sum = max_row_sum,
-            coarse_solve_on_cpu = coarse_solve_on_cpu != 0,
+            coarsening, smoother, jacobi_omega, initial_coarsening,
+            strength_type         = _parse_strength(get(d, "strength", _DEFAULT_STRENGTH_NAME)),
+            cycle_type            = _parse_cycle(get(d, "cycle", _DEFAULT_CYCLE_NAME)),
+            max_levels            = _to_int(get(d, "max_levels", _DEFAULTS.max_levels)),
+            max_coarse_size       = _to_int(get(d, "max_coarse_size", _DEFAULTS.max_coarse_size)),
+            pre_smoothing_steps   = _to_int(get(d, "pre_smoothing_steps", _DEFAULTS.pre_smoothing_steps)),
+            post_smoothing_steps  = _to_int(get(d, "post_smoothing_steps", _DEFAULTS.post_smoothing_steps)),
+            verbose               = _to_int(get(d, "verbose", _DEFAULTS.verbose)),
+            initial_coarsening_levels = _to_int(get(d, "initial_coarsening_levels", _DEFAULTS.initial_coarsening_levels)),
+            max_row_sum           = _to_float(get(d, "max_row_sum", _DEFAULTS.max_row_sum)),
+            coarse_solve_on_cpu   = _to_bool(get(d, "coarse_solve_on_cpu", _DEFAULTS.coarse_solve_on_cpu)),
         )
+
         lock(_HANDLE_LOCK) do
             h = _new_handle()
             _CONFIG_HANDLES[h] = config
             return h
         end
     catch e
-        @error "draugr_amg_config_create failed" exception=(e, catch_backtrace())
+        msg = sprint(showerror, e)
+        _set_last_error(msg)
+        @error "draugr_amg_config_from_json failed" exception=(e, catch_backtrace())
         return Int32(-1)
     end
 end
+
+"""
+    draugr_amg_config_from_json(json::String) -> Int32
+
+Convenience method for Julia callers — avoids manual pointer wrangling.
+"""
+draugr_amg_config_from_json(json::String) =
+    GC.@preserve json draugr_amg_config_from_json(Base.unsafe_convert(Ptr{UInt8}, json))
 
 """
     draugr_amg_setup(n, nnz, rowptr, colval, nzval, config_handle, index_base) -> Int32
@@ -223,7 +250,7 @@ Arguments:
 - `rowptr`:        Ptr{Int32} to row-pointer array (length n+1)
 - `colval`:        Ptr{Int32} to column-index array (length nnz)
 - `nzval`:         Ptr{Float64} to values array  (length nnz)
-- `config_handle`: Config handle from `draugr_amg_config_create`
+- `config_handle`: Config handle from `draugr_amg_config_from_json`
 - `index_base`:    Index base of incoming arrays: 0 for C-style zero-based,
                    1 for Fortran/Julia-style one-based.
                    When 0, rowptr and colval are converted to 1-based on
@@ -237,6 +264,7 @@ Base.@ccallable function draugr_amg_setup(n::Int32, nnz_count::Int32,
                                           config_handle::Int32,
                                           index_base::Int32)::Int32
     try
+        _set_last_error("")
         rp = unsafe_wrap(Array, rowptr, Int(n) + 1)
         cv = unsafe_wrap(Array, colval, Int(nnz_count))
         nzv = unsafe_wrap(Array, nzval, Int(nnz_count))
@@ -245,7 +273,7 @@ Base.@ccallable function draugr_amg_setup(n::Int32, nnz_count::Int32,
             get(_CONFIG_HANDLES, config_handle, nothing)
         end
         if config === nothing
-            @error "Invalid config handle" config_handle
+            _set_last_error("Invalid config handle: $config_handle")
             return Int32(-1)
         end
         hierarchy = amg_setup(A, config)
@@ -255,6 +283,8 @@ Base.@ccallable function draugr_amg_setup(n::Int32, nnz_count::Int32,
             return h
         end
     catch e
+        msg = sprint(showerror, e)
+        _set_last_error(msg)
         @error "draugr_amg_setup failed" exception=(e, catch_backtrace())
         return Int32(-1)
     end
@@ -276,6 +306,7 @@ Base.@ccallable function draugr_amg_resetup(handle::Int32, n::Int32, nnz_count::
                                             config_handle::Int32,
                                             index_base::Int32)::Int32
     try
+        _set_last_error("")
         rp = unsafe_wrap(Array, rowptr, Int(n) + 1)
         cv = unsafe_wrap(Array, colval, Int(nnz_count))
         nzv = unsafe_wrap(Array, nzval, Int(nnz_count))
@@ -286,7 +317,7 @@ Base.@ccallable function draugr_amg_resetup(handle::Int32, n::Int32, nnz_count::
             return h, c
         end
         if hierarchy === nothing || config === nothing
-            @error "Invalid handle" handle config_handle
+            _set_last_error("Invalid handle (hierarchy=$handle, config=$config_handle)")
             return Int32(-1)
         end
         backend = hierarchy.backend
@@ -310,6 +341,8 @@ Base.@ccallable function draugr_amg_resetup(handle::Int32, n::Int32, nnz_count::
         hierarchy.coarse_factor = lu(hierarchy.coarse_A)
         return Int32(0)
     catch e
+        msg = sprint(showerror, e)
+        _set_last_error(msg)
         @error "draugr_amg_resetup failed" exception=(e, catch_backtrace())
         return Int32(-1)
     end
@@ -327,6 +360,7 @@ Base.@ccallable function draugr_amg_solve(handle::Int32, n::Int32,
                                           config_handle::Int32,
                                           tol::Float64, maxiter::Int32)::Int32
     try
+        _set_last_error("")
         xv = unsafe_wrap(Array, x, Int(n))
         bv = unsafe_wrap(Array, b, Int(n))
         hierarchy, config = lock(_HANDLE_LOCK) do
@@ -335,12 +369,14 @@ Base.@ccallable function draugr_amg_solve(handle::Int32, n::Int32,
             return h, c
         end
         if hierarchy === nothing || config === nothing
-            @error "Invalid handle" handle config_handle
+            _set_last_error("Invalid handle (hierarchy=$handle, config=$config_handle)")
             return Int32(-1)
         end
         _, niter = amg_solve!(xv, bv, hierarchy, config; tol=tol, maxiter=Int(maxiter))
         return Int32(niter)
     catch e
+        msg = sprint(showerror, e)
+        _set_last_error(msg)
         @error "draugr_amg_solve failed" exception=(e, catch_backtrace())
         return Int32(-1)
     end
@@ -357,6 +393,7 @@ Base.@ccallable function draugr_amg_cycle(handle::Int32, n::Int32,
                                           x::Ptr{Float64}, b::Ptr{Float64},
                                           config_handle::Int32)::Int32
     try
+        _set_last_error("")
         xv = unsafe_wrap(Array, x, Int(n))
         bv = unsafe_wrap(Array, b, Int(n))
         hierarchy, config = lock(_HANDLE_LOCK) do
@@ -365,12 +402,14 @@ Base.@ccallable function draugr_amg_cycle(handle::Int32, n::Int32,
             return h, c
         end
         if hierarchy === nothing || config === nothing
-            @error "Invalid handle" handle config_handle
+            _set_last_error("Invalid handle (hierarchy=$handle, config=$config_handle)")
             return Int32(-1)
         end
         amg_cycle!(xv, bv, hierarchy, config)
         return Int32(0)
     catch e
+        msg = sprint(showerror, e)
+        _set_last_error(msg)
         @error "draugr_amg_cycle failed" exception=(e, catch_backtrace())
         return Int32(-1)
     end
@@ -422,12 +461,10 @@ Return a named tuple of `@cfunction` pointers for the embedding use case.
 """
 function draugr_amg_get_cfunctions()
     return (
-        config_create = @cfunction(draugr_amg_config_create,
-            Int32,
-            (Int32, Int32, Int32, Int32, Int32,
-             Float64, Float64, Float64,
-             Int32, Int32, Int32, Int32, Int32,
-             Int32, Int32, Float64, Int32)),
+        config_from_json = @cfunction(draugr_amg_config_from_json,
+            Int32, (Ptr{UInt8},)),
+        last_error = @cfunction(draugr_amg_last_error,
+            Ptr{UInt8}, ()),
         setup = @cfunction(draugr_amg_setup,
             Int32,
             (Int32, Int32, Ptr{Int32}, Ptr{Int32}, Ptr{Float64}, Int32, Int32)),

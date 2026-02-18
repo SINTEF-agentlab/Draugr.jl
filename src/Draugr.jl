@@ -108,16 +108,8 @@ export build_smoother, update_smoother!, smooth!
 export AbstractDraugrPreconditioner, DraugrPreconditioner
 export setup_specific_preconditioner
 # C-callable interface
-export CoarseningEnum, SmootherEnum, InterpolationEnum, CycleEnum, StrengthEnum
-export COARSENING_AGGREGATION, COARSENING_PMIS, COARSENING_HMIS, COARSENING_RS
-export COARSENING_AGGRESSIVE_PMIS, COARSENING_AGGRESSIVE_HMIS, COARSENING_SMOOTHED_AGGREGATION
-export SMOOTHER_JACOBI, SMOOTHER_COLORED_GS, SMOOTHER_SERIAL_GS
-export SMOOTHER_SPAI0, SMOOTHER_SPAI1, SMOOTHER_L1_JACOBI, SMOOTHER_CHEBYSHEV, SMOOTHER_ILU0
-export SMOOTHER_L1_COLORED_GS, SMOOTHER_SERIAL_ILU0, SMOOTHER_L1_SERIAL_GS
-export INTERPOLATION_DIRECT, INTERPOLATION_STANDARD, INTERPOLATION_EXTENDED_I
-export CYCLE_V, CYCLE_W
-export STRENGTH_ABSOLUTE, STRENGTH_SIGNED
-export draugr_amg_config_create, draugr_amg_setup, draugr_amg_resetup
+export draugr_amg_config_from_json, draugr_amg_last_error
+export draugr_amg_setup, draugr_amg_resetup
 export draugr_amg_solve, draugr_amg_cycle, draugr_amg_free, draugr_amg_config_free
 export draugr_amg_get_cfunctions
 

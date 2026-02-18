@@ -10,7 +10,8 @@ The RestrictionMap groups triples by their destination coarse NZ index so that
 """
 function compute_coarse_sparsity(A_fine::CSRMatrix{Tv, Ti},
                                  P::ProlongationOp{Ti, Tv},
-                                 n_coarse::Int) where {Tv, Ti}
+                                 n_coarse::Int;
+                                 build_restriction_map::Bool=true) where {Tv, Ti}
     n_fine = size(A_fine, 1)
     cv_a = colvals(A_fine)
     nzv_a = nonzeros(A_fine)
@@ -150,6 +151,10 @@ function compute_coarse_sparsity(A_fine::CSRMatrix{Tv, Ti},
     end
 
     A_coarse = CSRMatrix(rowptr_c, colval_c, nzval_c, n_coarse, n_coarse)
+
+    if !build_restriction_map
+        return A_coarse, nothing
+    end
 
     # Phase 3: Group triples by coarse NZ destination for contention-free parallel resetup.
     # Sort triples by their coarse NZ index so each output entry owns a contiguous

@@ -433,6 +433,102 @@ end
         end
     end
 
+    @testset "AMG Setup - allow_partial_resetup=false" begin
+        n = 10
+        A = poisson2d_csr(n)
+        N = n*n
+        config = AMGConfig(coarsening=AggregationCoarsening())
+        hierarchy = amg_setup(A, config; allow_partial_resetup=false)
+        @test length(hierarchy.levels) > 0
+        # R_map should be nothing when allow_partial_resetup=false
+        for lvl in hierarchy.levels
+            @test lvl.R_map === nothing
+        end
+        # Solve should still work
+        b = rand(N)
+        x = zeros(N)
+        x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r = b - sparse(A.At') * x
+        @test norm(r) / norm(b) < 1e-8
+        @test niter < 200
+    end
+
+    @testset "AMG Setup - allow_partial_resetup=true has R_map" begin
+        n = 10
+        A = poisson2d_csr(n)
+        config = AMGConfig(coarsening=AggregationCoarsening())
+        hierarchy = amg_setup(A, config; allow_partial_resetup=true)
+        @test length(hierarchy.levels) > 0
+        for lvl in hierarchy.levels
+            @test lvl.R_map !== nothing
+        end
+    end
+
+    @testset "AMG Resetup - partial=false" begin
+        n = 10
+        A = poisson2d_csr(n)
+        N = n*n
+        config = AMGConfig(coarsening=AggregationCoarsening())
+        hierarchy = amg_setup(A, config)
+        # Solve with original matrix
+        b = rand(N)
+        x1 = zeros(N)
+        x1, _ = amg_solve!(x1, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r1 = b - sparse(A.At') * x1
+        @test norm(r1) / norm(b) < 1e-8
+        # Scale matrix and do full resetup
+        nonzeros(A) .*= 2.0
+        amg_resetup!(hierarchy, A, config; partial=false)
+        x2 = zeros(N)
+        x2, _ = amg_solve!(x2, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r2 = b - sparse(A.At') * x2
+        @test norm(r2) / norm(b) < 1e-8
+        @test !isapprox(x1, x2, atol=1e-6)
+    end
+
+    @testset "AMG Resetup - partial=false with allow_partial_resetup" begin
+        n = 10
+        A = poisson2d_csr(n)
+        N = n*n
+        config = AMGConfig(coarsening=AggregationCoarsening())
+        hierarchy = amg_setup(A, config; allow_partial_resetup=false)
+        # R_map should be nothing
+        for lvl in hierarchy.levels
+            @test lvl.R_map === nothing
+        end
+        # Full resetup with allow_partial_resetup=true should populate R_map
+        amg_resetup!(hierarchy, A, config; partial=false, allow_partial_resetup=true)
+        for lvl in hierarchy.levels
+            @test lvl.R_map !== nothing
+        end
+        # Partial resetup should now work
+        nonzeros(A) .*= 2.0
+        amg_resetup!(hierarchy, A, config; partial=true)
+        b = rand(N)
+        x = zeros(N)
+        x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r = b - sparse(A.At') * x
+        @test norm(r) / norm(b) < 1e-8
+    end
+
+    @testset "AMG Resetup - partial=false, allow_partial_resetup=false" begin
+        n = 10
+        A = poisson2d_csr(n)
+        N = n*n
+        config = AMGConfig(coarsening=AggregationCoarsening())
+        hierarchy = amg_setup(A, config)
+        # Full resetup without restriction maps
+        amg_resetup!(hierarchy, A, config; partial=false, allow_partial_resetup=false)
+        for lvl in hierarchy.levels
+            @test lvl.R_map === nothing
+        end
+        b = rand(N)
+        x = zeros(N)
+        x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r = b - sparse(A.At') * x
+        @test norm(r) / norm(b) < 1e-8
+    end
+
     @testset "Small System Direct Solve" begin
         # System small enough to be solved directly
         A = poisson1d_csr(5)

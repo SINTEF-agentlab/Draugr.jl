@@ -385,7 +385,7 @@ function _print_hierarchy_info(hierarchy::AMGHierarchy, config::AMGConfig, n_fin
         total_rows += n
         sname = _smoother_name(lvl.smoother)
         if i == 1
-            Printf.@printf("  %5d   %7d    %8d         -   %s\n", i, n, nz, sname)
+            Printf.@printf("  %5d   %7d    %8d        -   %s\n", i, n, nz, sname)
         else
             prev_n = size(hierarchy.levels[i-1].A, 1)
             ratio = n / prev_n

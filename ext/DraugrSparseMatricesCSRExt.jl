@@ -66,7 +66,7 @@ function Draugr.amg_resetup!(hierarchy::AMGHierarchy{Tv, Ti},
                                   A_new::SparseMatrixCSR{Bi, Tv, Ti},
                                   config::AMGConfig=AMGConfig();
                                   partial::Bool=true,
-                                  allow_partial_resetup::Bool=true) where {Bi, Tv, Ti}
+                                  allow_partial_resetup::Bool=Draugr._has_restriction_maps(hierarchy)) where {Bi, Tv, Ti}
     A_csr = csr_from_sparse_csr(A_new)
     return Draugr.amg_resetup!(hierarchy, A_csr, config; partial=partial,
                                allow_partial_resetup=allow_partial_resetup)

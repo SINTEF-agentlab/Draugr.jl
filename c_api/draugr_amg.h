@@ -106,6 +106,9 @@ int32_t draugr_amg_config_from_json(const char *json_str);
  * @param config_handle  Config handle from draugr_amg_config_from_json()
  * @param index_base     0 for C-style zero-based indexing,
  *                       1 for Fortran/Julia-style one-based indexing
+ * @param allow_partial_resetup  1 to build restriction maps for fast partial
+ *                       resetup (default use case), 0 to skip them for a
+ *                       faster initial setup (only full resetup available)
  *
  * @return  Hierarchy handle (> 0) on success, -1 on error.
  */
@@ -113,14 +116,27 @@ int32_t draugr_amg_setup(int32_t n, int32_t nnz,
                          const int32_t *rowptr, const int32_t *colval,
                          const double *nzval,
                          int32_t config_handle,
-                         int32_t index_base);
+                         int32_t index_base,
+                         int32_t allow_partial_resetup);
 
 /**
- * Update an existing hierarchy with new matrix coefficients.
- * The sparsity pattern (rowptr, colval) must be identical to the
- * original call to draugr_amg_setup().
+ * Update an existing hierarchy with new matrix data.
+ *
+ * When partial=1: only matrix values, Galerkin products, smoothers and the
+ * coarse solver are recomputed — the coarsening structure is kept.  This is
+ * the fast path for coefficient-only updates (same sparsity pattern).
+ * Requires the hierarchy to have restriction maps (setup/resetup with
+ * allow_partial_resetup=1).
+ *
+ * When partial=0: the hierarchy is fully rebuilt (new coarsening, prolongation,
+ * smoothers) while reusing workspace arrays from the existing hierarchy.
+ * More efficient than freeing + re-calling draugr_amg_setup() because
+ * workspace vectors whose sizes haven't changed are reused.
  *
  * @param index_base     0 for zero-based, 1 for one-based indexing
+ * @param partial        1 for coefficient-only update, 0 for full rebuild
+ * @param allow_partial_resetup  1 to build restriction maps for future
+ *                       partial resetups (only relevant when partial=0)
  *
  * @return  0 on success, -1 on error.
  */
@@ -128,7 +144,9 @@ int32_t draugr_amg_resetup(int32_t handle, int32_t n, int32_t nnz,
                            const int32_t *rowptr, const int32_t *colval,
                            const double *nzval,
                            int32_t config_handle,
-                           int32_t index_base);
+                           int32_t index_base,
+                           int32_t partial,
+                           int32_t allow_partial_resetup);
 
 /* ── Solve / cycle ─────────────────────────────────────────────────────── */
 

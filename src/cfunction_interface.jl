@@ -243,7 +243,8 @@ Base.@ccallable function draugr_amg_setup(n::Int32, nnz_count::Int32,
                                           rowptr::Ptr{Int32}, colval::Ptr{Int32},
                                           nzval::Ptr{Float64},
                                           config_handle::Int32,
-                                          index_base::Int32)::Int32
+                                          index_base::Int32,
+                                          allow_partial_resetup::Int32)::Int32
     try
         _set_last_error("")
         rp = unsafe_wrap(Array, rowptr, Int(n) + 1)
@@ -257,7 +258,8 @@ Base.@ccallable function draugr_amg_setup(n::Int32, nnz_count::Int32,
             _set_last_error("Invalid config handle: $config_handle")
             return Int32(-1)
         end
-        hierarchy = amg_setup(A, config)
+        hierarchy = amg_setup(A, config;
+                              allow_partial_resetup=(allow_partial_resetup != Int32(0)))
         lock(_HANDLE_LOCK) do
             h = _new_handle()
             _HIERARCHY_HANDLES[h] = hierarchy
@@ -272,7 +274,7 @@ Base.@ccallable function draugr_amg_setup(n::Int32, nnz_count::Int32,
 end
 
 @doc """
-    draugr_amg_setup(n, nnz, rowptr, colval, nzval, config_handle, index_base) -> Int32
+    draugr_amg_setup(n, nnz, rowptr, colval, nzval, config_handle, index_base, allow_partial_resetup) -> Int32
 
 Build an AMG hierarchy from CSR data and return a hierarchy handle.
 
@@ -287,6 +289,10 @@ Arguments:
                    1 for Fortran/Julia-style one-based.
                    When 0, rowptr and colval are converted to 1-based on
                    owned copies (no extra allocation).
+- `allow_partial_resetup`: When 1, restriction maps are built during setup so that
+                   `draugr_amg_resetup` can be called with `partial=1`. When 0,
+                   these maps are skipped for faster setup, but only full resetup
+                   (`partial=0`) can be used afterwards.
 
 Returns a hierarchy handle (> 0) on success, or -1 on error.
 """ draugr_amg_setup
@@ -295,7 +301,9 @@ Base.@ccallable function draugr_amg_resetup(handle::Int32, n::Int32, nnz_count::
                                             rowptr::Ptr{Int32}, colval::Ptr{Int32},
                                             nzval::Ptr{Float64},
                                             config_handle::Int32,
-                                            index_base::Int32)::Int32
+                                            index_base::Int32,
+                                            partial::Int32,
+                                            allow_partial_resetup::Int32)::Int32
     try
         _set_last_error("")
         rp = unsafe_wrap(Array, rowptr, Int(n) + 1)
@@ -311,25 +319,9 @@ Base.@ccallable function draugr_amg_resetup(handle::Int32, n::Int32, nnz_count::
             _set_last_error("Invalid handle (hierarchy=$handle, config=$config_handle)")
             return Int32(-1)
         end
-        backend = hierarchy.backend
-        block_size = hierarchy.block_size
-        nlevels = length(hierarchy.levels)
-        if nlevels == 0
-            Draugr._update_coarse_solver!(hierarchy, A_csr; block_size=block_size)
-            return Int32(0)
-        end
-        level1 = hierarchy.levels[1]
-        Draugr._copy_nzvals!(level1.A, A_csr; block_size=block_size)
-        Draugr.update_smoother!(level1.smoother, level1.A; block_size=block_size)
-        for lvl in 1:(nlevels - 1)
-            level = hierarchy.levels[lvl]
-            next_level = hierarchy.levels[lvl + 1]
-            Draugr.galerkin_product!(next_level.A, level.A, level.P, level.R_map; block_size=block_size)
-            Draugr.update_smoother!(next_level.smoother, next_level.A; block_size=block_size)
-        end
-        last_level = hierarchy.levels[nlevels]
-        Draugr._recompute_coarsest_dense!(hierarchy, last_level)
-        hierarchy.coarse_factor = lu(hierarchy.coarse_A)
+        amg_resetup!(hierarchy, A_csr, config;
+                     partial=(partial != Int32(0)),
+                     allow_partial_resetup=(allow_partial_resetup != Int32(0)))
         return Int32(0)
     catch e
         msg = sprint(showerror, e)
@@ -340,9 +332,25 @@ Base.@ccallable function draugr_amg_resetup(handle::Int32, n::Int32, nnz_count::
 end
 
 @doc """
-    draugr_amg_resetup(handle, n, nnz, rowptr, colval, nzval, config_handle, index_base) -> Int32
+    draugr_amg_resetup(handle, n, nnz, rowptr, colval, nzval, config_handle,
+                       index_base, partial, allow_partial_resetup) -> Int32
 
-Update the AMG hierarchy with new matrix coefficients (same sparsity pattern).
+Update the AMG hierarchy with new matrix data. Thin wrapper around
+`amg_resetup!(hierarchy, A, config; partial, allow_partial_resetup)`.
+
+When `partial=1`, only matrix values, Galerkin products, smoothers and the
+coarse solver are recomputed — the coarsening structure is kept.  This is
+the fast path and requires the hierarchy to have restriction maps (built
+when setup/resetup used `allow_partial_resetup=1`).
+
+When `partial=0`, the hierarchy is fully rebuilt (new coarsening, prolongation,
+smoothers) while reusing workspace arrays from the existing hierarchy. This is
+more efficient than freeing and re-calling `draugr_amg_setup` because
+workspace vectors whose sizes haven't changed are reused.
+
+`allow_partial_resetup` controls whether restriction maps are built during a
+full resetup (`partial=0`) for future partial resetups.  Ignored when
+`partial=1`.
 
 When `index_base=0`, the incoming rowptr/colval use zero-based indexing and are
 converted to one-based on owned copies (no extra allocation).
@@ -420,13 +428,22 @@ Returns 0 on success, -1 on error.
 """ draugr_amg_cycle
 
 Base.@ccallable function draugr_amg_free(handle::Int32)::Int32
-    lock(_HANDLE_LOCK) do
-        if haskey(_HIERARCHY_HANDLES, handle)
-            delete!(_HIERARCHY_HANDLES, handle)
-            return Int32(0)
-        else
-            return Int32(-1)
+    try
+        _set_last_error("")
+        lock(_HANDLE_LOCK) do
+            if haskey(_HIERARCHY_HANDLES, handle)
+                delete!(_HIERARCHY_HANDLES, handle)
+                return Int32(0)
+            else
+                _set_last_error("Invalid hierarchy handle: $handle")
+                return Int32(-1)
+            end
         end
+    catch e
+        msg = sprint(showerror, e)
+        _set_last_error(msg)
+        @error "draugr_amg_free failed" exception=(e, catch_backtrace())
+        return Int32(-1)
     end
 end
 
@@ -435,17 +452,26 @@ end
 
 Free the AMG hierarchy associated with `handle`.
 
-Returns 0 on success, -1 if handle not found.
+Returns 0 on success, -1 on error.
 """ draugr_amg_free
 
 Base.@ccallable function draugr_amg_config_free(handle::Int32)::Int32
-    lock(_HANDLE_LOCK) do
-        if haskey(_CONFIG_HANDLES, handle)
-            delete!(_CONFIG_HANDLES, handle)
-            return Int32(0)
-        else
-            return Int32(-1)
+    try
+        _set_last_error("")
+        lock(_HANDLE_LOCK) do
+            if haskey(_CONFIG_HANDLES, handle)
+                delete!(_CONFIG_HANDLES, handle)
+                return Int32(0)
+            else
+                _set_last_error("Invalid config handle: $handle")
+                return Int32(-1)
+            end
         end
+    catch e
+        msg = sprint(showerror, e)
+        _set_last_error(msg)
+        @error "draugr_amg_config_free failed" exception=(e, catch_backtrace())
+        return Int32(-1)
     end
 end
 
@@ -454,7 +480,7 @@ end
 
 Free the AMG configuration associated with `handle`.
 
-Returns 0 on success, -1 if handle not found.
+Returns 0 on success, -1 on error.
 """ draugr_amg_config_free
 
 
@@ -473,10 +499,10 @@ function draugr_amg_get_cfunctions()
             Ptr{UInt8}, ()),
         setup = @cfunction(draugr_amg_setup,
             Int32,
-            (Int32, Int32, Ptr{Int32}, Ptr{Int32}, Ptr{Float64}, Int32, Int32)),
+            (Int32, Int32, Ptr{Int32}, Ptr{Int32}, Ptr{Float64}, Int32, Int32, Int32)),
         resetup = @cfunction(draugr_amg_resetup,
             Int32,
-            (Int32, Int32, Int32, Ptr{Int32}, Ptr{Int32}, Ptr{Float64}, Int32, Int32)),
+            (Int32, Int32, Int32, Ptr{Int32}, Ptr{Int32}, Ptr{Float64}, Int32, Int32, Int32, Int32)),
         solve = @cfunction(draugr_amg_solve,
             Int32,
             (Int32, Int32, Ptr{Float64}, Ptr{Float64}, Int32, Float64, Int32)),

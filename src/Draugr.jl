@@ -103,7 +103,7 @@ export SPAI0Smoother, SPAI1Smoother
 export L1JacobiSmoother, ChebyshevSmoother, ILU0Smoother, SerialILU0Smoother
 export JacobiSmootherType, ColoredGaussSeidelType, SerialGaussSeidelType
 export SPAI0SmootherType, SPAI1SmootherType
-export L1JacobiSmootherType, L1ColoredGaussSeidelType, L1SerialGaussSeidelTyp, ChebyshevSmootherType, ILU0SmootherType, SerialILU0SmootherType
+export L1JacobiSmootherType, L1ColoredGaussSeidelType, L1SerialGaussSeidelType, ChebyshevSmootherType, ILU0SmootherType, SerialILU0SmootherType
 export build_smoother, update_smoother!, smooth!
 export AbstractDraugrPreconditioner, DraugrPreconditioner
 export setup_specific_preconditioner

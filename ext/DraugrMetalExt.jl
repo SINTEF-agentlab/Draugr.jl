@@ -25,9 +25,11 @@ hierarchy = amg_setup(A, config)
 function Draugr.amg_setup(A::CSRMatrix{Tv, Ti, <:MtlVector, <:MtlVector, <:MtlVector},
                                config::AMGConfig=AMGConfig();
                                backend=MetalBackend(),
-                               block_size::Int=64) where {Tv, Ti}
+                               block_size::Int=64,
+                               allow_partial_resetup::Bool=true) where {Tv, Ti}
     return invoke(Draugr.amg_setup, Tuple{CSRMatrix{Tv, Ti}, AMGConfig},
-                  A, config; backend=backend, block_size=block_size)
+                  A, config; backend=backend, block_size=block_size,
+                  allow_partial_resetup=allow_partial_resetup)
 end
 
 """
@@ -38,9 +40,12 @@ Converts to a CPU `CSRMatrix` and forwards to the main `CSRMatrix`-based resetup
 """
 function Draugr.amg_resetup!(hierarchy::AMGHierarchy{Tv, Ti},
                                   A_new::CSRMatrix{Tv, Ti, <:MtlVector, <:MtlVector, <:MtlVector},
-                                  config::AMGConfig=AMGConfig()) where {Tv, Ti}
+                                  config::AMGConfig=AMGConfig();
+                                  partial::Bool=true,
+                                  allow_partial_resetup::Bool=true) where {Tv, Ti}
     A_csr = Draugr.csr_to_cpu(A_new)
-    return Draugr.amg_resetup!(hierarchy, A_csr, config)
+    return Draugr.amg_resetup!(hierarchy, A_csr, config; partial=partial,
+                               allow_partial_resetup=allow_partial_resetup)
 end
 
 end # module

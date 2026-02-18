@@ -6,7 +6,6 @@ using Draugr
 
 function _warmup()
     # Build a tiny 1D Laplacian in CSR format, 1-based.
-    # Keep this warmup minimal to avoid long PackageCompiler tracing times.
     n = 20
     rowptr = Int32[]
     colval = Int32[]
@@ -24,12 +23,9 @@ function _warmup()
     end
     nnz = Int32(length(nzval))
 
-    # Exercise config creation
-    cfg = draugr_amg_config_create(
-        Int32(0), Int32(0), Int32(0), Int32(0), Int32(0),
-        0.25, 0.0, 2.0/3.0,
-        Int32(20), Int32(50), Int32(1), Int32(1), Int32(0),
-        Int32(0), Int32(0), 1.0, Int32(0))
+    # Exercise config creation — string-only path (non-default values)
+    json = """{"coarsening": "pmis", "interpolation": "standard", "theta": 0.25}"""
+    cfg = draugr_amg_config_from_json(json)
 
     # Exercise setup (1-based indexing)
     h = draugr_amg_setup(Int32(n), nnz, pointer(rowptr), pointer(colval),
@@ -49,6 +45,16 @@ function _warmup()
     nzval2 .*= 1.1
     draugr_amg_resetup(h, Int32(n), nnz, pointer(rowptr), pointer(colval),
                        pointer(nzval2), cfg, Int32(1))
+
+    # Exercise error reporting
+    draugr_amg_last_error()
+
+    # Exercise nested-object path (interpolation sub-params, smoother omega)
+    cfg2 = draugr_amg_config_from_json("""{
+        "interpolation": {"type": "extended_i", "trunc_factor": 0.3, "max_elements": 5},
+        "smoother": {"type": "jacobi", "omega": 0.667}
+    }""")
+    draugr_amg_config_free(cfg2)
 
     # Cleanup
     draugr_amg_free(h)

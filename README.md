@@ -206,47 +206,72 @@ precond = DraugrPreconditioner(;
 
 Draugr provides a set of `Base.@ccallable` routines so the solver can be
 called from C, C++, Fortran, or any language that can call C functions.
-All exported symbols use the `draugr_amg_` prefix.  Integer enums select
-coarsening, smoother, and interpolation algorithms.
+All exported symbols use the `draugr_amg_` prefix.
 
-### Enums
+Configuration is passed as a **JSON string** via `draugr_amg_config_from_json()`.
 
-In Julia the enum values are plain names; in the C header each define is
-prefixed with `DRAUGR_AMG_`.
+### JSON Configuration
 
-| Category             | Julia / C define                                                                 |
-|----------------------|----------------------------------------------------------------------------------|
-| `CoarseningEnum`     | `COARSENING_AGGREGATION(0)`, `COARSENING_PMIS(1)`, `COARSENING_HMIS(2)`, `COARSENING_RS(3)`, `COARSENING_AGGRESSIVE_PMIS(4)`, `COARSENING_AGGRESSIVE_HMIS(5)`, `COARSENING_SMOOTHED_AGGREGATION(6)` |
-| `SmootherEnum`       | `SMOOTHER_JACOBI(0)`, `SMOOTHER_COLORED_GS(1)`, `SMOOTHER_SERIAL_GS(2)`, `SMOOTHER_SPAI0(3)`, `SMOOTHER_SPAI1(4)`, `SMOOTHER_L1_JACOBI(5)`, `SMOOTHER_CHEBYSHEV(6)`, `SMOOTHER_ILU0(7)`, `SMOOTHER_L1_COLORED_GS(8)` |
-| `InterpolationEnum`  | `INTERPOLATION_DIRECT(0)`, `INTERPOLATION_STANDARD(1)`, `INTERPOLATION_EXTENDED_I(2)` |
-| `CycleEnum`          | `CYCLE_V(0)`, `CYCLE_W(1)` |
-| `StrengthEnum`       | `STRENGTH_ABSOLUTE(0)`, `STRENGTH_SIGNED(1)` |
+All parameters are optional. Omitted keys use sensible defaults (HMIS
+coarsening, Extended+i interpolation, L1 Colored GS smoother, V-cycle).
+
+| Parameter               | Type            | Default          | Description                              |
+|-------------------------|-----------------|------------------|------------------------------------------|
+| `coarsening`            | string          | `"hmis"`         | `"aggregation"`, `"pmis"`, `"hmis"`, `"rs"`, `"aggressive_pmis"`, `"aggressive_hmis"`, `"smoothed_aggregation"` |
+| `interpolation`         | string or object| `"extended_i"`   | `"direct"`, `"standard"`, `"extended_i"` |
+| `smoother`              | string or object| `"l1_colored_gs"`| `"jacobi"`, `"colored_gs"`, `"serial_gs"`, `"spai0"`, `"spai1"`, `"l1_jacobi"`, `"l1_colored_gs"`, `"chebyshev"`, `"ilu0"` |
+| `strength`              | string          | `"absolute"`     | `"absolute"` or `"signed"`               |
+| `cycle`                 | string          | `"v"`            | `"v"` or `"w"`                           |
+| `theta`                 | double          | `0.5`            | Strength-of-connection threshold         |
+| `max_levels`            | int             | `20`             |                                          |
+| `max_coarse_size`       | int             | `50`             |                                          |
+| `pre_smoothing_steps`   | int             | `1`              |                                          |
+| `post_smoothing_steps`  | int             | `1`              |                                          |
+| `verbose`               | int             | `0`              | 0=silent, 1=summary, 2=per-iteration    |
+| `jacobi_omega`          | double          | `0.667`          | Jacobi relaxation weight                 |
+| `max_row_sum`           | double          | `1.0`            | Dependency weakening (1.0 = disabled)    |
+| `coarse_solve_on_cpu`   | bool            | `false`          |                                          |
+| `initial_coarsening`    | string          | same as coarsening| Coarsening for first N levels           |
+| `initial_coarsening_levels` | int         | `0`              |                                          |
+
+When `interpolation` or `smoother` is a plain string, defaults for that type
+are used. Use the object form for type-specific sub-parameters:
+
+```json
+"interpolation": {
+    "type": "extended_i",
+    "trunc_factor": 0.3,
+    "max_elements": 5,
+    "norm_p": 2,
+    "rescale": true
+}
+```
+
+```json
+"smoother": {"type": "jacobi", "omega": 0.667}
+```
+
+Unknown keys are silently ignored, so host applications can include their own
+keys in the same JSON object.
+
+### Error Handling
+
+On failure, all `draugr_amg_*` functions return `-1`. Call
+`draugr_amg_last_error()` to get the error message as a C string.
 
 ### Workflow from Julia
 
 ```julia
 using Draugr
 
-# 1. Create a config handle
-cfg = draugr_amg_config_create(
-    Int32(0),   # coarsening: AGGREGATION
-    Int32(0),   # smoother:   JACOBI
-    Int32(0),   # interpolation: DIRECT
-    Int32(0),   # strength:   ABSOLUTE
-    Int32(0),   # cycle:      V
-    0.25,       # θ
-    0.0,        # trunc_factor
-    2/3,        # jacobi_omega
-    Int32(20),  # max_levels
-    Int32(50),  # max_coarse_size
-    Int32(1),   # pre_smoothing_steps
-    Int32(1),   # post_smoothing_steps
-    Int32(0),   # verbose
-    Int32(0),   # initial_coarsening
-    Int32(0),   # initial_coarsening_levels
-    1.0,        # max_row_sum
-    Int32(0),   # coarse_solve_on_cpu (0=false, 1=true)
-)
+# 1. Create a config handle from JSON
+json = """{
+    "coarsening": "hmis",
+    "interpolation": {"type": "extended_i", "trunc_factor": 0.3},
+    "smoother": "l1_colored_gs",
+    "theta": 0.5
+}"""
+cfg = draugr_amg_config_from_json(json)
 
 # 2. Setup (pass index_base=0 for 0-based arrays)
 h = draugr_amg_setup(Int32(n), Int32(nnz),
@@ -277,17 +302,18 @@ draugr_amg_config_free(cfg)
 // Initialize Julia runtime (once)
 init_julia(0, NULL);
 
-// 1. Create config
-int32_t cfg = draugr_amg_config_create(
-    DRAUGR_AMG_COARSENING_HMIS,
-    DRAUGR_AMG_SMOOTHER_L1_COLORED_GS,
-    DRAUGR_AMG_INTERPOLATION_EXTENDED_I,
-    DRAUGR_AMG_STRENGTH_ABSOLUTE,
-    DRAUGR_AMG_CYCLE_V,
-    0.5, 0.0, 2.0/3.0,
-    20, 50, 1, 1, 0,
-    DRAUGR_AMG_COARSENING_HMIS, 0,
-    1.0, 0);
+// 1. Create config from JSON
+const char* json = "{"
+    "\"coarsening\": \"hmis\","
+    "\"interpolation\": {\"type\": \"extended_i\", \"trunc_factor\": 0.3},"
+    "\"smoother\": \"l1_colored_gs\","
+    "\"theta\": 0.5"
+    "}";
+int32_t cfg = draugr_amg_config_from_json(json);
+if (cfg < 0) {
+    fprintf(stderr, "Config error: %s\n", draugr_amg_last_error());
+    return 1;
+}
 
 // 2. Setup with 0-based CSR arrays
 int32_t h = draugr_amg_setup(n, nnz, rowptr, colval, nzval, cfg, 0);
@@ -313,7 +339,7 @@ To pass function pointers to a C library:
 
 ```julia
 cfuncs = draugr_amg_get_cfunctions()
-# cfuncs.setup, cfuncs.solve, cfuncs.cycle, etc. are Ptr{Cvoid}
+# cfuncs.config_from_json, cfuncs.setup, cfuncs.solve, etc. are Ptr{Cvoid}
 ```
 
 ## License

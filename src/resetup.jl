@@ -1,5 +1,20 @@
 """
-    amg_resetup!(hierarchy, A_new::CSRMatrix, config; partial=true, allow_partial_resetup=true)
+    _has_restriction_maps(hierarchy) -> Bool
+
+Check whether the hierarchy currently has restriction maps built.
+Returns `true` if any level has a non-nothing `R_map`.
+"""
+function _has_restriction_maps(hierarchy::AMGHierarchy)
+    for lvl in hierarchy.levels
+        if lvl.R_map !== nothing
+            return true
+        end
+    end
+    return false
+end
+
+"""
+    amg_resetup!(hierarchy, A_new::CSRMatrix, config; partial=true, allow_partial_resetup)
 
 Main resetup implementation using the internal `CSRMatrix` type.
 All other `amg_resetup!` methods (for `SparseMatrixCSC`, GPU types, etc.)
@@ -13,7 +28,8 @@ This requires the hierarchy to have been set up with `allow_partial_resetup=true
 When `partial=false`, the hierarchy is rebuilt from scratch (new coarsening,
 prolongation, smoothers, etc.) while reusing workspace arrays from the existing
 levels where possible. The `allow_partial_resetup` keyword controls whether
-restriction maps are built for future partial resetups.
+restriction maps are built for future partial resetups. By default it matches
+the current hierarchy state (i.e. whether restriction maps are already present).
 
 The backend and block_size are taken from the hierarchy (set during `amg_setup`).
 """
@@ -21,7 +37,7 @@ function amg_resetup!(hierarchy::AMGHierarchy{Tv, Ti},
                       A_new::CSRMatrix{Tv, Ti},
                       config::AMGConfig=AMGConfig();
                       partial::Bool=true,
-                      allow_partial_resetup::Bool=true) where {Tv, Ti}
+                      allow_partial_resetup::Bool=_has_restriction_maps(hierarchy)) where {Tv, Ti}
     backend = hierarchy.backend
     block_size = hierarchy.block_size
     if partial
@@ -70,7 +86,7 @@ function amg_resetup!(hierarchy::AMGHierarchy{Tv, Ti},
 end
 
 """
-    amg_resetup!(hierarchy, A_new::SparseMatrixCSC, config; partial=true, allow_partial_resetup=true)
+    amg_resetup!(hierarchy, A_new::SparseMatrixCSC, config; partial=true, allow_partial_resetup)
 
 External API entry point: convert `SparseMatrixCSC` to `CSRMatrix` via
 `csr_from_csc` and forward to the main `CSRMatrix`-based resetup.
@@ -79,7 +95,7 @@ function amg_resetup!(hierarchy::AMGHierarchy{Tv, Ti},
                       A_new::SparseMatrixCSC{Tv, Ti},
                       config::AMGConfig=AMGConfig();
                       partial::Bool=true,
-                      allow_partial_resetup::Bool=true) where {Tv, Ti}
+                      allow_partial_resetup::Bool=_has_restriction_maps(hierarchy)) where {Tv, Ti}
     A_csr = csr_from_csc(A_new)
     return amg_resetup!(hierarchy, A_csr, config; partial=partial,
                         allow_partial_resetup=allow_partial_resetup)

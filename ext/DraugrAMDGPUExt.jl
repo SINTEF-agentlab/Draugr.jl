@@ -45,7 +45,7 @@ function Draugr.amg_resetup!(hierarchy::AMGHierarchy{Tv, Ti},
                                   A_new::ROCSparseMatrixCSR{Tv, Ti},
                                   config::AMGConfig=AMGConfig();
                                   partial::Bool=true,
-                                  allow_partial_resetup::Bool=true) where {Tv, Ti}
+                                  allow_partial_resetup::Bool=Draugr._has_restriction_maps(hierarchy)) where {Tv, Ti}
     A_csr = Draugr.csr_to_cpu(Draugr.csr_from_gpu(A_new))
     return Draugr.amg_resetup!(hierarchy, A_csr, config; partial=partial,
                                allow_partial_resetup=allow_partial_resetup)

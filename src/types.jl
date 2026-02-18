@@ -432,7 +432,7 @@ mutable struct AMGLevel{Tv, Ti<:Integer}
     A::CSRMatrix{Tv, Ti}
     P::ProlongationOp
     Pt_map::TransposeMap
-    R_map::RestrictionMap
+    R_map::Union{Nothing, RestrictionMap}
     smoother::AbstractSmoother
     r::AbstractVector{Tv}      # residual workspace
     xc::AbstractVector{Tv}     # coarse solution workspace

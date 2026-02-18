@@ -1,49 +1,88 @@
 """
-    amg_resetup!(hierarchy, A_new::CSRMatrix, config)
+    amg_resetup!(hierarchy, A_new::CSRMatrix, config; partial=true, allow_partial_resetup=true)
 
 Main resetup implementation using the internal `CSRMatrix` type.
 All other `amg_resetup!` methods (for `SparseMatrixCSC`, GPU types, etc.)
 should convert their input to `CSRMatrix` via `csr_from_csc` or equivalent
 and forward to this method.
 
+When `partial=true` (the default), only the matrix values, Galerkin products,
+smoothers and coarse solver are recomputed using the pre-built restriction maps.
+This requires the hierarchy to have been set up with `allow_partial_resetup=true`.
+
+When `partial=false`, the hierarchy is rebuilt from scratch (new coarsening,
+prolongation, smoothers, etc.) while reusing workspace arrays from the existing
+levels where possible. The `allow_partial_resetup` keyword controls whether
+restriction maps are built for future partial resetups.
+
 The backend and block_size are taken from the hierarchy (set during `amg_setup`).
 """
 function amg_resetup!(hierarchy::AMGHierarchy{Tv, Ti},
                       A_new::CSRMatrix{Tv, Ti},
-                      config::AMGConfig=AMGConfig()) where {Tv, Ti}
+                      config::AMGConfig=AMGConfig();
+                      partial::Bool=true,
+                      allow_partial_resetup::Bool=true) where {Tv, Ti}
     backend = hierarchy.backend
     block_size = hierarchy.block_size
-    nlevels = length(hierarchy.levels)
-    if nlevels == 0
-        _update_coarse_solver!(hierarchy, A_new; backend=backend, block_size=block_size)
+    if partial
+        nlevels = length(hierarchy.levels)
+        if nlevels == 0
+            _update_coarse_solver!(hierarchy, A_new; backend=backend, block_size=block_size)
+            return hierarchy
+        end
+        level1 = hierarchy.levels[1]
+        _copy_nzvals!(level1.A, A_new; backend=backend, block_size=block_size)
+        update_smoother!(level1.smoother, level1.A; backend=backend, block_size=block_size)
+        for lvl in 1:(nlevels - 1)
+            level = hierarchy.levels[lvl]
+            next_level = hierarchy.levels[lvl + 1]
+            galerkin_product!(next_level.A, level.A, level.P, level.R_map; backend=backend, block_size=block_size)
+            update_smoother!(next_level.smoother, next_level.A; backend=backend, block_size=block_size)
+        end
+        last_level = hierarchy.levels[nlevels]
+        _recompute_coarsest_dense!(hierarchy, last_level; backend=backend)
+        hierarchy.coarse_factor = lu(hierarchy.coarse_A)
+        return hierarchy
+    else
+        # Full resetup: rebuild hierarchy from scratch, reusing workspace arrays
+        n_finest = size(A_new, 1)
+        is_gpu = !(hierarchy.solve_r isa Array)
+        if is_gpu && !isempty(hierarchy.levels)
+            device_ref = hierarchy.levels[1].A
+        else
+            device_ref = nothing
+        end
+        A_ref = device_ref === nothing ? A_new : device_ref
+        A_coarsest = _build_levels!(hierarchy.levels, A_new, config;
+                                    backend=backend, block_size=block_size,
+                                    allow_partial_resetup=allow_partial_resetup,
+                                    device_ref=device_ref)
+        coarse_dense, coarse_factor, coarse_x, coarse_b, solve_r =
+            _build_coarse_solver(A_coarsest, A_ref, n_finest, config;
+                                 backend=backend, block_size=block_size)
+        hierarchy.coarse_A = coarse_dense
+        hierarchy.coarse_factor = coarse_factor
+        hierarchy.coarse_x = coarse_x
+        hierarchy.coarse_b = coarse_b
+        hierarchy.solve_r = solve_r
         return hierarchy
     end
-    level1 = hierarchy.levels[1]
-    _copy_nzvals!(level1.A, A_new; backend=backend, block_size=block_size)
-    update_smoother!(level1.smoother, level1.A; backend=backend, block_size=block_size)
-    for lvl in 1:(nlevels - 1)
-        level = hierarchy.levels[lvl]
-        next_level = hierarchy.levels[lvl + 1]
-        galerkin_product!(next_level.A, level.A, level.P, level.R_map; backend=backend, block_size=block_size)
-        update_smoother!(next_level.smoother, next_level.A; backend=backend, block_size=block_size)
-    end
-    last_level = hierarchy.levels[nlevels]
-    _recompute_coarsest_dense!(hierarchy, last_level; backend=backend)
-    hierarchy.coarse_factor = lu(hierarchy.coarse_A)
-    return hierarchy
 end
 
 """
-    amg_resetup!(hierarchy, A_new::SparseMatrixCSC, config)
+    amg_resetup!(hierarchy, A_new::SparseMatrixCSC, config; partial=true, allow_partial_resetup=true)
 
 External API entry point: convert `SparseMatrixCSC` to `CSRMatrix` via
 `csr_from_csc` and forward to the main `CSRMatrix`-based resetup.
 """
 function amg_resetup!(hierarchy::AMGHierarchy{Tv, Ti},
                       A_new::SparseMatrixCSC{Tv, Ti},
-                      config::AMGConfig=AMGConfig()) where {Tv, Ti}
+                      config::AMGConfig=AMGConfig();
+                      partial::Bool=true,
+                      allow_partial_resetup::Bool=true) where {Tv, Ti}
     A_csr = csr_from_csc(A_new)
-    return amg_resetup!(hierarchy, A_csr, config)
+    return amg_resetup!(hierarchy, A_csr, config; partial=partial,
+                        allow_partial_resetup=allow_partial_resetup)
 end
 
 """

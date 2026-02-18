@@ -39,14 +39,16 @@ function _restriction_map_to_device(ref::CSRMatrix, r_map::RestrictionMap)
 end
 
 """
-    amg_setup(A::SparseMatrixCSC, config; backend, block_size) -> AMGHierarchy
+    amg_setup(A::SparseMatrixCSC, config; backend, block_size, allow_partial_resetup) -> AMGHierarchy
 
 External API entry point: convert `SparseMatrixCSC` to `CSRMatrix` once
 and forward to the general CSRMatrix-based setup.
 """
 function amg_setup(A::SparseMatrixCSC{Tv, Ti}, config::AMGConfig=AMGConfig();
-                   backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
-    return amg_setup(csr_from_csc(A), config; backend=backend, block_size=block_size)
+                   backend=DEFAULT_BACKEND, block_size::Int=64,
+                   allow_partial_resetup::Bool=true) where {Tv, Ti}
+    return amg_setup(csr_from_csc(A), config; backend=backend, block_size=block_size,
+                     allow_partial_resetup=allow_partial_resetup)
 end
 
 """
@@ -56,74 +58,136 @@ Perform the full AMG setup (analysis phase). This determines the coarsening at e
 level, constructs prolongation operators, computes Galerkin products, and sets up
 smoothers.
 
-The sparsity structure computed here is reused by `amg_resetup!` when matrix
-coefficients change but the pattern remains the same.
+When `allow_partial_resetup=true` (the default), the sparsity structure and
+restriction maps computed here are reused by `amg_resetup!` with `partial=true`
+when matrix coefficients change but the pattern remains the same. When
+`allow_partial_resetup=false`, these additional mappings are skipped for a
+faster setup; only `amg_resetup!` with `partial=false` can be used afterwards.
 """
 function amg_setup(A_csr::CSRMatrix{Tv, Ti}, config::AMGConfig=AMGConfig();
-                   backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
+                   backend=DEFAULT_BACKEND, block_size::Int=64,
+                   allow_partial_resetup::Bool=true) where {Tv, Ti}
     t_setup = time()
     levels = AMGLevel{Tv, Ti}[]
-    A_current = A_csr
     n_finest = size(A_csr, 1)
-    # Determine if we need GPU-resident arrays: any non-CPU array type
-    # (CuArray, JLArray, MtlArray, etc.) triggers GPU-resident hierarchy
-    is_gpu = !(A_csr.nzval isa Array)
+    A_coarsest = _build_levels!(levels, A_csr, config;
+                                backend=backend, block_size=block_size,
+                                allow_partial_resetup=allow_partial_resetup)
+    coarse_dense, coarse_factor, coarse_x, coarse_b, solve_r =
+        _build_coarse_solver(A_coarsest, A_csr, n_finest, config;
+                             backend=backend, block_size=block_size)
+    hierarchy = AMGHierarchy{Tv, Ti}(levels, coarse_dense,
+                                      coarse_factor, coarse_x, coarse_b, solve_r,
+                                      backend, block_size, config.coarse_solve_on_cpu)
+    t_setup = time() - t_setup
+    if config.verbose >= 1
+        _print_hierarchy_info(hierarchy, config, n_finest, t_setup)
+    end
+    return hierarchy
+end
+
+# ── Shared helpers for setup and full resetup ────────────────────────────────
+
+"""
+    _reuse_or_allocate_vector(old_level, field, A_ref, Tv, n)
+
+Try to reuse a workspace vector from an old AMG level if its size matches.
+Otherwise allocate a new vector on the same device as `A_ref`.
+"""
+function _reuse_or_allocate_vector(old_level, field::Symbol,
+                                   A_ref::CSRMatrix, ::Type{Tv}, n::Int) where {Tv}
+    if old_level !== nothing
+        old_vec = getfield(old_level, field)
+        if length(old_vec) == n
+            return old_vec
+        end
+    end
+    if A_ref.nzval isa Array
+        return Vector{Tv}(undef, n)
+    else
+        return _allocate_vector(A_ref, Tv, n)
+    end
+end
+
+"""
+    _build_levels!(levels, A_input, config; backend, block_size, allow_partial_resetup, device_ref)
+
+Build AMG levels by coarsening `A_input`. Populates `levels` in-place, reusing
+workspace vectors from any pre-existing levels when sizes match. Returns the
+coarsest-level CSR matrix (to be used for the direct solver).
+
+When `device_ref` is provided (a GPU-backed CSRMatrix), it is used as the
+reference for device allocation. When `nothing` (the default), `A_input` is
+used as the reference.
+"""
+function _build_levels!(levels::Vector{AMGLevel{Tv, Ti}},
+                        A_input::CSRMatrix{Tv, Ti},
+                        config::AMGConfig;
+                        backend=DEFAULT_BACKEND, block_size::Int=64,
+                        allow_partial_resetup::Bool=true,
+                        device_ref::Union{Nothing, CSRMatrix}=nothing) where {Tv, Ti}
+    A_ref = device_ref === nothing ? A_input : device_ref
+    is_gpu = !(A_ref.nzval isa Array)
+    old_levels = copy(levels)
+    empty!(levels)
+    A_current = A_input
     for lvl in 1:(config.max_levels - 1)
         n = size(A_current, 1)
         n <= config.max_coarse_size && break
-        # Select coarsening algorithm for this level
         coarsening_alg = _get_coarsening_for_level(config, lvl)
-        # Coarsen and build prolongation (coarsening converts to CPU internally)
         P, n_coarse = _coarsen_with_fallback(A_current, coarsening_alg, config; backend=backend, block_size=block_size)
-        n_coarse >= n && break  # no coarsening progress
-        n_coarse == 0 && break  # degenerate case
-        # Compute coarse operator via Galerkin product (CPU — inherently sequential)
+        n_coarse >= n && break
+        n_coarse == 0 && break
         A_cpu = csr_to_cpu(A_current)
-        A_coarse, r_map = compute_coarse_sparsity(A_cpu, P, n_coarse)
-        # Build transpose map for atomic-free restriction
+        A_coarse, r_map = compute_coarse_sparsity(A_cpu, P, n_coarse; build_restriction_map=allow_partial_resetup)
         Pt_map = build_transpose_map(P)
+        old_lvl = lvl <= length(old_levels) ? old_levels[lvl] : nothing
         if is_gpu
-            # Copy level structures to GPU device so kernels can access them
-            A_dev = _csr_to_device(A_csr, A_cpu)
-            P_dev = _prolongation_to_device(A_csr, P)
-            Pt_map_dev = _transpose_map_to_device(A_csr, Pt_map)
-            r_map_dev = _restriction_map_to_device(A_csr, r_map)
-            # Build smoother on device arrays
+            A_dev = _csr_to_device(A_ref, A_cpu)
+            P_dev = _prolongation_to_device(A_ref, P)
+            Pt_map_dev = _transpose_map_to_device(A_ref, Pt_map)
+            r_map_dev = r_map === nothing ? nothing : _restriction_map_to_device(A_ref, r_map)
             smoother = build_smoother(A_dev, config.smoother, config.jacobi_omega; backend=backend, block_size=block_size)
-            # Workspace on device
-            r = _allocate_vector(A_csr, Tv, n)
-            xc = _allocate_vector(A_csr, Tv, n_coarse)
-            bc = _allocate_vector(A_csr, Tv, n_coarse)
+            r = _reuse_or_allocate_vector(old_lvl, :r, A_ref, Tv, n)
+            xc = _reuse_or_allocate_vector(old_lvl, :xc, A_ref, Tv, n_coarse)
+            bc = _reuse_or_allocate_vector(old_lvl, :bc, A_ref, Tv, n_coarse)
             level = AMGLevel{Tv, Ti}(A_dev, P_dev, Pt_map_dev, r_map_dev, smoother, r, xc, bc)
         else
-            # CPU path: use arrays as-is
             smoother = build_smoother(A_cpu, config.smoother, config.jacobi_omega; backend=backend, block_size=block_size)
-            r = Vector{Tv}(undef, n)
-            xc = Vector{Tv}(undef, n_coarse)
-            bc = Vector{Tv}(undef, n_coarse)
+            r = _reuse_or_allocate_vector(old_lvl, :r, A_ref, Tv, n)
+            xc = _reuse_or_allocate_vector(old_lvl, :xc, A_ref, Tv, n_coarse)
+            bc = _reuse_or_allocate_vector(old_lvl, :bc, A_ref, Tv, n_coarse)
             level = AMGLevel{Tv, Ti}(A_cpu, P, Pt_map, r_map, smoother, r, xc, bc)
         end
         push!(levels, level)
         A_current = A_coarse
     end
-    # Set up direct solver at coarsest level using high-level lu()
-    # For GPU: build dense matrix on CPU (A_current may be CPU from coarsening),
-    # then copy to device so lu() dispatches to GPU (e.g., CUDA's cuSOLVER).
-    # If coarse_solve_on_cpu is set, or the GPU backend doesn't support lu(),
-    # _build_coarse_lu falls back to CPU.
+    return A_current
+end
+
+"""
+    _build_coarse_solver(A_current, A_ref, n_finest, config; backend, block_size)
+
+Build the direct solver for the coarsest level. Returns a tuple of
+`(coarse_dense, coarse_factor, coarse_x, coarse_b, solve_r)`.
+
+`A_ref` is used as the device reference for GPU allocation. `n_finest` is the
+finest-level matrix size (for the residual workspace `solve_r`).
+"""
+function _build_coarse_solver(A_current::CSRMatrix{Tv}, A_ref::CSRMatrix,
+                              n_finest::Int, config::AMGConfig;
+                              backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv}
+    is_gpu = !(A_ref.nzval isa Array)
     n_coarse = size(A_current, 1)
     if is_gpu
-        # Build dense on CPU first (A_current is CPU from compute_coarse_sparsity)
         A_cpu = csr_to_cpu(A_current)
         coarse_cpu = Matrix{Tv}(undef, n_coarse, n_coarse)
         _csr_to_dense!(coarse_cpu, A_cpu)
         if config.coarse_solve_on_cpu
-            # Force coarse solve on CPU
             coarse_dense = coarse_cpu
             coarse_factor = lu(coarse_dense)
         else
-            # Copy to device and attempt GPU LU; falls back to CPU if unsupported
-            coarse_dev = _allocate_dense_matrix(A_csr, Tv, n_coarse, n_coarse)
+            coarse_dev = _allocate_dense_matrix(A_ref, Tv, n_coarse, n_coarse)
             copyto!(coarse_dev, coarse_cpu)
             coarse_dense, coarse_factor = _build_coarse_lu(coarse_dev)
         end
@@ -131,7 +195,7 @@ function amg_setup(A_csr::CSRMatrix{Tv, Ti}, config::AMGConfig=AMGConfig();
         fill!(coarse_x, zero(Tv))
         coarse_b = similar(coarse_dense, Tv, n_coarse)
         fill!(coarse_b, zero(Tv))
-        solve_r = _allocate_vector(A_csr, Tv, n_finest)
+        solve_r = _allocate_vector(A_ref, Tv, n_finest)
     else
         coarse_dense = Matrix{Tv}(undef, n_coarse, n_coarse)
         A_cpu = csr_to_cpu(A_current)
@@ -141,14 +205,7 @@ function amg_setup(A_csr::CSRMatrix{Tv, Ti}, config::AMGConfig=AMGConfig();
         coarse_b = Vector{Tv}(undef, n_coarse)
         solve_r = Vector{Tv}(undef, n_finest)
     end
-    hierarchy = AMGHierarchy{Tv, Ti}(levels, coarse_dense,
-                                      coarse_factor, coarse_x, coarse_b, solve_r,
-                                      backend, block_size, config.coarse_solve_on_cpu)
-    t_setup = time() - t_setup
-    if config.verbose >= 1
-        _print_hierarchy_info(hierarchy, config, n_finest, t_setup)
-    end
-    return hierarchy
+    return coarse_dense, coarse_factor, coarse_x, coarse_b, solve_r
 end
 
 """

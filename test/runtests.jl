@@ -3508,4 +3508,198 @@ end
 
     end
 
+    # ── C API full lifecycle ──────────────────────────────────────────────────
+
+    @testset "C API lifecycle" begin
+        # Build a 1D Laplacian in raw CSR format (1-based)
+        n = 20
+        rowptr = Int32[]
+        colval = Int32[]
+        nzval  = Float64[]
+        push!(rowptr, Int32(1))
+        for i in 1:n
+            if i > 1
+                push!(colval, Int32(i - 1)); push!(nzval, -1.0)
+            end
+            push!(colval, Int32(i)); push!(nzval, 2.0)
+            if i < n
+                push!(colval, Int32(i + 1)); push!(nzval, -1.0)
+            end
+            push!(rowptr, Int32(length(colval) + 1))
+        end
+        nnz = Int32(length(nzval))
+
+        cfg = draugr_amg_config_from_json("{}")
+        @test cfg > 0
+
+        @testset "setup + solve + cycle + free" begin
+            h = draugr_amg_setup(Int32(n), nnz, pointer(rowptr), pointer(colval),
+                                 pointer(nzval), cfg, Int32(1), Int32(1))
+            @test h > 0
+
+            b = ones(Float64, n)
+            x = zeros(Float64, n)
+            niter = draugr_amg_solve(h, Int32(n), pointer(x), pointer(b),
+                                     cfg, 1e-10, Int32(200))
+            @test niter > 0
+            @test niter < 200
+
+            fill!(x, 0.0)
+            ret = draugr_amg_cycle(h, Int32(n), pointer(x), pointer(b), cfg)
+            @test ret == 0
+            @test norm(x) > 0
+
+            @test draugr_amg_free(h) == 0
+            @test draugr_amg_free(h) == -1
+        end
+
+        @testset "setup with allow_partial_resetup=0" begin
+            h = draugr_amg_setup(Int32(n), nnz, pointer(rowptr), pointer(colval),
+                                 pointer(nzval), cfg, Int32(1), Int32(0))
+            @test h > 0
+            hierarchy = Draugr._HIERARCHY_HANDLES[h]
+            for lvl in hierarchy.levels
+                @test lvl.R_map === nothing
+            end
+            draugr_amg_free(h)
+        end
+
+        @testset "partial resetup (coefficient-only)" begin
+            h = draugr_amg_setup(Int32(n), nnz, pointer(rowptr), pointer(colval),
+                                 pointer(nzval), cfg, Int32(1), Int32(1))
+            @test h > 0
+            nzval2 = copy(nzval)
+            nzval2 .*= 1.5
+            ret = draugr_amg_resetup(h, Int32(n), nnz, pointer(rowptr), pointer(colval),
+                                     pointer(nzval2), cfg, Int32(1), Int32(1), Int32(1))
+            @test ret == 0
+
+            b = ones(Float64, n)
+            x = zeros(Float64, n)
+            niter = draugr_amg_solve(h, Int32(n), pointer(x), pointer(b),
+                                     cfg, 1e-10, Int32(200))
+            @test niter > 0
+            @test niter < 200
+            draugr_amg_free(h)
+        end
+
+        @testset "full resetup (partial=0)" begin
+            h = draugr_amg_setup(Int32(n), nnz, pointer(rowptr), pointer(colval),
+                                 pointer(nzval), cfg, Int32(1), Int32(1))
+            @test h > 0
+            nzval2 = copy(nzval)
+            nzval2 .*= 2.0
+            ret = draugr_amg_resetup(h, Int32(n), nnz, pointer(rowptr), pointer(colval),
+                                     pointer(nzval2), cfg, Int32(1), Int32(0), Int32(1))
+            @test ret == 0
+            hierarchy = Draugr._HIERARCHY_HANDLES[h]
+            for lvl in hierarchy.levels
+                @test lvl.R_map !== nothing
+            end
+
+            b = ones(Float64, n)
+            x = zeros(Float64, n)
+            niter = draugr_amg_solve(h, Int32(n), pointer(x), pointer(b),
+                                     cfg, 1e-10, Int32(200))
+            @test niter > 0
+            @test niter < 200
+            draugr_amg_free(h)
+        end
+
+        @testset "full resetup with allow_partial_resetup=0" begin
+            h = draugr_amg_setup(Int32(n), nnz, pointer(rowptr), pointer(colval),
+                                 pointer(nzval), cfg, Int32(1), Int32(1))
+            @test h > 0
+            ret = draugr_amg_resetup(h, Int32(n), nnz, pointer(rowptr), pointer(colval),
+                                     pointer(nzval), cfg, Int32(1), Int32(0), Int32(0))
+            @test ret == 0
+            hierarchy = Draugr._HIERARCHY_HANDLES[h]
+            for lvl in hierarchy.levels
+                @test lvl.R_map === nothing
+            end
+            draugr_amg_free(h)
+        end
+
+        @testset "full resetup then partial resetup" begin
+            h = draugr_amg_setup(Int32(n), nnz, pointer(rowptr), pointer(colval),
+                                 pointer(nzval), cfg, Int32(1), Int32(0))
+            @test h > 0
+            # Full resetup with allow_partial_resetup=1 to enable future partial
+            ret = draugr_amg_resetup(h, Int32(n), nnz, pointer(rowptr), pointer(colval),
+                                     pointer(nzval), cfg, Int32(1), Int32(0), Int32(1))
+            @test ret == 0
+            hierarchy = Draugr._HIERARCHY_HANDLES[h]
+            for lvl in hierarchy.levels
+                @test lvl.R_map !== nothing
+            end
+            # Now partial resetup should work
+            nzval2 = copy(nzval)
+            nzval2 .*= 1.1
+            ret = draugr_amg_resetup(h, Int32(n), nnz, pointer(rowptr), pointer(colval),
+                                     pointer(nzval2), cfg, Int32(1), Int32(1), Int32(1))
+            @test ret == 0
+
+            b = ones(Float64, n)
+            x = zeros(Float64, n)
+            niter = draugr_amg_solve(h, Int32(n), pointer(x), pointer(b),
+                                     cfg, 1e-10, Int32(200))
+            @test niter > 0
+            @test niter < 200
+            draugr_amg_free(h)
+        end
+
+        @testset "zero-based indexing" begin
+            rp0 = rowptr .- Int32(1)
+            cv0 = colval .- Int32(1)
+            h = draugr_amg_setup(Int32(n), nnz, pointer(rp0), pointer(cv0),
+                                 pointer(nzval), cfg, Int32(0), Int32(1))
+            @test h > 0
+
+            b = ones(Float64, n)
+            x = zeros(Float64, n)
+            niter = draugr_amg_solve(h, Int32(n), pointer(x), pointer(b),
+                                     cfg, 1e-10, Int32(200))
+            @test niter > 0
+            @test niter < 200
+            draugr_amg_free(h)
+        end
+
+        @testset "invalid handles" begin
+            ret = draugr_amg_resetup(Int32(9999), Int32(n), nnz, pointer(rowptr),
+                                     pointer(colval), pointer(nzval), cfg,
+                                     Int32(1), Int32(1), Int32(1))
+            @test ret == -1
+            err = unsafe_string(draugr_amg_last_error())
+            @test length(err) > 0
+
+            b = ones(Float64, n)
+            x = zeros(Float64, n)
+            ret = draugr_amg_solve(Int32(9999), Int32(n), pointer(x), pointer(b),
+                                   cfg, 1e-10, Int32(50))
+            @test ret == -1
+
+            ret = draugr_amg_cycle(Int32(9999), Int32(n), pointer(x), pointer(b), cfg)
+            @test ret == -1
+
+            @test draugr_amg_free(Int32(9999)) == -1
+        end
+
+        @testset "@cfunction pointers" begin
+            ptrs = draugr_amg_get_cfunctions()
+            @test ptrs.config_from_json isa Ptr
+            @test ptrs.last_error isa Ptr
+            @test ptrs.setup isa Ptr
+            @test ptrs.resetup isa Ptr
+            @test ptrs.solve isa Ptr
+            @test ptrs.cycle isa Ptr
+            @test ptrs.free isa Ptr
+            @test ptrs.config_free isa Ptr
+            for ptr in ptrs
+                @test ptr != C_NULL
+            end
+        end
+
+        draugr_amg_config_free(cfg)
+    end
+
 end

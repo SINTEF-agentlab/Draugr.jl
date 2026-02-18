@@ -17,6 +17,24 @@ end
 GalerkinWorkspace{Ti}() where {Ti} = GalerkinWorkspace{Ti}(Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[])
 
 """
+    _sort_perm_rows_by_col!(perm, raw_J, rowptr_tmp, n_coarse)
+
+Sort segments of `perm` (one per coarse row) by their column values in `raw_J`.
+Factored out as a separate function to create a function barrier and avoid
+closure type instability when `raw_J` is captured by the `by` keyword.
+"""
+function _sort_perm_rows_by_col!(perm::Vector{Ti}, raw_J::Vector{Ti},
+                                  rowptr_tmp::Vector{Ti}, n_coarse::Int) where Ti
+    @inbounds for row in 1:n_coarse
+        rs = Int(rowptr_tmp[row])
+        re = Int(rowptr_tmp[row+1]) - 1
+        re < rs && continue
+        sort!(view(perm, rs:re), alg=Base.Sort.InsertionSort, by=k -> raw_J[k])
+    end
+    return nothing
+end
+
+"""
     compute_coarse_sparsity(A_fine, P, n_coarse)
 
 Determine the sparsity pattern of the coarse grid operator A_c = P^T A_f P.
@@ -114,12 +132,9 @@ function compute_coarse_sparsity(A_fine::CSRMatrix{Tv, Ti},
     # Sort triples within each coarse row by column.
     # This single sort replaces the previous two-pass approach (sort for counting
     # unique columns, then sort again for filling colval_c + binary search).
-    @inbounds for row in 1:n_coarse
-        rs = Int(rowptr_tmp[row])
-        re = Int(rowptr_tmp[row+1]) - 1
-        re < rs && continue
-        sort!(view(perm, rs:re), alg=Base.Sort.InsertionSort, by=k -> raw_J[k])
-    end
+    # Factored into a helper to create a function barrier and avoid closure type
+    # instability from capturing raw_J.
+    _sort_perm_rows_by_col!(perm, raw_J, rowptr_tmp, n_coarse)
 
     # Count unique columns per row (linear scan over sorted perm)
     unique_per_row = zeros(Ti, n_coarse)

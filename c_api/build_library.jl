@@ -1,9 +1,11 @@
 # build_library.jl — Compile Draugr into a shared library
 #
-# Usage:
-#   julia --project=/path/to/Draugr.jl c_api/build_library.jl [output_dir]
+# Uses the c_api project so only C-API build deps are loaded.
 #
-# Output directory defaults to DraugrCompiled/ next to this script.
+# Usage:
+#   julia --project=c_api c_api/build_library.jl [output_dir]
+#
+# Output directory defaults to DraugrCompiled/ at repo root.
 
 using Pkg
 Pkg.instantiate()

@@ -175,17 +175,6 @@ end
 
 # ── Public C-callable functions ──────────────────────────────────────────────
 
-"""
-    draugr_amg_config_from_json(json_ptr) -> Int32
-
-Create an AMG configuration from a JSON string and return a handle.
-All keys are optional; defaults match `AMGConfig()` in types.jl.
-Unknown keys are ignored.
-
-Pass NULL or "{}" for all defaults.
-Returns a config handle (> 0) on success, or -1 on error.
-Call `draugr_amg_last_error()` for the error message on failure.
-"""
 Base.@ccallable function draugr_amg_config_from_json(json_ptr::Ptr{UInt8})::Int32
     try
         _set_last_error("")
@@ -231,33 +220,25 @@ Base.@ccallable function draugr_amg_config_from_json(json_ptr::Ptr{UInt8})::Int3
     end
 end
 
-"""
+@doc """
+    draugr_amg_config_from_json(json_ptr) -> Int32
+
+Create an AMG configuration from a JSON string and return a handle.
+All keys are optional; defaults match `AMGConfig()` in types.jl.
+Unknown keys are ignored.
+
+Pass NULL or "{}" for all defaults.
+Returns a config handle (> 0) on success, or -1 on error.
+Call `draugr_amg_last_error()` for the error message on failure.
+
     draugr_amg_config_from_json(json::String) -> Int32
 
 Convenience method for Julia callers — avoids manual pointer wrangling.
-"""
+""" draugr_amg_config_from_json
+
 draugr_amg_config_from_json(json::String) =
     GC.@preserve json draugr_amg_config_from_json(Base.unsafe_convert(Ptr{UInt8}, json))
 
-"""
-    draugr_amg_setup(n, nnz, rowptr, colval, nzval, config_handle, index_base) -> Int32
-
-Build an AMG hierarchy from CSR data and return a hierarchy handle.
-
-Arguments:
-- `n`:             Number of rows (== columns, square matrix)
-- `nnz`:           Number of nonzeros (length of colval/nzval)
-- `rowptr`:        Ptr{Int32} to row-pointer array (length n+1)
-- `colval`:        Ptr{Int32} to column-index array (length nnz)
-- `nzval`:         Ptr{Float64} to values array  (length nnz)
-- `config_handle`: Config handle from `draugr_amg_config_from_json`
-- `index_base`:    Index base of incoming arrays: 0 for C-style zero-based,
-                   1 for Fortran/Julia-style one-based.
-                   When 0, rowptr and colval are converted to 1-based on
-                   owned copies (no extra allocation).
-
-Returns a hierarchy handle (> 0) on success, or -1 on error.
-"""
 Base.@ccallable function draugr_amg_setup(n::Int32, nnz_count::Int32,
                                           rowptr::Ptr{Int32}, colval::Ptr{Int32},
                                           nzval::Ptr{Float64},
@@ -290,16 +271,26 @@ Base.@ccallable function draugr_amg_setup(n::Int32, nnz_count::Int32,
     end
 end
 
-"""
-    draugr_amg_resetup(handle, n, nnz, rowptr, colval, nzval, config_handle, index_base) -> Int32
+@doc """
+    draugr_amg_setup(n, nnz, rowptr, colval, nzval, config_handle, index_base) -> Int32
 
-Update the AMG hierarchy with new matrix coefficients (same sparsity pattern).
+Build an AMG hierarchy from CSR data and return a hierarchy handle.
 
-When `index_base=0`, the incoming rowptr/colval use zero-based indexing and are
-converted to one-based on owned copies (no extra allocation).
+Arguments:
+- `n`:             Number of rows (== columns, square matrix)
+- `nnz`:           Number of nonzeros (length of colval/nzval)
+- `rowptr`:        Ptr{Int32} to row-pointer array (length n+1)
+- `colval`:        Ptr{Int32} to column-index array (length nnz)
+- `nzval`:         Ptr{Float64} to values array  (length nnz)
+- `config_handle`: Config handle from `draugr_amg_config_from_json`
+- `index_base`:    Index base of incoming arrays: 0 for C-style zero-based,
+                   1 for Fortran/Julia-style one-based.
+                   When 0, rowptr and colval are converted to 1-based on
+                   owned copies (no extra allocation).
 
-Returns 0 on success, -1 on error.
-"""
+Returns a hierarchy handle (> 0) on success, or -1 on error.
+""" draugr_amg_setup
+
 Base.@ccallable function draugr_amg_resetup(handle::Int32, n::Int32, nnz_count::Int32,
                                             rowptr::Ptr{Int32}, colval::Ptr{Int32},
                                             nzval::Ptr{Float64},
@@ -348,13 +339,17 @@ Base.@ccallable function draugr_amg_resetup(handle::Int32, n::Int32, nnz_count::
     end
 end
 
-"""
-    draugr_amg_solve(handle, n, x, b, config_handle, tol, maxiter) -> Int32
+@doc """
+    draugr_amg_resetup(handle, n, nnz, rowptr, colval, nzval, config_handle, index_base) -> Int32
 
-Solve Ax = b using AMG. The solution is written into `x`.
+Update the AMG hierarchy with new matrix coefficients (same sparsity pattern).
 
-Returns the number of iterations on success, or -1 on error.
-"""
+When `index_base=0`, the incoming rowptr/colval use zero-based indexing and are
+converted to one-based on owned copies (no extra allocation).
+
+Returns 0 on success, -1 on error.
+""" draugr_amg_resetup
+
 Base.@ccallable function draugr_amg_solve(handle::Int32, n::Int32,
                                           x::Ptr{Float64}, b::Ptr{Float64},
                                           config_handle::Int32,
@@ -382,13 +377,14 @@ Base.@ccallable function draugr_amg_solve(handle::Int32, n::Int32,
     end
 end
 
-"""
-    draugr_amg_cycle(handle, n, x, b, config_handle) -> Int32
+@doc """
+    draugr_amg_solve(handle, n, x, b, config_handle, tol, maxiter) -> Int32
 
-Apply one AMG cycle (V or W, as configured) to improve x for Ax = b.
+Solve Ax = b using AMG. The solution is written into `x`.
 
-Returns 0 on success, -1 on error.
-"""
+Returns the number of iterations on success, or -1 on error.
+""" draugr_amg_solve
+
 Base.@ccallable function draugr_amg_cycle(handle::Int32, n::Int32,
                                           x::Ptr{Float64}, b::Ptr{Float64},
                                           config_handle::Int32)::Int32
@@ -415,13 +411,14 @@ Base.@ccallable function draugr_amg_cycle(handle::Int32, n::Int32,
     end
 end
 
-"""
-    draugr_amg_free(handle) -> Int32
+@doc """
+    draugr_amg_cycle(handle, n, x, b, config_handle) -> Int32
 
-Free the AMG hierarchy associated with `handle`.
+Apply one AMG cycle (V or W, as configured) to improve x for Ax = b.
 
-Returns 0 on success, -1 if handle not found.
-"""
+Returns 0 on success, -1 on error.
+""" draugr_amg_cycle
+
 Base.@ccallable function draugr_amg_free(handle::Int32)::Int32
     lock(_HANDLE_LOCK) do
         if haskey(_HIERARCHY_HANDLES, handle)
@@ -433,13 +430,14 @@ Base.@ccallable function draugr_amg_free(handle::Int32)::Int32
     end
 end
 
-"""
-    draugr_amg_config_free(handle) -> Int32
+@doc """
+    draugr_amg_free(handle) -> Int32
 
-Free the AMG configuration associated with `handle`.
+Free the AMG hierarchy associated with `handle`.
 
 Returns 0 on success, -1 if handle not found.
-"""
+""" draugr_amg_free
+
 Base.@ccallable function draugr_amg_config_free(handle::Int32)::Int32
     lock(_HANDLE_LOCK) do
         if haskey(_CONFIG_HANDLES, handle)
@@ -450,6 +448,14 @@ Base.@ccallable function draugr_amg_config_free(handle::Int32)::Int32
         end
     end
 end
+
+@doc """
+    draugr_amg_config_free(handle) -> Int32
+
+Free the AMG configuration associated with `handle`.
+
+Returns 0 on success, -1 if handle not found.
+""" draugr_amg_config_free
 
 
 # ── @cfunction pointers (for Julia-embedding use case) ───────────────────────

@@ -27,9 +27,9 @@ function _warmup()
     json = """{"coarsening": "pmis", "interpolation": "standard", "theta": 0.25}"""
     cfg = draugr_amg_config_from_json(json)
 
-    # Exercise setup (1-based indexing)
+    # Exercise setup (1-based indexing, allow partial resetup)
     h = draugr_amg_setup(Int32(n), nnz, pointer(rowptr), pointer(colval),
-                         pointer(nzval), cfg, Int32(1))
+                         pointer(nzval), cfg, Int32(1), Int32(1))
 
     # Exercise solve
     b = ones(Float64, n)
@@ -40,11 +40,17 @@ function _warmup()
     fill!(x, 0.0)
     draugr_amg_cycle(h, Int32(n), pointer(x), pointer(b), cfg)
 
-    # Exercise resetup (same matrix, simulates coefficient update)
+    # Exercise partial resetup (coefficient-only update)
     nzval2 = copy(nzval)
     nzval2 .*= 1.1
     draugr_amg_resetup(h, Int32(n), nnz, pointer(rowptr), pointer(colval),
-                       pointer(nzval2), cfg, Int32(1))
+                       pointer(nzval2), cfg, Int32(1), Int32(1), Int32(1))
+
+    # Exercise full resetup (rebuild hierarchy, reuse workspace, keep restriction maps)
+    nzval3 = copy(nzval)
+    nzval3 .*= 0.9
+    draugr_amg_resetup(h, Int32(n), nnz, pointer(rowptr), pointer(colval),
+                       pointer(nzval3), cfg, Int32(1), Int32(0), Int32(1))
 
     # Exercise error reporting
     draugr_amg_last_error()

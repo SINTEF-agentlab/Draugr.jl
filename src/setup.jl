@@ -131,6 +131,7 @@ function _build_levels!(levels::Vector{AMGLevel{Tv, Ti}},
     old_levels = copy(levels)
     empty!(levels)
     A_current = A_input
+    galerkin_ws = GalerkinWorkspace{Ti}()
     for lvl in 1:(config.max_levels - 1)
         n = size(A_current, 1)
         n <= config.max_coarse_size && break
@@ -139,7 +140,7 @@ function _build_levels!(levels::Vector{AMGLevel{Tv, Ti}},
         n_coarse >= n && break
         n_coarse == 0 && break
         A_cpu = csr_to_cpu(A_current)
-        A_coarse, r_map = compute_coarse_sparsity(A_cpu, P, n_coarse; build_restriction_map=allow_partial_resetup)
+        A_coarse, r_map = compute_coarse_sparsity(A_cpu, P, n_coarse; build_restriction_map=allow_partial_resetup, workspace=galerkin_ws)
         Pt_map = build_transpose_map(P)
         old_lvl = lvl <= length(old_levels) ? old_levels[lvl] : nothing
         if is_gpu

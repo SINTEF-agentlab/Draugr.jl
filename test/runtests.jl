@@ -437,8 +437,8 @@ end
         n = 10
         A = poisson2d_csr(n)
         N = n*n
-        config = AMGConfig(coarsening=AggregationCoarsening())
-        hierarchy = amg_setup(A, config; allow_partial_resetup=false)
+        config = AMGConfig(coarsening=AggregationCoarsening(), allow_partial_resetup=false)
+        hierarchy = amg_setup(A, config)
         @test length(hierarchy.levels) > 0
         # R_map should be nothing when allow_partial_resetup=false
         for lvl in hierarchy.levels
@@ -456,8 +456,8 @@ end
     @testset "AMG Setup - allow_partial_resetup=true has R_map" begin
         n = 10
         A = poisson2d_csr(n)
-        config = AMGConfig(coarsening=AggregationCoarsening())
-        hierarchy = amg_setup(A, config; allow_partial_resetup=true)
+        config = AMGConfig(coarsening=AggregationCoarsening(), allow_partial_resetup=true)
+        hierarchy = amg_setup(A, config)
         @test length(hierarchy.levels) > 0
         for lvl in hierarchy.levels
             @test lvl.R_map !== nothing
@@ -490,23 +490,24 @@ end
         n = 10
         A = poisson2d_csr(n)
         N = n*n
-        config = AMGConfig(coarsening=AggregationCoarsening())
-        hierarchy = amg_setup(A, config; allow_partial_resetup=false)
+        config_no_partial = AMGConfig(coarsening=AggregationCoarsening(), allow_partial_resetup=false)
+        hierarchy = amg_setup(A, config_no_partial)
         # R_map should be nothing
         for lvl in hierarchy.levels
             @test lvl.R_map === nothing
         end
-        # Full resetup with allow_partial_resetup=true should populate R_map
-        amg_resetup!(hierarchy, A, config; partial=false, allow_partial_resetup=true)
+        # Full resetup with allow_partial_resetup=true config should populate R_map
+        config_with_partial = AMGConfig(coarsening=AggregationCoarsening(), allow_partial_resetup=true)
+        amg_resetup!(hierarchy, A, config_with_partial; partial=false)
         for lvl in hierarchy.levels
             @test lvl.R_map !== nothing
         end
         # Partial resetup should now work
         nonzeros(A) .*= 2.0
-        amg_resetup!(hierarchy, A, config; partial=true)
+        amg_resetup!(hierarchy, A, config_with_partial; partial=true)
         b = rand(N)
         x = zeros(N)
-        x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+        x, niter = amg_solve!(x, b, hierarchy, config_with_partial; tol=1e-8, maxiter=200)
         r = b - sparse(A.At') * x
         @test norm(r) / norm(b) < 1e-8
     end
@@ -518,13 +519,14 @@ end
         config = AMGConfig(coarsening=AggregationCoarsening())
         hierarchy = amg_setup(A, config)
         # Full resetup without restriction maps
-        amg_resetup!(hierarchy, A, config; partial=false, allow_partial_resetup=false)
+        config_no_partial = AMGConfig(coarsening=AggregationCoarsening(), allow_partial_resetup=false)
+        amg_resetup!(hierarchy, A, config_no_partial; partial=false)
         for lvl in hierarchy.levels
             @test lvl.R_map === nothing
         end
         b = rand(N)
         x = zeros(N)
-        x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+        x, niter = amg_solve!(x, b, hierarchy, config_no_partial; tol=1e-8, maxiter=200)
         r = b - sparse(A.At') * x
         @test norm(r) / norm(b) < 1e-8
     end

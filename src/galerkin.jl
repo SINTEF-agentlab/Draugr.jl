@@ -8,11 +8,13 @@ mutable struct GalerkinWorkspace{Ti<:Integer}
     raw_I::Vector{Ti}
     raw_J::Vector{Ti}
     raw_ci::Vector{Ti}
+    raw_pi::Vector{Ti}
+    raw_ai::Vector{Ti}
+    raw_pj::Vector{Ti}
     perm::Vector{Ti}
-    col_buf::Vector{Ti}
 end
 
-GalerkinWorkspace{Ti}() where {Ti} = GalerkinWorkspace{Ti}(Ti[], Ti[], Ti[], Ti[], Ti[])
+GalerkinWorkspace{Ti}() where {Ti} = GalerkinWorkspace{Ti}(Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[])
 
 """
     compute_coarse_sparsity(A_fine, P, n_coarse)
@@ -50,19 +52,24 @@ function compute_coarse_sparsity(A_fine::CSRMatrix{Tv, Ti},
     if workspace !== nothing
         raw_I = resize!(workspace.raw_I, ntriples)
         raw_J = resize!(workspace.raw_J, ntriples)
-        raw_ci = resize!(workspace.raw_ci, ntriples)
+        raw_pi = resize!(workspace.raw_pi, ntriples)
+        raw_ai = resize!(workspace.raw_ai, ntriples)
+        raw_pj = resize!(workspace.raw_pj, ntriples)
         perm = resize!(workspace.perm, ntriples)
-        col_buf = workspace.col_buf
+        if build_restriction_map
+            raw_ci = resize!(workspace.raw_ci, ntriples)
+        end
     else
         raw_I = Vector{Ti}(undef, ntriples)
         raw_J = Vector{Ti}(undef, ntriples)
-        raw_ci = Vector{Ti}(undef, ntriples)
+        raw_pi = Vector{Ti}(undef, ntriples)
+        raw_ai = Vector{Ti}(undef, ntriples)
+        raw_pj = Vector{Ti}(undef, ntriples)
         perm = Vector{Ti}(undef, ntriples)
-        col_buf = Ti[]
+        if build_restriction_map
+            raw_ci = Vector{Ti}(undef, ntriples)
+        end
     end
-    raw_pi = Vector{Ti}(undef, ntriples)
-    raw_ai = Vector{Ti}(undef, ntriples)
-    raw_pj = Vector{Ti}(undef, ntriples)
     idx = 0
     @inbounds for i in 1:n_fine
         for pnz_i in P.rowptr[i]:(P.rowptr[i+1]-1)
@@ -104,26 +111,29 @@ function compute_coarse_sparsity(A_fine::CSRMatrix{Tv, Ti},
         pos[row] += one(Ti)
     end
 
-    # For each coarse row, find unique columns by sorting columns within the row
-    # and build the coarse CSR colval directly.
-    # First pass: count unique columns per row
+    # Sort triples within each coarse row by column.
+    # This single sort replaces the previous two-pass approach (sort for counting
+    # unique columns, then sort again for filling colval_c + binary search).
+    @inbounds for row in 1:n_coarse
+        rs = Int(rowptr_tmp[row])
+        re = Int(rowptr_tmp[row+1]) - 1
+        re < rs && continue
+        sort!(view(perm, rs:re), alg=Base.Sort.InsertionSort, by=k -> raw_J[k])
+    end
+
+    # Count unique columns per row (linear scan over sorted perm)
     unique_per_row = zeros(Ti, n_coarse)
     @inbounds for row in 1:n_coarse
         rs = rowptr_tmp[row]
         re = rowptr_tmp[row+1] - one(Ti)
-        row_len = re - rs + one(Ti)
-        row_len == zero(Ti) && continue
-        # Gather columns for this row
-        resize!(col_buf, row_len)
-        for k in rs:re
-            col_buf[k - rs + one(Ti)] = raw_J[perm[k]]
-        end
-        sort!(col_buf, alg=Base.Sort.InsertionSort)
-        # Count unique
+        rs > re && continue
         nuniq = one(Ti)
-        for k in 2:Ti(row_len)
-            if col_buf[k] != col_buf[k - one(Ti)]
+        prev_col = raw_J[perm[rs]]
+        for k in (rs+one(Ti)):re
+            col = raw_J[perm[k]]
+            if col != prev_col
                 nuniq += one(Ti)
+                prev_col = col
             end
         end
         unique_per_row[row] = nuniq
@@ -140,40 +150,36 @@ function compute_coarse_sparsity(A_fine::CSRMatrix{Tv, Ti},
         rowptr_c[i+1] = rowptr_c[i] + unique_per_row[i]
     end
 
-    # Build colval_c (unique sorted columns per row) and map each triple to its NZ index
+    # Build colval_c (unique sorted columns per row), accumulate values, and
+    # optionally map each triple to its NZ index (for restriction map).
+    # No re-sorting or binary search needed — perm is already column-sorted
+    # within each row.
     colval_c = Vector{Ti}(undef, nnz_c)
     nzval_c = zeros(Tv, nnz_c)
 
     @inbounds for row in 1:n_coarse
         rs = rowptr_tmp[row]
         re = rowptr_tmp[row+1] - one(Ti)
-        row_len = re - rs + one(Ti)
-        row_len == zero(Ti) && continue
-        # Gather columns for this row (via perm)
-        resize!(col_buf, row_len)
-        for k in rs:re
-            col_buf[k - rs + one(Ti)] = raw_J[perm[k]]
-        end
-        sort!(col_buf, alg=Base.Sort.InsertionSort)
-        # Fill unique columns into colval_c
+        rs > re && continue
+        # First triple in this row starts a new unique column
         csr_pos = rowptr_c[row]
-        colval_c[csr_pos] = col_buf[1]
-        for k in 2:Ti(row_len)
-            if col_buf[k] != col_buf[k - one(Ti)]
-                csr_pos += one(Ti)
-                colval_c[csr_pos] = col_buf[k]
-            end
+        t = perm[rs]
+        colval_c[csr_pos] = raw_J[t]
+        nzval_c[csr_pos] += P.nzval[raw_pi[t]] * nzv_a[raw_ai[t]] * P.nzval[raw_pj[t]]
+        if build_restriction_map
+            raw_ci[t] = csr_pos
         end
-        # Now map each triple in this row to its NZ index using binary search
-        csr_start = rowptr_c[row]
-        csr_end = rowptr_c[row+1] - one(Ti)
-        for k in rs:re
+        for k in (rs+one(Ti)):re
             t = perm[k]
-            J = raw_J[t]
-            nz_idx = _find_nz_in_row(colval_c, csr_start, csr_end, J)
-            raw_ci[t] = nz_idx
-            # Accumulate value
-            nzval_c[nz_idx] += P.nzval[raw_pi[t]] * nzv_a[raw_ai[t]] * P.nzval[raw_pj[t]]
+            col = raw_J[t]
+            if col != colval_c[csr_pos]
+                csr_pos += one(Ti)
+                colval_c[csr_pos] = col
+            end
+            nzval_c[csr_pos] += P.nzval[raw_pi[t]] * nzv_a[raw_ai[t]] * P.nzval[raw_pj[t]]
+            if build_restriction_map
+                raw_ci[t] = csr_pos
+            end
         end
     end
 
@@ -188,17 +194,24 @@ function compute_coarse_sparsity(A_fine::CSRMatrix{Tv, Ti},
     # range of contributing triples.
     # Reuse perm buffer for sortperm! to avoid extra allocation.
     sortperm!(perm, raw_ci)
-    # Permute in-place instead of making copies by indexing.
-    permute!(raw_ci, perm)
-    permute!(raw_pi, perm)
-    permute!(raw_ai, perm)
-    permute!(raw_pj, perm)
+
+    # Copy permuted triple indices for the RestrictionMap (the originals may be
+    # workspace-owned and will be reused on the next call).
+    map_pi = Vector{Ti}(undef, ntriples)
+    map_ai = Vector{Ti}(undef, ntriples)
+    map_pj = Vector{Ti}(undef, ntriples)
+    @inbounds for i in 1:ntriples
+        p = perm[i]
+        map_pi[i] = raw_pi[p]
+        map_ai[i] = raw_ai[p]
+        map_pj[i] = raw_pj[p]
+    end
 
     # Build an offset array: nz_offsets[k] to nz_offsets[k+1]-1 = triples for coarse NZ k
     nz_offsets = Vector{Ti}(undef, nnz_c + 1)
     fill!(nz_offsets, Ti(0))
     @inbounds for t in 1:ntriples
-        nz_offsets[raw_ci[t]] += Ti(1)
+        nz_offsets[raw_ci[perm[t]]] += Ti(1)
     end
     cumsum_val = Ti(1)
     for k in 1:nnz_c
@@ -207,7 +220,7 @@ function compute_coarse_sparsity(A_fine::CSRMatrix{Tv, Ti},
         cumsum_val += cnt
     end
     nz_offsets[nnz_c + 1] = cumsum_val
-    r_map = RestrictionMap(nz_offsets, raw_pi, raw_ai, raw_pj)
+    r_map = RestrictionMap(nz_offsets, map_pi, map_ai, map_pj)
     return A_coarse, r_map
 end
 

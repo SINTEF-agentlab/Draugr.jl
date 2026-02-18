@@ -17,24 +17,6 @@ end
 GalerkinWorkspace{Ti}() where {Ti} = GalerkinWorkspace{Ti}(Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[])
 
 """
-    _sort_perm_rows_by_col!(perm, raw_J, rowptr_tmp, n_coarse)
-
-Sort segments of `perm` (one per coarse row) by their column values in `raw_J`.
-Factored out as a separate function to create a function barrier and avoid
-closure type instability when `raw_J` is captured by the `by` keyword.
-"""
-function _sort_perm_rows_by_col!(perm::Vector{Ti}, raw_J::Vector{Ti},
-                                  rowptr_tmp::Vector{Ti}, n_coarse::Int) where Ti
-    @inbounds for row in 1:n_coarse
-        rs = Int(rowptr_tmp[row])
-        re = Int(rowptr_tmp[row+1]) - 1
-        re < rs && continue
-        sort!(view(perm, rs:re), alg=Base.Sort.InsertionSort, by=k -> raw_J[k])
-    end
-    return nothing
-end
-
-"""
     compute_coarse_sparsity(A_fine, P, n_coarse)
 
 Determine the sparsity pattern of the coarse grid operator A_c = P^T A_f P.
@@ -129,26 +111,25 @@ function compute_coarse_sparsity(A_fine::CSRMatrix{Tv, Ti},
         pos[row] += one(Ti)
     end
 
-    # Sort triples within each coarse row by column.
-    # This single sort replaces the previous two-pass approach (sort for counting
-    # unique columns, then sort again for filling colval_c + binary search).
-    # Factored into a helper to create a function barrier and avoid closure type
-    # instability from capturing raw_J.
-    _sort_perm_rows_by_col!(perm, raw_J, rowptr_tmp, n_coarse)
+    # Phase 2: Build coarse CSR structure using a sparse row accumulator.
+    # Instead of sorting all triples within each row by column (expensive when
+    # triples >> unique columns), we use a generation-based marker to discover
+    # unique columns and a dense accumulator for values.  Only the unique column
+    # list (much smaller than the number of triples) needs to be sorted.
+    col_marker = zeros(Ti, n_coarse)   # generation-based "seen" marker per column
+    col_list = Vector{Ti}(undef, n_coarse)  # unique columns found in current row
+    marker_gen = zero(Ti)
 
-    # Count unique columns per row (linear scan over sorted perm)
+    # First pass: count unique columns per row
     unique_per_row = zeros(Ti, n_coarse)
     @inbounds for row in 1:n_coarse
-        rs = rowptr_tmp[row]
-        re = rowptr_tmp[row+1] - one(Ti)
-        rs > re && continue
-        nuniq = one(Ti)
-        prev_col = raw_J[perm[rs]]
-        for k in (rs+one(Ti)):re
+        marker_gen += one(Ti)
+        nuniq = zero(Ti)
+        for k in rowptr_tmp[row]:(rowptr_tmp[row+1] - one(Ti))
             col = raw_J[perm[k]]
-            if col != prev_col
+            if col_marker[col] != marker_gen
+                col_marker[col] = marker_gen
                 nuniq += one(Ti)
-                prev_col = col
             end
         end
         unique_per_row[row] = nuniq
@@ -165,35 +146,48 @@ function compute_coarse_sparsity(A_fine::CSRMatrix{Tv, Ti},
         rowptr_c[i+1] = rowptr_c[i] + unique_per_row[i]
     end
 
-    # Build colval_c (unique sorted columns per row), accumulate values, and
-    # optionally map each triple to its NZ index (for restriction map).
-    # No re-sorting or binary search needed — perm is already column-sorted
-    # within each row.
+    # Second pass: fill colval_c and nzval_c using sparse accumulator,
+    # then optionally map triples to NZ indices for the restriction map.
+    # NOTE: marker_gen continues from the first pass (not reset) so generation
+    # values in col_marker from the first pass cannot collide with second-pass values.
     colval_c = Vector{Ti}(undef, nnz_c)
     nzval_c = zeros(Tv, nnz_c)
+    val_acc = Vector{Tv}(undef, n_coarse)  # dense value accumulator (only touched entries are read)
 
     @inbounds for row in 1:n_coarse
+        marker_gen += one(Ti)
+        nuniq = zero(Ti)
         rs = rowptr_tmp[row]
         re = rowptr_tmp[row+1] - one(Ti)
-        rs > re && continue
-        # First triple in this row starts a new unique column
-        csr_pos = rowptr_c[row]
-        t = perm[rs]
-        colval_c[csr_pos] = raw_J[t]
-        nzval_c[csr_pos] += P.nzval[raw_pi[t]] * nzv_a[raw_ai[t]] * P.nzval[raw_pj[t]]
-        if build_restriction_map
-            raw_ci[t] = csr_pos
-        end
-        for k in (rs+one(Ti)):re
+        # Discover unique columns and accumulate values
+        for k in rs:re
             t = perm[k]
             col = raw_J[t]
-            if col != colval_c[csr_pos]
-                csr_pos += one(Ti)
-                colval_c[csr_pos] = col
+            if col_marker[col] != marker_gen
+                col_marker[col] = marker_gen
+                nuniq += one(Ti)
+                col_list[nuniq] = col
+                val_acc[col] = zero(Tv)
             end
-            nzval_c[csr_pos] += P.nzval[raw_pi[t]] * nzv_a[raw_ai[t]] * P.nzval[raw_pj[t]]
-            if build_restriction_map
-                raw_ci[t] = csr_pos
+            val_acc[col] += P.nzval[raw_pi[t]] * nzv_a[raw_ai[t]] * P.nzval[raw_pj[t]]
+        end
+        # Sort only the unique columns (much fewer than triples)
+        sort!(view(col_list, 1:Int(nuniq)), alg=Base.Sort.InsertionSort)
+        # Fill CSR row
+        csr_pos = rowptr_c[row]
+        for i in one(Ti):nuniq
+            col = col_list[i]
+            colval_c[csr_pos] = col
+            nzval_c[csr_pos] = val_acc[col]
+            csr_pos += one(Ti)
+        end
+        # Map each triple to its coarse NZ index via binary search (only for restriction map)
+        if build_restriction_map
+            csr_start = rowptr_c[row]
+            csr_end = rowptr_c[row+1] - one(Ti)
+            for k in rs:re
+                t = perm[k]
+                raw_ci[t] = _find_nz_in_row(colval_c, csr_start, csr_end, raw_J[t])
             end
         end
     end

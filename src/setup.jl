@@ -39,16 +39,14 @@ function _restriction_map_to_device(ref::CSRMatrix, r_map::RestrictionMap)
 end
 
 """
-    amg_setup(A::SparseMatrixCSC, config; backend, block_size, allow_partial_resetup) -> AMGHierarchy
+    amg_setup(A::SparseMatrixCSC, config; backend, block_size) -> AMGHierarchy
 
 External API entry point: convert `SparseMatrixCSC` to `CSRMatrix` once
 and forward to the general CSRMatrix-based setup.
 """
 function amg_setup(A::SparseMatrixCSC{Tv, Ti}, config::AMGConfig=AMGConfig();
-                   backend=DEFAULT_BACKEND, block_size::Int=64,
-                   allow_partial_resetup::Bool=true) where {Tv, Ti}
-    return amg_setup(csr_from_csc(A), config; backend=backend, block_size=block_size,
-                     allow_partial_resetup=allow_partial_resetup)
+                   backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
+    return amg_setup(csr_from_csc(A), config; backend=backend, block_size=block_size)
 end
 
 """
@@ -58,27 +56,28 @@ Perform the full AMG setup (analysis phase). This determines the coarsening at e
 level, constructs prolongation operators, computes Galerkin products, and sets up
 smoothers.
 
-When `allow_partial_resetup=true` (the default), the sparsity structure and
-restriction maps computed here are reused by `amg_resetup!` with `partial=true`
-when matrix coefficients change but the pattern remains the same. When
-`allow_partial_resetup=false`, these additional mappings are skipped for a
-faster setup; only `amg_resetup!` with `partial=false` can be used afterwards.
+When `config.allow_partial_resetup` is `true` (the default), the sparsity structure
+and restriction maps computed here are reused by `amg_resetup!` with `partial=true`
+when matrix coefficients change but the pattern remains the same. When `false`,
+these additional mappings are skipped for a faster setup; only `amg_resetup!` with
+`partial=false` can be used afterwards.
 """
 function amg_setup(A_csr::CSRMatrix{Tv, Ti}, config::AMGConfig=AMGConfig();
-                   backend=DEFAULT_BACKEND, block_size::Int=64,
-                   allow_partial_resetup::Bool=true) where {Tv, Ti}
+                   backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
     t_setup = time()
     levels = AMGLevel{Tv, Ti}[]
     n_finest = size(A_csr, 1)
+    galerkin_ws = GalerkinWorkspace{Ti}()
     A_coarsest = _build_levels!(levels, A_csr, config;
                                 backend=backend, block_size=block_size,
-                                allow_partial_resetup=allow_partial_resetup)
+                                galerkin_workspace=galerkin_ws)
     coarse_dense, coarse_factor, coarse_x, coarse_b, solve_r =
         _build_coarse_solver(A_coarsest, A_csr, n_finest, config;
                              backend=backend, block_size=block_size)
     hierarchy = AMGHierarchy{Tv, Ti}(levels, coarse_dense,
                                       coarse_factor, coarse_x, coarse_b, solve_r,
-                                      backend, block_size, config.coarse_solve_on_cpu)
+                                      backend, block_size, config.coarse_solve_on_cpu,
+                                      galerkin_ws)
     t_setup = time() - t_setup
     if config.verbose >= 1
         _print_hierarchy_info(hierarchy, config, n_finest, t_setup)
@@ -110,7 +109,7 @@ function _reuse_or_allocate_vector(old_level, field::Symbol,
 end
 
 """
-    _build_levels!(levels, A_input, config; backend, block_size, allow_partial_resetup, device_ref)
+    _build_levels!(levels, A_input, config; backend, block_size, galerkin_workspace, device_ref)
 
 Build AMG levels by coarsening `A_input`. Populates `levels` in-place, reusing
 workspace vectors from any pre-existing levels when sizes match. Returns the
@@ -119,19 +118,21 @@ coarsest-level CSR matrix (to be used for the direct solver).
 When `device_ref` is provided (a GPU-backed CSRMatrix), it is used as the
 reference for device allocation. When `nothing` (the default), `A_input` is
 used as the reference.
+
+The `galerkin_workspace` is reused across all levels and resetup calls.
 """
 function _build_levels!(levels::Vector{AMGLevel{Tv, Ti}},
                         A_input::CSRMatrix{Tv, Ti},
                         config::AMGConfig;
                         backend=DEFAULT_BACKEND, block_size::Int=64,
-                        allow_partial_resetup::Bool=true,
+                        galerkin_workspace::GalerkinWorkspace{Ti}=GalerkinWorkspace{Ti}(),
                         device_ref::Union{Nothing, CSRMatrix}=nothing) where {Tv, Ti}
     A_ref = device_ref === nothing ? A_input : device_ref
     is_gpu = !(A_ref.nzval isa Array)
     old_levels = copy(levels)
     empty!(levels)
     A_current = A_input
-    galerkin_ws = GalerkinWorkspace{Ti}()
+    allow_partial_resetup = config.allow_partial_resetup
     for lvl in 1:(config.max_levels - 1)
         n = size(A_current, 1)
         n <= config.max_coarse_size && break
@@ -140,7 +141,7 @@ function _build_levels!(levels::Vector{AMGLevel{Tv, Ti}},
         n_coarse >= n && break
         n_coarse == 0 && break
         A_cpu = csr_to_cpu(A_current)
-        A_coarse, r_map = compute_coarse_sparsity(A_cpu, P, n_coarse; build_restriction_map=allow_partial_resetup, workspace=galerkin_ws)
+        A_coarse, r_map = compute_coarse_sparsity(A_cpu, P, n_coarse; build_restriction_map=allow_partial_resetup, workspace=galerkin_workspace)
         Pt_map = build_transpose_map(P)
         old_lvl = lvl <= length(old_levels) ? old_levels[lvl] : nothing
         if is_gpu

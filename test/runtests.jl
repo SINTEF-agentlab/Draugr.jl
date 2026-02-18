@@ -2455,8 +2455,7 @@ end
         b = ones(10)
         for stype in [JacobiSmootherType(), SPAI0SmootherType(), L1JacobiSmootherType(),
                       ColoredGaussSeidelType(), L1ColoredGaussSeidelType(), ILU0SmootherType(), ChebyshevSmootherType(),
-                      SPAI1SmootherType(), SerialGaussSeidelType(), SerialILU0SmootherType()]
-                      SPAI1SmootherType(), SerialGaussSeidelType(), L1SerialGaussSeidelType()]
+                      SPAI1SmootherType(), SerialGaussSeidelType(), SerialILU0SmootherType(), L1SerialGaussSeidelType()]
             smoother = build_smoother(A, stype)
             x = zeros(10)
             smooth!(x, A, b, smoother; steps=10)

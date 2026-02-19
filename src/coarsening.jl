@@ -1,3 +1,55 @@
+# ── Bucket sort helpers (standalone functions to avoid closure boxing) ─────────
+
+"""Remove node `i` from its bucket in the linked-list bucket structure."""
+@inline function _bucket_remove_node!(i::Int, λ::Vector{Int},
+                                      bucket_head::Vector{Int},
+                                      bucket_next::Vector{Int},
+                                      bucket_prev::Vector{Int})
+    @inbounds begin
+        k = λ[i] + 1
+        p = bucket_prev[i]
+        nx = bucket_next[i]
+        if p != 0
+            bucket_next[p] = nx
+        else
+            bucket_head[k] = nx
+        end
+        if nx != 0
+            bucket_prev[nx] = p
+        end
+        bucket_next[i] = 0
+        bucket_prev[i] = 0
+    end
+    return nothing
+end
+
+"""Remove node `i` from its old bucket and insert into bucket for `new_λ`."""
+@inline function _bucket_update_node!(i::Int, new_λ::Int, λ::Vector{Int},
+                                      bucket_head::Vector{Int},
+                                      bucket_next::Vector{Int},
+                                      bucket_prev::Vector{Int})
+    @inbounds begin
+        _bucket_remove_node!(i, λ, bucket_head, bucket_next, bucket_prev)
+        λ[i] = new_λ
+        k = new_λ + 1
+        old_len = length(bucket_head)
+        if k > old_len
+            resize!(bucket_head, k)
+            for idx in (old_len + 1):k
+                bucket_head[idx] = 0
+            end
+        end
+        old_head = bucket_head[k]
+        bucket_head[k] = i
+        bucket_next[i] = old_head
+        bucket_prev[i] = 0
+        if old_head != 0
+            bucket_prev[old_head] = i
+        end
+    end
+    return nothing
+end
+
 # ── Aggregation coarsening ────────────────────────────────────────────────────
 
 """
@@ -504,45 +556,6 @@ function _rs_first_pass!(A::CSRMatrix{Tv, Ti}, is_strong::AbstractVector{Bool};
     end
     top_bucket = max_λ_val
 
-    @inline function _bkt_remove!(i)
-        @inbounds begin
-            k = λ[i] + 1
-            p = bucket_prev[i]
-            nx = bucket_next[i]
-            if p != 0
-                bucket_next[p] = nx
-            else
-                bucket_head[k] = nx
-            end
-            if nx != 0
-                bucket_prev[nx] = p
-            end
-            bucket_next[i] = 0
-            bucket_prev[i] = 0
-        end
-    end
-    @inline function _bkt_update!(i, new_λ)
-        @inbounds begin
-            _bkt_remove!(i)
-            λ[i] = new_λ
-            k = new_λ + 1
-            old_len = length(bucket_head)
-            if k > old_len
-                resize!(bucket_head, k)
-                for idx in (old_len + 1):k
-                    bucket_head[idx] = 0
-                end
-            end
-            old_head = bucket_head[k]
-            bucket_head[k] = i
-            bucket_next[i] = old_head
-            bucket_prev[i] = 0
-            if old_head != 0
-                bucket_prev[old_head] = i
-            end
-        end
-    end
-
     # Main RS first pass greedy loop
     while true
         while top_bucket >= 0 && bucket_head[top_bucket + 1] == 0
@@ -551,7 +564,7 @@ function _rs_first_pass!(A::CSRMatrix{Tv, Ti}, is_strong::AbstractVector{Bool};
         top_bucket < 0 && break
         best_i = bucket_head[top_bucket + 1]
         best_i == 0 && break
-        _bkt_remove!(best_i)
+        _bucket_remove_node!(best_i, λ, bucket_head, bucket_next, bucket_prev)
         cf[best_i] = 1  # C-point
 
         # For each undecided node j that strongly depends on best_i (S^T neighbors):
@@ -559,14 +572,14 @@ function _rs_first_pass!(A::CSRMatrix{Tv, Ti}, is_strong::AbstractVector{Bool};
         @inbounds for idx in st_offsets[best_i]:(st_offsets[best_i + 1] - 1)
             j = st_sources[idx]
             cf[j] != 0 && continue
-            _bkt_remove!(j)
+            _bucket_remove_node!(j, λ, bucket_head, bucket_next, bucket_prev)
             cf[j] = -1  # F-point (permanent)
             # Increment λ for undecided nodes that j strongly depends on
             for nz2 in nzrange(A, j)
                 k = cv[nz2]
                 if k != j && is_strong[nz2] && cf[k] == 0
                     new_val = λ[k] + 1
-                    _bkt_update!(k, new_val)
+                    _bucket_update_node!(k, new_val, λ, bucket_head, bucket_next, bucket_prev)
                     if new_val > top_bucket
                         top_bucket = new_val
                     end
@@ -578,17 +591,17 @@ function _rs_first_pass!(A::CSRMatrix{Tv, Ti}, is_strong::AbstractVector{Bool};
             j = cv[nz]
             if j != best_i && is_strong[nz] && cf[j] == 0
                 new_val = max(0, λ[j] - 1)
-                _bkt_update!(j, new_val)
+                _bucket_update_node!(j, new_val, λ, bucket_head, bucket_next, bucket_prev)
                 if new_val == 0
                     # Node has no more undecided dependents → mark with f_pnt
-                    _bkt_remove!(j)
+                    _bucket_remove_node!(j, λ, bucket_head, bucket_next, bucket_prev)
                     cf[j] = f_pnt  # Z_PT for HMIS, F_PT for RS
                     # Increment λ for its undecided strong neighbors
                     for nz2 in nzrange(A, j)
                         k = cv[nz2]
                         if k != j && is_strong[nz2] && cf[k] == 0
                             new_val2 = λ[k] + 1
-                            _bkt_update!(k, new_val2)
+                            _bucket_update_node!(k, new_val2, λ, bucket_head, bucket_next, bucket_prev)
                             if new_val2 > top_bucket
                                 top_bucket = new_val2
                             end
@@ -773,46 +786,6 @@ function coarsen_rs(A_in::CSRMatrix{Tv, Ti}, θ::Real;
         end
     end
     top_bucket = max_λ_val
-    # Helper: remove node i from its bucket
-    @inline function _bucket_remove!(i)
-        @inbounds begin
-            k = λ[i] + 1
-            p = bucket_prev[i]
-            nx = bucket_next[i]
-            if p != 0
-                bucket_next[p] = nx
-            else
-                bucket_head[k] = nx
-            end
-            if nx != 0
-                bucket_prev[nx] = p
-            end
-            bucket_next[i] = 0
-            bucket_prev[i] = 0
-        end
-    end
-    # Helper: move node i to new bucket for updated λ value
-    @inline function _bucket_update!(i, new_λ)
-        @inbounds begin
-            _bucket_remove!(i)
-            λ[i] = new_λ
-            k = new_λ + 1
-            old_len = length(bucket_head)
-            if k > old_len
-                resize!(bucket_head, k)
-                for idx in (old_len + 1):k
-                    bucket_head[idx] = 0
-                end
-            end
-            old_head = bucket_head[k]
-            bucket_head[k] = i
-            bucket_next[i] = old_head
-            bucket_prev[i] = 0
-            if old_head != 0
-                bucket_prev[old_head] = i
-            end
-        end
-    end
     while true
         # Find highest non-empty bucket
         while top_bucket >= 0 && bucket_head[top_bucket + 1] == 0
@@ -822,13 +795,13 @@ function coarsen_rs(A_in::CSRMatrix{Tv, Ti}, θ::Real;
         best_i = bucket_head[top_bucket + 1]
         best_i == 0 && break
         # Remove best_i from bucket and make it coarse
-        _bucket_remove!(best_i)
+        _bucket_remove_node!(best_i, λ, bucket_head, bucket_next, bucket_prev)
         cf[best_i] = 1
         # For each undecided node j that strongly depends on best_i, make j fine
         @inbounds for idx in st_offsets[best_i]:(st_offsets[best_i + 1] - 1)
             j = st_sources[idx]
             cf[j] != 0 && continue
-            _bucket_remove!(j)
+            _bucket_remove_node!(j, λ, bucket_head, bucket_next, bucket_prev)
             cf[j] = -1  # j becomes fine
             # Increment λ for undecided nodes that j strongly depends on
             # (they gain influence because j is now F)
@@ -836,7 +809,7 @@ function coarsen_rs(A_in::CSRMatrix{Tv, Ti}, θ::Real;
                 k = cv[nz2]
                 if k != j && is_strong[nz2] && cf[k] == 0
                     new_val = λ[k] + 1
-                    _bucket_update!(k, new_val)
+                    _bucket_update_node!(k, new_val, λ, bucket_head, bucket_next, bucket_prev)
                     if new_val > top_bucket
                         top_bucket = new_val
                     end
@@ -848,7 +821,7 @@ function coarsen_rs(A_in::CSRMatrix{Tv, Ti}, θ::Real;
             j = cv[nz]
             if j != best_i && is_strong[nz] && cf[j] == 0
                 new_val = max(0, λ[j] - 1)
-                _bucket_update!(j, new_val)
+                _bucket_update_node!(j, new_val, λ, bucket_head, bucket_next, bucket_prev)
             end
         end
     end

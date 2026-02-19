@@ -960,8 +960,10 @@ function _coo_to_prolongation(I_p::Vector{Ti}, J_p::Vector{Ti}, V_p::Vector{Tv},
         old_P.ncol = n_coarse
         old_P.trunc_scaling = trunc
         return old_P
-    else
+    elseif trunc !== nothing
         return ProlongationOp{Ti, Tv, Vector{Ti}, Vector{Tv}}(rp, colval, nzval, n_fine, n_coarse, trunc)
+    else
+        return ProlongationOp{Ti, Tv}(rp, colval, nzval, n_fine, n_coarse)
     end
 end
 

@@ -55,6 +55,7 @@ function amg_resetup!(hierarchy::AMGHierarchy{Tv, Ti},
         A_coarsest = _build_levels!(hierarchy.levels, A_new, config;
                                     backend=backend, block_size=block_size,
                                     galerkin_workspace=hierarchy.galerkin_workspace,
+                                    setup_workspace=hierarchy.setup_workspace,
                                     device_ref=device_ref)
         coarse_dense, coarse_factor, coarse_x, coarse_b, solve_r =
             _build_coarse_solver(A_coarsest, A_ref, n_finest, config;

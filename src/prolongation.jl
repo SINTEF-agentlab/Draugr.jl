@@ -263,16 +263,22 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
         end
     end
 
-    # Build rowptr
+    # Build rowptr — reuse old_P arrays when available
     total_nnz = sum(row_counts)
-    rp = Vector{Ti}(undef, n_fine + 1)
+    old_P_reuse = setup_workspace !== nothing ? setup_workspace.old_P : nothing
+    if old_P_reuse !== nothing && old_P_reuse.colval isa Vector
+        rp = resize!(old_P_reuse.rowptr, n_fine + 1)
+        cval = resize!(old_P_reuse.colval, total_nnz)
+        nzv_p = resize!(old_P_reuse.nzval, total_nnz)
+    else
+        rp = Vector{Ti}(undef, n_fine + 1)
+        cval = Vector{Ti}(undef, total_nnz)
+        nzv_p = Vector{Tv}(undef, total_nnz)
+    end
     rp[1] = Ti(1)
     for i in 1:n_fine
         rp[i+1] = rp[i] + Ti(row_counts[i])
     end
-
-    cval = Vector{Ti}(undef, total_nnz)
-    nzv_p = Vector{Tv}(undef, total_nnz)
 
     # Second pass: fill entries
     @inbounds for i in 1:n_fine
@@ -334,7 +340,17 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
         end
     end
 
-    return ProlongationOp{Ti, Tv}(rp, cval, nzv_p, n_fine, n_coarse)
+    if old_P_reuse !== nothing && old_P_reuse.colval isa Vector
+        old_P_reuse.nrow = n_fine
+        old_P_reuse.ncol = n_coarse
+        old_P_reuse.trunc_scaling = nothing
+        if setup_workspace !== nothing
+            setup_workspace.old_P = nothing
+        end
+        return old_P_reuse
+    else
+        return ProlongationOp{Ti, Tv}(rp, cval, nzv_p, n_fine, n_coarse)
+    end
 end
 
 # ── Standard (Classical) interpolation ───────────────────────────────────────
@@ -471,8 +487,14 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
         end
     end
 
-    return _coo_to_prolongation(I_p, J_p, V_p, n_fine, n_coarse;
+    old_P_reuse = setup_workspace !== nothing ? setup_workspace.old_P : nothing
+    P = _coo_to_prolongation(I_p, J_p, V_p, n_fine, n_coarse;
+        old_P=old_P_reuse,
         sort_perm=setup_workspace !== nothing ? setup_workspace.sort_perm : nothing)
+    if setup_workspace !== nothing
+        setup_workspace.old_P = nothing
+    end
+    return P
 end
 
 # ── Extended+i interpolation ─────────────────────────────────────────────────
@@ -760,21 +782,16 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
     end
 
     _sort_perm = setup_workspace !== nothing ? setup_workspace.sort_perm : nothing
+    old_P_reuse = setup_workspace !== nothing ? setup_workspace.old_P : nothing
     if do_rescale
-        # Compute sort permutation before _coo_to_prolongation mutates I_p/J_p
-        nnz_p = length(I_p)
-        if _sort_perm !== nothing
-            resize!(_sort_perm, nnz_p)
-            perm = _sort_perm
-        else
-            perm = Vector{Int}(undef, nnz_p)
-        end
-        sortperm!(perm, 1:nnz_p; lt=_coo_lt(I_p, J_p))
-        permute!(S_p, perm)
-        P = _coo_to_prolongation(I_p, J_p, V_p, n_fine, n_coarse; sort_perm=_sort_perm)
-        P.trunc_scaling = copy(S_p)
+        P = _coo_to_prolongation(I_p, J_p, V_p, n_fine, n_coarse;
+            old_P=old_P_reuse, S_p=S_p, sort_perm=_sort_perm)
     else
-        P = _coo_to_prolongation(I_p, J_p, V_p, n_fine, n_coarse; sort_perm=_sort_perm)
+        P = _coo_to_prolongation(I_p, J_p, V_p, n_fine, n_coarse;
+            old_P=old_P_reuse, sort_perm=_sort_perm)
+    end
+    if setup_workspace !== nothing
+        setup_workspace.old_P = nothing
     end
     return P
 end
@@ -799,50 +816,153 @@ function _find_nearest_coarse(A::CSRMatrix{Tv, Ti}, i::Int,
     return best_j > 0 ? best_j : 1
 end
 
-"""Sort permutation for COO arrays by (row, col) without tuple allocation."""
-@inline function _coo_lt(I_p, J_p)
-    return (a, b) -> begin
-        @inbounds begin
-            ia = I_p[a]; ib = I_p[b]
-            ia < ib && return true
-            ia > ib && return false
-            return J_p[a] < J_p[b]
-        end
+"""Scatter COO entries into CSR arrays using counting sort positions."""
+@inline function _scatter_coo_to_csr!(colval, nzval, I_p, J_p, V_p, pos, nnz_p::Int)
+    @inbounds for k in 1:nnz_p
+        row = I_p[k]
+        p = Int(pos[row])
+        colval[p] = J_p[k]
+        nzval[p] = V_p[k]
+        pos[row] += one(eltype(pos))
     end
 end
 
-"""Convert COO format to ProlongationOp (CSR). The input arrays are sorted
-in-place as workspace; the returned ProlongationOp owns independent copies.
-`sort_perm` is an optional pre-allocated buffer for sortperm!."""
+"""Scatter COO entries + trunc_scaling into CSR arrays using counting sort positions."""
+@inline function _scatter_coo_to_csr!(colval, nzval, trunc, I_p, J_p, V_p, S_p, pos, nnz_p::Int)
+    @inbounds for k in 1:nnz_p
+        row = I_p[k]
+        p = Int(pos[row])
+        colval[p] = J_p[k]
+        nzval[p] = V_p[k]
+        trunc[p] = S_p[k]
+        pos[row] += one(eltype(pos))
+    end
+end
+
+"""In-place insertion sort of CSR row entries by column index."""
+function _sort_csr_row!(colval::AbstractVector, nzval::AbstractVector,
+                         rs::Int, re::Int)
+    @inbounds for j in (rs+1):re
+        key_c = colval[j]
+        key_v = nzval[j]
+        k = j - 1
+        while k >= rs && colval[k] > key_c
+            colval[k+1] = colval[k]
+            nzval[k+1] = nzval[k]
+            k -= 1
+        end
+        colval[k+1] = key_c
+        nzval[k+1] = key_v
+    end
+end
+
+"""In-place insertion sort of CSR row entries by column index, also permuting trunc_scaling."""
+function _sort_csr_row!(colval::AbstractVector, nzval::AbstractVector,
+                         trunc::AbstractVector, rs::Int, re::Int)
+    @inbounds for j in (rs+1):re
+        key_c = colval[j]
+        key_v = nzval[j]
+        key_t = trunc[j]
+        k = j - 1
+        while k >= rs && colval[k] > key_c
+            colval[k+1] = colval[k]
+            nzval[k+1] = nzval[k]
+            trunc[k+1] = trunc[k]
+            k -= 1
+        end
+        colval[k+1] = key_c
+        nzval[k+1] = key_v
+        trunc[k+1] = key_t
+    end
+end
+
+"""Convert COO format to ProlongationOp (CSR) using counting sort by row
+followed by per-row insertion sort by column. Much faster than global
+sortperm for typical prolongation operators with few entries per row.
+
+When `old_P` is provided, its arrays are resized and reused instead of
+allocating new ones. When `S_p` is provided, it is reordered into CSR
+order and stored as `trunc_scaling`. `sort_perm` is used as a temporary
+position buffer during the counting sort."""
 function _coo_to_prolongation(I_p::Vector{Ti}, J_p::Vector{Ti}, V_p::Vector{Tv},
                               n_fine::Int, n_coarse::Int;
+                              old_P::Union{Nothing, ProlongationOp}=nothing,
+                              S_p::Union{Nothing, Vector}=nothing,
                               sort_perm::Union{Nothing,Vector{Int}}=nothing) where {Ti, Tv}
-    # Sort by (row, col) using buffer to avoid allocating tuples
     nnz_p = length(I_p)
-    if sort_perm !== nothing
-        resize!(sort_perm, nnz_p)
-        perm = sort_perm
+
+    # Get or create output arrays, reusing old_P when available
+    if old_P !== nothing && old_P.colval isa Vector
+        rp = resize!(old_P.rowptr, n_fine + 1)
+        colval = resize!(old_P.colval, nnz_p)
+        nzval = resize!(old_P.nzval, nnz_p)
     else
-        perm = Vector{Int}(undef, nnz_p)
+        rp = Vector{Ti}(undef, n_fine + 1)
+        colval = Vector{Ti}(undef, nnz_p)
+        nzval = Vector{Tv}(undef, nnz_p)
     end
-    sortperm!(perm, 1:nnz_p; lt=_coo_lt(I_p, J_p))
-    permute!(I_p, perm)
-    permute!(J_p, perm)
-    permute!(V_p, perm)
-    rp = Vector{Ti}(undef, n_fine + 1)
+
+    # Handle trunc_scaling: resize from old_P or allocate
+    if S_p !== nothing
+        if old_P !== nothing && old_P.trunc_scaling isa Vector
+            trunc = resize!(old_P.trunc_scaling, nnz_p)
+        else
+            trunc = Vector{Tv}(undef, nnz_p)
+        end
+    else
+        trunc = nothing
+    end
+
+    # 1. Count entries per row
     fill!(rp, Ti(0))
-    for k in 1:nnz_p
+    @inbounds for k in 1:nnz_p
         rp[I_p[k]] += Ti(1)
     end
-    cumsum = Ti(1)
-    for i in 1:n_fine
+
+    # 2. Build rowptr (cumulative sum)
+    cumsum_val = Ti(1)
+    @inbounds for i in 1:n_fine
         count = rp[i]
-        rp[i] = cumsum
-        cumsum += count
+        rp[i] = cumsum_val
+        cumsum_val += count
     end
-    rp[n_fine + 1] = cumsum
-    # Copy colval/nzval so the ProlongationOp doesn't alias workspace arrays
-    return ProlongationOp{Ti, Tv}(rp, copy(J_p), copy(V_p), n_fine, n_coarse)
+    rp[n_fine + 1] = cumsum_val
+
+    # 3. Counting sort: distribute COO entries into CSR positions
+    if sort_perm !== nothing
+        resize!(sort_perm, n_fine)
+        pos = sort_perm
+    else
+        pos = Vector{Int}(undef, n_fine)
+    end
+    copyto!(pos, 1, rp, 1, n_fine)
+
+    if trunc !== nothing
+        _scatter_coo_to_csr!(colval, nzval, trunc, I_p, J_p, V_p, S_p, pos, nnz_p)
+    else
+        _scatter_coo_to_csr!(colval, nzval, I_p, J_p, V_p, pos, nnz_p)
+    end
+
+    # 4. Sort each row by column (insertion sort — rows are typically small)
+    if trunc !== nothing
+        @inbounds for i in 1:n_fine
+            _sort_csr_row!(colval, nzval, trunc, Int(rp[i]), Int(rp[i+1]) - 1)
+        end
+    else
+        @inbounds for i in 1:n_fine
+            _sort_csr_row!(colval, nzval, Int(rp[i]), Int(rp[i+1]) - 1)
+        end
+    end
+
+    # Return ProlongationOp (mutate old_P or create new)
+    if old_P !== nothing && old_P.colval isa Vector
+        old_P.nrow = n_fine
+        old_P.ncol = n_coarse
+        old_P.trunc_scaling = trunc
+        return old_P
+    else
+        return ProlongationOp{Ti, Tv, Vector{Ti}, Vector{Tv}}(rp, colval, nzval, n_fine, n_coarse, trunc)
+    end
 end
 
 """

@@ -223,7 +223,8 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                               backend=DEFAULT_BACKEND, block_size::Int=64,
                               setup_workspace=nothing) where {Tv, Ti}
     # Compute strength on GPU if available, then convert to CPU for graph algorithms
-    is_strong_raw = strength_graph(A_in, θ; backend=backend, block_size=block_size)
+    is_strong_raw = strength_graph(A_in, θ; backend=backend, block_size=block_size,
+        is_strong=setup_workspace !== nothing ? setup_workspace.is_strong : nothing)
     is_strong = is_strong_raw isa Array ? is_strong_raw : Array(is_strong_raw)
     A = csr_to_cpu(A_in)
     n_fine = size(A, 1)
@@ -354,7 +355,8 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                               backend=DEFAULT_BACKEND, block_size::Int=64,
                               setup_workspace=nothing) where {Tv, Ti}
     # Compute strength on GPU if available, then convert to CPU for graph algorithms
-    is_strong_raw = strength_graph(A_in, θ; backend=backend, block_size=block_size)
+    is_strong_raw = strength_graph(A_in, θ; backend=backend, block_size=block_size,
+        is_strong=setup_workspace !== nothing ? setup_workspace.is_strong : nothing)
     is_strong = is_strong_raw isa Array ? is_strong_raw : Array(is_strong_raw)
     A = csr_to_cpu(A_in)
     n_fine = size(A, 1)
@@ -469,7 +471,8 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
         end
     end
 
-    return _coo_to_prolongation(I_p, J_p, V_p, n_fine, n_coarse)
+    return _coo_to_prolongation(I_p, J_p, V_p, n_fine, n_coarse;
+        sort_perm=setup_workspace !== nothing ? setup_workspace.sort_perm : nothing)
 end
 
 # ── Extended+i interpolation ─────────────────────────────────────────────────
@@ -487,7 +490,8 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                               backend=DEFAULT_BACKEND, block_size::Int=64,
                               setup_workspace=nothing) where {Tv, Ti}
     # Compute strength on GPU if available, then convert to CPU for graph algorithms
-    is_strong_raw = strength_graph(A_in, θ; backend=backend, block_size=block_size)
+    is_strong_raw = strength_graph(A_in, θ; backend=backend, block_size=block_size,
+        is_strong=setup_workspace !== nothing ? setup_workspace.is_strong : nothing)
     is_strong = is_strong_raw isa Array ? is_strong_raw : Array(is_strong_raw)
     A = csr_to_cpu(A_in)
     n_fine = size(A, 1)
@@ -755,13 +759,22 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
         strong_f_marker -= 1
     end
 
+    _sort_perm = setup_workspace !== nothing ? setup_workspace.sort_perm : nothing
     if do_rescale
         # Compute sort permutation before _coo_to_prolongation mutates I_p/J_p
-        perm = sortperm(collect(zip(I_p, J_p)))
-        P = _coo_to_prolongation(I_p, J_p, V_p, n_fine, n_coarse)
-        P.trunc_scaling = S_p[perm]
+        nnz_p = length(I_p)
+        if _sort_perm !== nothing
+            resize!(_sort_perm, nnz_p)
+            perm = _sort_perm
+        else
+            perm = Vector{Int}(undef, nnz_p)
+        end
+        sortperm!(perm, 1:nnz_p; by=k -> (I_p[k], J_p[k]))
+        permute!(S_p, perm)
+        P = _coo_to_prolongation(I_p, J_p, V_p, n_fine, n_coarse; sort_perm=_sort_perm)
+        P.trunc_scaling = copy(S_p)
     else
-        P = _coo_to_prolongation(I_p, J_p, V_p, n_fine, n_coarse)
+        P = _coo_to_prolongation(I_p, J_p, V_p, n_fine, n_coarse; sort_perm=_sort_perm)
     end
     return P
 end
@@ -787,15 +800,23 @@ function _find_nearest_coarse(A::CSRMatrix{Tv, Ti}, i::Int,
 end
 
 """Convert COO format to ProlongationOp (CSR). The input arrays are sorted
-in-place as workspace; the returned ProlongationOp owns independent copies."""
+in-place as workspace; the returned ProlongationOp owns independent copies.
+`sort_perm` is an optional pre-allocated buffer for sortperm!."""
 function _coo_to_prolongation(I_p::Vector{Ti}, J_p::Vector{Ti}, V_p::Vector{Tv},
-                              n_fine::Int, n_coarse::Int) where {Ti, Tv}
-    # Sort by (row, col)
-    perm = sortperm(collect(zip(I_p, J_p)))
+                              n_fine::Int, n_coarse::Int;
+                              sort_perm::Union{Nothing,Vector{Int}}=nothing) where {Ti, Tv}
+    # Sort by (row, col) using buffer to avoid allocating tuples
+    nnz_p = length(I_p)
+    if sort_perm !== nothing
+        resize!(sort_perm, nnz_p)
+        perm = sort_perm
+    else
+        perm = Vector{Int}(undef, nnz_p)
+    end
+    sortperm!(perm, 1:nnz_p; by=k -> (I_p[k], J_p[k]))
     permute!(I_p, perm)
     permute!(J_p, perm)
     permute!(V_p, perm)
-    nnz_p = length(I_p)
     rp = Vector{Ti}(undef, n_fine + 1)
     fill!(rp, Ti(0))
     for k in 1:nnz_p

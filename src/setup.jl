@@ -68,16 +68,18 @@ function amg_setup(A_csr::CSRMatrix{Tv, Ti}, config::AMGConfig=AMGConfig();
     levels = AMGLevel{Tv, Ti}[]
     n_finest = size(A_csr, 1)
     galerkin_ws = GalerkinWorkspace{Ti}()
+    setup_ws = SetupWorkspace{Tv, Ti}()
     A_coarsest = _build_levels!(levels, A_csr, config;
                                 backend=backend, block_size=block_size,
-                                galerkin_workspace=galerkin_ws)
+                                galerkin_workspace=galerkin_ws,
+                                setup_workspace=setup_ws)
     coarse_dense, coarse_factor, coarse_x, coarse_b, solve_r =
         _build_coarse_solver(A_coarsest, A_csr, n_finest, config;
                              backend=backend, block_size=block_size)
     hierarchy = AMGHierarchy{Tv, Ti}(levels, coarse_dense,
                                       coarse_factor, coarse_x, coarse_b, solve_r,
                                       backend, block_size, config.coarse_solve_on_cpu,
-                                      galerkin_ws)
+                                      galerkin_ws, setup_ws)
     t_setup = time() - t_setup
     if config.verbose >= 1
         _print_hierarchy_info(hierarchy, config, n_finest, t_setup)
@@ -109,7 +111,7 @@ function _reuse_or_allocate_vector(old_level, field::Symbol,
 end
 
 """
-    _build_levels!(levels, A_input, config; backend, block_size, galerkin_workspace, device_ref)
+    _build_levels!(levels, A_input, config; backend, block_size, galerkin_workspace, setup_workspace, device_ref)
 
 Build AMG levels by coarsening `A_input`. Populates `levels` in-place, reusing
 workspace vectors from any pre-existing levels when sizes match. Returns the
@@ -119,13 +121,15 @@ When `device_ref` is provided (a GPU-backed CSRMatrix), it is used as the
 reference for device allocation. When `nothing` (the default), `A_input` is
 used as the reference.
 
-The `galerkin_workspace` is reused across all levels and resetup calls.
+The `galerkin_workspace` and `setup_workspace` are reused across all levels
+and resetup calls.
 """
 function _build_levels!(levels::Vector{AMGLevel{Tv, Ti}},
                         A_input::CSRMatrix{Tv, Ti},
                         config::AMGConfig;
                         backend=DEFAULT_BACKEND, block_size::Int=64,
                         galerkin_workspace::GalerkinWorkspace{Ti}=GalerkinWorkspace{Ti}(),
+                        setup_workspace::SetupWorkspace{Tv, Ti}=SetupWorkspace{Tv, Ti}(),
                         device_ref::Union{Nothing, CSRMatrix}=nothing) where {Tv, Ti}
     A_ref = device_ref === nothing ? A_input : device_ref
     is_gpu = !(A_ref.nzval isa Array)
@@ -137,7 +141,7 @@ function _build_levels!(levels::Vector{AMGLevel{Tv, Ti}},
         n = size(A_current, 1)
         n <= config.max_coarse_size && break
         coarsening_alg = _get_coarsening_for_level(config, lvl)
-        P, n_coarse = _coarsen_with_fallback(A_current, coarsening_alg, config; backend=backend, block_size=block_size)
+        P, n_coarse = _coarsen_with_fallback(A_current, coarsening_alg, config; backend=backend, block_size=block_size, setup_workspace=setup_workspace)
         n_coarse >= n && break
         n_coarse == 0 && break
         A_cpu = csr_to_cpu(A_current)
@@ -220,16 +224,17 @@ and the original θ is too aggressive.
 """
 function _coarsen_with_fallback(A::CSRMatrix, alg::CoarseningAlgorithm,
                                 config::AMGConfig;
-                                backend=DEFAULT_BACKEND, block_size::Int=64)
+                                backend=DEFAULT_BACKEND, block_size::Int=64,
+                                setup_workspace=nothing)
     n = size(A, 1)
-    P, n_coarse = _coarsen_and_build_P(A, alg, config; backend=backend, block_size=block_size)
+    P, n_coarse = _coarsen_and_build_P(A, alg, config; backend=backend, block_size=block_size, setup_workspace=setup_workspace)
     # If coarsening is adequate, return
     (n_coarse < 0.8 * n || n <= config.max_coarse_size) && return P, n_coarse
     # Try reducing θ
     for attempt in 1:3
         reduced_alg = _reduce_theta(alg, 0.5^attempt)
         reduced_alg === nothing && return P, n_coarse  # no θ to reduce
-        P2, nc2 = _coarsen_and_build_P(A, reduced_alg, config; backend=backend, block_size=block_size)
+        P2, nc2 = _coarsen_and_build_P(A, reduced_alg, config; backend=backend, block_size=block_size, setup_workspace=setup_workspace)
         if nc2 < n_coarse
             P, n_coarse = P2, nc2
         end
@@ -257,10 +262,11 @@ When max_row_sum is configured, strength computation uses a weakened matrix.
 """
 function _coarsen_and_build_P(A::CSRMatrix, alg::CoarseningAlgorithm,
                               config::AMGConfig=AMGConfig();
-                              backend=DEFAULT_BACKEND, block_size::Int=64)
+                              backend=DEFAULT_BACKEND, block_size::Int=64,
+                              setup_workspace=nothing)
     if uses_cf_splitting(alg)
-        cf, coarse_map, n_coarse = coarsen_cf(A, alg, config; backend=backend, block_size=block_size)
-        P = build_cf_prolongation(A, cf, coarse_map, n_coarse, alg.interpolation, alg.θ; backend=backend, block_size=block_size)
+        cf, coarse_map, n_coarse = coarsen_cf(A, alg, config; backend=backend, block_size=block_size, setup_workspace=setup_workspace)
+        P = build_cf_prolongation(A, cf, coarse_map, n_coarse, alg.interpolation, alg.θ; backend=backend, block_size=block_size, setup_workspace=setup_workspace)
         # Apply interpolation truncation if configured
         tf = _get_trunc_factor(alg.interpolation)
         if tf > 0
@@ -268,7 +274,7 @@ function _coarsen_and_build_P(A::CSRMatrix, alg::CoarseningAlgorithm,
         end
         return P, n_coarse
     else
-        agg, n_coarse = coarsen(A, alg, config; backend=backend, block_size=block_size)
+        agg, n_coarse = coarsen(A, alg, config; backend=backend, block_size=block_size, setup_workspace=setup_workspace)
         P = build_prolongation(A, agg, n_coarse)
         # Apply filtering if requested
         if _has_filtering(alg) && alg.filtering
@@ -280,8 +286,9 @@ end
 
 function _coarsen_and_build_P(A::CSRMatrix, alg::SmoothedAggregationCoarsening,
                               config::AMGConfig=AMGConfig();
-                              backend=DEFAULT_BACKEND, block_size::Int=64)
-    agg, n_coarse = coarsen(A, AggregationCoarsening(alg.θ), config; backend=backend, block_size=block_size)
+                              backend=DEFAULT_BACKEND, block_size::Int=64,
+                              setup_workspace=nothing)
+    agg, n_coarse = coarsen(A, AggregationCoarsening(alg.θ), config; backend=backend, block_size=block_size, setup_workspace=setup_workspace)
     P_tent = build_prolongation(A, agg, n_coarse)
     # Smooth: P = (I - ω D⁻¹ A) P_tent
     P = _smooth_prolongation(A, P_tent, alg.ω)
@@ -303,18 +310,19 @@ aggressive coarsening.
 """
 function _coarsen_and_build_P(A::CSRMatrix, alg::AggressiveCoarsening,
                               config::AMGConfig=AMGConfig();
-                              backend=DEFAULT_BACKEND, block_size::Int=64)
+                              backend=DEFAULT_BACKEND, block_size::Int=64,
+                              setup_workspace=nothing)
     if alg.base == :hmis
-        cf, coarse_map, n_coarse = coarsen_aggressive_cf(A, alg.θ, :hmis; config=config, backend=backend, block_size=block_size)
-        P = build_cf_prolongation(A, cf, coarse_map, n_coarse, alg.interpolation, alg.θ; backend=backend, block_size=block_size)
+        cf, coarse_map, n_coarse = coarsen_aggressive_cf(A, alg.θ, :hmis; config=config, backend=backend, block_size=block_size, setup_workspace=setup_workspace)
+        P = build_cf_prolongation(A, cf, coarse_map, n_coarse, alg.interpolation, alg.θ; backend=backend, block_size=block_size, setup_workspace=setup_workspace)
         tf = _get_trunc_factor(alg.interpolation)
         if tf > 0
             P = _truncate_interpolation(P, tf)
         end
         return P, n_coarse
     elseif alg.base == :pmis
-        cf, coarse_map, n_coarse = coarsen_aggressive_cf(A, alg.θ, :pmis; config=config, backend=backend, block_size=block_size)
-        P = build_cf_prolongation(A, cf, coarse_map, n_coarse, alg.interpolation, alg.θ; backend=backend, block_size=block_size)
+        cf, coarse_map, n_coarse = coarsen_aggressive_cf(A, alg.θ, :pmis; config=config, backend=backend, block_size=block_size, setup_workspace=setup_workspace)
+        P = build_cf_prolongation(A, cf, coarse_map, n_coarse, alg.interpolation, alg.θ; backend=backend, block_size=block_size, setup_workspace=setup_workspace)
         tf = _get_trunc_factor(alg.interpolation)
         if tf > 0
             P = _truncate_interpolation(P, tf)
@@ -322,7 +330,7 @@ function _coarsen_and_build_P(A::CSRMatrix, alg::AggressiveCoarsening,
         return P, n_coarse
     else
         # Legacy: aggregation-based aggressive coarsening
-        agg, n_coarse = coarsen(A, alg, config; backend=backend, block_size=block_size)
+        agg, n_coarse = coarsen(A, alg, config; backend=backend, block_size=block_size, setup_workspace=setup_workspace)
         P = build_prolongation(A, agg, n_coarse)
         return P, n_coarse
     end

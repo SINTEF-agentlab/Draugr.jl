@@ -196,8 +196,9 @@ Build a prolongation operator from a CF-splitting using the specified interpolat
 function build_cf_prolongation(A::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                                coarse_map::Vector{Int}, n_coarse::Int,
                                interp::InterpolationType, θ::Real=0.25;
-                               backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
-    return _build_interpolation(A, cf, coarse_map, n_coarse, interp, θ; backend=backend, block_size=block_size)
+                               backend=DEFAULT_BACKEND, block_size::Int=64,
+                               setup_workspace=nothing) where {Tv, Ti}
+    return _build_interpolation(A, cf, coarse_map, n_coarse, interp, θ; backend=backend, block_size=block_size, setup_workspace=setup_workspace)
 end
 
 # ── Direct interpolation ─────────────────────────────────────────────────────
@@ -219,7 +220,8 @@ d_i = a_{i,i} + Σ_{k ∈ weak ∪ F_i^s ∪ same_sign} a_{i,k}.
 function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                               coarse_map::Vector{Int}, n_coarse::Int,
                               ::DirectInterpolation, θ::Real=0.25;
-                              backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
+                              backend=DEFAULT_BACKEND, block_size::Int=64,
+                              setup_workspace=nothing) where {Tv, Ti}
     # Compute strength on GPU if available, then convert to CPU for graph algorithms
     is_strong_raw = strength_graph(A_in, θ; backend=backend, block_size=block_size)
     is_strong = is_strong_raw isa Array ? is_strong_raw : Array(is_strong_raw)
@@ -349,7 +351,8 @@ where d_i = a_{i,i} + Σ_{k∈weak} a_{i,k}
 function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                               coarse_map::Vector{Int}, n_coarse::Int,
                               ::StandardInterpolation, θ::Real=0.25;
-                              backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
+                              backend=DEFAULT_BACKEND, block_size::Int=64,
+                              setup_workspace=nothing) where {Tv, Ti}
     # Compute strength on GPU if available, then convert to CPU for graph algorithms
     is_strong_raw = strength_graph(A_in, θ; backend=backend, block_size=block_size)
     is_strong = is_strong_raw isa Array ? is_strong_raw : Array(is_strong_raw)
@@ -359,9 +362,13 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
     nzv = nonzeros(A)
 
     # Build P using COO format, then convert to CSR
+    nnz_hint = nnz(A)
     I_p = Ti[]
     J_p = Ti[]
     V_p = Tv[]
+    sizehint!(I_p, nnz_hint)
+    sizehint!(J_p, nnz_hint)
+    sizehint!(V_p, nnz_hint)
 
     @inbounds for i in 1:n_fine
         if cf[i] == 1
@@ -467,7 +474,8 @@ interpolation targets, resulting in a larger but more accurate interpolation ste
 function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                               coarse_map::Vector{Int}, n_coarse::Int,
                               interp::ExtendedIInterpolation, θ::Real=0.25;
-                              backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
+                              backend=DEFAULT_BACKEND, block_size::Int=64,
+                              setup_workspace=nothing) where {Tv, Ti}
     # Compute strength on GPU if available, then convert to CPU for graph algorithms
     is_strong_raw = strength_graph(A_in, θ; backend=backend, block_size=block_size)
     is_strong = is_strong_raw isa Array ? is_strong_raw : Array(is_strong_raw)
@@ -482,11 +490,10 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
     do_rescale = interp.rescale
 
     # Build strength-based sparse matrix S for determining C-hat
-    # S_diag[i] contains strong neighbors of i (like hypre's S_diag)
-    # Build S as adjacency list: for each node, list of (neighbor, is_strong_F)
     strong_nbrs = Vector{Vector{Int}}(undef, n_fine)
     @inbounds for i in 1:n_fine
         snb = Int[]
+        sizehint!(snb, 8)
         for nz in nzrange(A, i)
             j = cv[nz]
             if j != i && is_strong[nz]
@@ -500,10 +507,17 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
     P_marker = fill(-1, n_fine)
     strong_f_marker = -2
 
+    nnz_hint = nnz(A)
     I_p = Ti[]
     J_p = Ti[]
     V_p = Tv[]
+    sizehint!(I_p, nnz_hint)
+    sizehint!(J_p, nnz_hint)
+    sizehint!(V_p, nnz_hint)
     S_p = do_rescale ? Tv[] : nothing  # per-entry scaling factors
+    if do_rescale
+        sizehint!(S_p, nnz_hint)
+    end
 
     @inbounds for i in 1:n_fine
         if cf[i] == 1
@@ -709,19 +723,20 @@ function _find_nearest_coarse(A::CSRMatrix{Tv, Ti}, i::Int,
     return best_j > 0 ? best_j : 1
 end
 
-"""Convert COO format to ProlongationOp (CSR)."""
+"""Convert COO format to ProlongationOp (CSR). Sorts in-place using the provided
+arrays (caller should not rely on original order after this call)."""
 function _coo_to_prolongation(I_p::Vector{Ti}, J_p::Vector{Ti}, V_p::Vector{Tv},
                               n_fine::Int, n_coarse::Int) where {Ti, Tv}
     # Sort by (row, col)
     perm = sortperm(collect(zip(I_p, J_p)))
-    I_s = I_p[perm]
-    J_s = J_p[perm]
-    V_s = V_p[perm]
-    nnz_p = length(I_s)
+    permute!(I_p, perm)
+    permute!(J_p, perm)
+    permute!(V_p, perm)
+    nnz_p = length(I_p)
     rp = Vector{Ti}(undef, n_fine + 1)
     fill!(rp, Ti(0))
     for k in 1:nnz_p
-        rp[I_s[k]] += Ti(1)
+        rp[I_p[k]] += Ti(1)
     end
     cumsum = Ti(1)
     for i in 1:n_fine
@@ -730,7 +745,7 @@ function _coo_to_prolongation(I_p::Vector{Ti}, J_p::Vector{Ti}, V_p::Vector{Tv},
         cumsum += count
     end
     rp[n_fine + 1] = cumsum
-    return ProlongationOp{Ti, Tv}(rp, J_s, V_s, n_fine, n_coarse)
+    return ProlongationOp{Ti, Tv}(rp, J_p, V_p, n_fine, n_coarse)
 end
 
 """

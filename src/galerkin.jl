@@ -30,7 +30,8 @@ function compute_coarse_sparsity(A_fine::CSRMatrix{Tv, Ti},
                                  P::ProlongationOp{Ti, Tv},
                                  n_coarse::Int;
                                  build_restriction_map::Bool=true,
-                                 workspace::Union{Nothing, GalerkinWorkspace{Ti}}=nothing) where {Tv, Ti}
+                                 workspace::Union{Nothing, GalerkinWorkspace{Ti}}=nothing,
+                                 old_A_coarse::Union{Nothing, CSRMatrix}=nothing) where {Tv, Ti}
     n_fine = size(A_fine, 1)
     cv_a = colvals(A_fine)
     nzv_a = nonzeros(A_fine)
@@ -135,12 +136,21 @@ function compute_coarse_sparsity(A_fine::CSRMatrix{Tv, Ti},
         unique_per_row[row] = nuniq
     end
 
-    # Build coarse CSR rowptr
+    # Build coarse CSR rowptr — reuse old_A_coarse arrays when available
     nnz_c = zero(Ti)
     @inbounds for row in 1:n_coarse
         nnz_c += unique_per_row[row]
     end
-    rowptr_c = Vector{Ti}(undef, n_coarse + 1)
+    if old_A_coarse !== nothing && old_A_coarse.nzval isa Vector
+        rowptr_c = resize!(old_A_coarse.rowptr, n_coarse + 1)
+        colval_c = resize!(old_A_coarse.colval, Int(nnz_c))
+        nzval_c = resize!(old_A_coarse.nzval, Int(nnz_c))
+        fill!(nzval_c, zero(Tv))
+    else
+        rowptr_c = Vector{Ti}(undef, n_coarse + 1)
+        colval_c = Vector{Ti}(undef, nnz_c)
+        nzval_c = zeros(Tv, nnz_c)
+    end
     rowptr_c[1] = one(Ti)
     @inbounds for i in 1:n_coarse
         rowptr_c[i+1] = rowptr_c[i] + unique_per_row[i]
@@ -150,8 +160,6 @@ function compute_coarse_sparsity(A_fine::CSRMatrix{Tv, Ti},
     # then optionally map triples to NZ indices for the restriction map.
     # NOTE: marker_gen continues from the first pass (not reset) so generation
     # values in col_marker from the first pass cannot collide with second-pass values.
-    colval_c = Vector{Ti}(undef, nnz_c)
-    nzval_c = zeros(Tv, nnz_c)
     val_acc = Vector{Tv}(undef, n_coarse)  # dense value accumulator (only touched entries are read)
 
     @inbounds for row in 1:n_coarse

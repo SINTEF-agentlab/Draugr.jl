@@ -500,8 +500,10 @@ mutable struct SetupWorkspace{Tv, Ti<:Integer}
     strong_nbrs_data::Vector{Int}
     # Strength graph buffer (reused across calls)
     is_strong::Vector{Bool}
-    # Sort permutation buffer (reused across sortperm! calls)
+    # Sort permutation buffer (reused as counting-sort position buffer)
     sort_perm::Vector{Int}
+    # Old ProlongationOp reference for array reuse during resetup (set per-level in _build_levels!)
+    old_P::Any   # Union{Nothing, ProlongationOp}
 end
 
 function SetupWorkspace{Tv, Ti}() where {Tv, Ti}
@@ -512,6 +514,7 @@ function SetupWorkspace{Tv, Ti}() where {Tv, Ti}
         Ti[], Ti[], Tv[],
         Int[], Int[], Int[],
         Bool[], Int[],
+        nothing,
     )
 end
 

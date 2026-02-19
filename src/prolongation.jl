@@ -363,12 +363,22 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
 
     # Build P using COO format, then convert to CSR
     nnz_hint = nnz(A)
-    I_p = Ti[]
-    J_p = Ti[]
-    V_p = Tv[]
-    sizehint!(I_p, nnz_hint)
-    sizehint!(J_p, nnz_hint)
-    sizehint!(V_p, nnz_hint)
+    if setup_workspace !== nothing
+        I_p = setup_workspace.I_p
+        J_p = setup_workspace.J_p
+        V_p = setup_workspace.V_p
+        empty!(I_p); empty!(J_p); empty!(V_p)
+        sizehint!(I_p, nnz_hint)
+        sizehint!(J_p, nnz_hint)
+        sizehint!(V_p, nnz_hint)
+    else
+        I_p = Ti[]
+        J_p = Ti[]
+        V_p = Tv[]
+        sizehint!(I_p, nnz_hint)
+        sizehint!(J_p, nnz_hint)
+        sizehint!(V_p, nnz_hint)
+    end
 
     @inbounds for i in 1:n_fine
         if cf[i] == 1
@@ -489,30 +499,78 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
     norm_p = interp.norm_p
     do_rescale = interp.rescale
 
-    # Build strength-based sparse matrix S for determining C-hat
-    strong_nbrs = Vector{Vector{Int}}(undef, n_fine)
+    # Build strength-based CSR structure for determining C-hat.
+    # Use flat CSR representation (offsets + data) to avoid allocating Vector{Vector{Int}}.
+    if setup_workspace !== nothing
+        sn_offsets = setup_workspace.strong_nbrs_offsets
+        sn_data = setup_workspace.strong_nbrs_data
+    else
+        sn_offsets = Vector{Int}(undef, n_fine + 1)
+        sn_data = Int[]
+    end
+    resize!(sn_offsets, n_fine + 1)
+    # Count strong neighbors per row
+    @inbounds begin
+        for i in 1:n_fine
+            cnt = 0
+            for nz in nzrange(A, i)
+                j = cv[nz]
+                if j != i && is_strong[nz]
+                    cnt += 1
+                end
+            end
+            sn_offsets[i] = cnt
+        end
+    end
+    # Cumulative sum to build offsets
+    total_sn = 0
     @inbounds for i in 1:n_fine
-        snb = Int[]
-        for nz in nzrange(A, i)
-            j = cv[nz]
-            if j != i && is_strong[nz]
-                push!(snb, j)
+        cnt = sn_offsets[i]
+        sn_offsets[i] = total_sn + 1
+        total_sn += cnt
+    end
+    sn_offsets[n_fine + 1] = total_sn + 1
+    resize!(sn_data, total_sn)
+    # Fill data
+    @inbounds begin
+        pos = 0
+        for i in 1:n_fine
+            for nz in nzrange(A, i)
+                j = cv[nz]
+                if j != i && is_strong[nz]
+                    pos += 1
+                    sn_data[pos] = j
+                end
             end
         end
-        strong_nbrs[i] = snb
     end
 
     # P_marker tracks which coarse points are in C-hat for current row
-    P_marker = fill(-1, n_fine)
+    if setup_workspace !== nothing
+        P_marker = resize!(setup_workspace.P_marker, n_fine)
+        fill!(P_marker, -1)
+    else
+        P_marker = fill(-1, n_fine)
+    end
     strong_f_marker = -2
 
     nnz_hint = nnz(A)
-    I_p = Ti[]
-    J_p = Ti[]
-    V_p = Tv[]
-    sizehint!(I_p, nnz_hint)
-    sizehint!(J_p, nnz_hint)
-    sizehint!(V_p, nnz_hint)
+    if setup_workspace !== nothing
+        I_p = setup_workspace.I_p
+        J_p = setup_workspace.J_p
+        V_p = setup_workspace.V_p
+        empty!(I_p); empty!(J_p); empty!(V_p)
+        sizehint!(I_p, nnz_hint)
+        sizehint!(J_p, nnz_hint)
+        sizehint!(V_p, nnz_hint)
+    else
+        I_p = Ti[]
+        J_p = Ti[]
+        V_p = Tv[]
+        sizehint!(I_p, nnz_hint)
+        sizehint!(J_p, nnz_hint)
+        sizehint!(V_p, nnz_hint)
+    end
     S_p = do_rescale ? Tv[] : nothing  # per-entry scaling factors
     if do_rescale
         sizehint!(S_p, nnz_hint)
@@ -530,7 +588,8 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
         # Also mark strong F neighbors with strong_f_marker
         chat_indices = Int[]  # indices into P arrays for C-hat points
 
-        for j in strong_nbrs[i]
+        for si in sn_offsets[i]:(sn_offsets[i + 1] - 1)
+            j = sn_data[si]
             if cf[j] == 1
                 # j is a strong C neighbor of i
                 if P_marker[j] < 0
@@ -540,7 +599,8 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
             elseif cf[j] == -1
                 # j is a strong F neighbor of i — mark it and add its C neighbors
                 P_marker[j] = strong_f_marker
-                for k in strong_nbrs[j]
+                for sj in sn_offsets[j]:(sn_offsets[j + 1] - 1)
+                    k = sn_data[sj]
                     if cf[k] == 1 && P_marker[k] < 0
                         P_marker[k] = length(chat_indices)
                         push!(chat_indices, k)
@@ -556,11 +616,12 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
             push!(I_p, Ti(i)); push!(J_p, Ti(best_j)); push!(V_p, one(Tv))
             if do_rescale; push!(S_p, one(Tv)); end
             # Reset markers
-            for j in strong_nbrs[i]
+            for si in sn_offsets[i]:(sn_offsets[i + 1] - 1)
+                j = sn_data[si]
                 P_marker[j] = -1
                 if cf[j] == -1
-                    for k in strong_nbrs[j]
-                        P_marker[k] = -1
+                    for sj in sn_offsets[j]:(sn_offsets[j + 1] - 1)
+                        P_marker[sn_data[sj]] = -1
                     end
                 end
             end
@@ -682,22 +743,25 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
         for j in chat_indices
             P_marker[j] = -1
         end
-        for j in strong_nbrs[i]
+        for si in sn_offsets[i]:(sn_offsets[i + 1] - 1)
+            j = sn_data[si]
             P_marker[j] = -1
             if cf[j] == -1
-                for k in strong_nbrs[j]
-                    P_marker[k] = -1
+                for sj in sn_offsets[j]:(sn_offsets[j + 1] - 1)
+                    P_marker[sn_data[sj]] = -1
                 end
             end
         end
         strong_f_marker -= 1
     end
 
-    P = _coo_to_prolongation(I_p, J_p, V_p, n_fine, n_coarse)
     if do_rescale
-        # Attach per-entry scaling factors (sorted with same permutation as nzval)
+        # Compute sort permutation before _coo_to_prolongation mutates I_p/J_p
         perm = sortperm(collect(zip(I_p, J_p)))
+        P = _coo_to_prolongation(I_p, J_p, V_p, n_fine, n_coarse)
         P.trunc_scaling = S_p[perm]
+    else
+        P = _coo_to_prolongation(I_p, J_p, V_p, n_fine, n_coarse)
     end
     return P
 end
@@ -722,8 +786,8 @@ function _find_nearest_coarse(A::CSRMatrix{Tv, Ti}, i::Int,
     return best_j > 0 ? best_j : 1
 end
 
-"""Convert COO format to ProlongationOp (CSR). Sorts in-place using the provided
-arrays (caller should not rely on original order after this call)."""
+"""Convert COO format to ProlongationOp (CSR). The input arrays are sorted
+in-place as workspace; the returned ProlongationOp owns independent copies."""
 function _coo_to_prolongation(I_p::Vector{Ti}, J_p::Vector{Ti}, V_p::Vector{Tv},
                               n_fine::Int, n_coarse::Int) where {Ti, Tv}
     # Sort by (row, col)
@@ -744,7 +808,8 @@ function _coo_to_prolongation(I_p::Vector{Ti}, J_p::Vector{Ti}, V_p::Vector{Tv},
         cumsum += count
     end
     rp[n_fine + 1] = cumsum
-    return ProlongationOp{Ti, Tv}(rp, J_p, V_p, n_fine, n_coarse)
+    # Copy colval/nzval so the ProlongationOp doesn't alias workspace arrays
+    return ProlongationOp{Ti, Tv}(rp, copy(J_p), copy(V_p), n_fine, n_coarse)
 end
 
 """

@@ -465,6 +465,44 @@ mutable struct AMGHierarchy{Tv, Ti<:Integer}
     block_size::Int            # block size for KA kernel launches
     coarse_solve_on_cpu::Bool  # if true, coarse LU solve is always on CPU
     galerkin_workspace::Any    # GalerkinWorkspace, reused across setup/resetup calls
+    setup_workspace::Any       # SetupWorkspace, reused across setup/resetup calls
+end
+
+"""
+    SetupWorkspace{Tv, Ti}
+
+Pre-allocated workspace for coarsening and prolongation building. Stored in the
+hierarchy and reused across setup/resetup calls to avoid repeated allocations in
+hot loops. Arrays are `resize!`'d as needed (they only grow, never shrink).
+"""
+mutable struct SetupWorkspace{Tv, Ti<:Integer}
+    # Coarsening workspace (size n per level)
+    cf::Vector{Int}
+    coarse_map::Vector{Int}
+    measure::Vector{Float64}
+    st_count::Vector{Int}
+    # _build_strong_transpose_adj workspace
+    counts::Vector{Int}
+    offsets::Vector{Int}
+    sources::Vector{Int}
+    pos::Vector{Int}
+    # Bucket sort workspace (RS / HMIS first pass)
+    bucket_head::Vector{Int}
+    bucket_next::Vector{Int}
+    bucket_prev::Vector{Int}
+    # COO accumulation workspace for prolongation building
+    I_p::Vector{Ti}
+    J_p::Vector{Ti}
+    V_p::Vector{Tv}
+end
+
+function SetupWorkspace{Tv, Ti}() where {Tv, Ti}
+    SetupWorkspace{Tv, Ti}(
+        Int[], Int[], Float64[], Int[],
+        Int[], Int[], Int[], Int[],
+        Int[], Int[], Int[],
+        Ti[], Ti[], Tv[],
+    )
 end
 
 # ── AMG Configuration ─────────────────────────────────────────────────────────

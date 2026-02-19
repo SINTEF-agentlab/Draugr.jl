@@ -494,6 +494,10 @@ mutable struct SetupWorkspace{Tv, Ti<:Integer}
     I_p::Vector{Ti}
     J_p::Vector{Ti}
     V_p::Vector{Tv}
+    # Extended interpolation workspace
+    P_marker::Vector{Int}
+    strong_nbrs_offsets::Vector{Int}
+    strong_nbrs_data::Vector{Int}
 end
 
 function SetupWorkspace{Tv, Ti}() where {Tv, Ti}
@@ -502,6 +506,7 @@ function SetupWorkspace{Tv, Ti}() where {Tv, Ti}
         Int[], Int[], Int[], Int[],
         Int[], Int[], Int[],
         Ti[], Ti[], Tv[],
+        Int[], Int[], Int[],
     )
 end
 

@@ -769,7 +769,7 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
         else
             perm = Vector{Int}(undef, nnz_p)
         end
-        sortperm!(perm, 1:nnz_p; by=k -> (I_p[k], J_p[k]))
+        sortperm!(perm, 1:nnz_p; lt=_coo_lt(I_p, J_p))
         permute!(S_p, perm)
         P = _coo_to_prolongation(I_p, J_p, V_p, n_fine, n_coarse; sort_perm=_sort_perm)
         P.trunc_scaling = copy(S_p)
@@ -799,6 +799,18 @@ function _find_nearest_coarse(A::CSRMatrix{Tv, Ti}, i::Int,
     return best_j > 0 ? best_j : 1
 end
 
+"""Sort permutation for COO arrays by (row, col) without tuple allocation."""
+@inline function _coo_lt(I_p, J_p)
+    return (a, b) -> begin
+        @inbounds begin
+            ia = I_p[a]; ib = I_p[b]
+            ia < ib && return true
+            ia > ib && return false
+            return J_p[a] < J_p[b]
+        end
+    end
+end
+
 """Convert COO format to ProlongationOp (CSR). The input arrays are sorted
 in-place as workspace; the returned ProlongationOp owns independent copies.
 `sort_perm` is an optional pre-allocated buffer for sortperm!."""
@@ -813,7 +825,7 @@ function _coo_to_prolongation(I_p::Vector{Ti}, J_p::Vector{Ti}, V_p::Vector{Tv},
     else
         perm = Vector{Int}(undef, nnz_p)
     end
-    sortperm!(perm, 1:nnz_p; by=k -> (I_p[k], J_p[k]))
+    sortperm!(perm, 1:nnz_p; lt=_coo_lt(I_p, J_p))
     permute!(I_p, perm)
     permute!(J_p, perm)
     permute!(V_p, perm)

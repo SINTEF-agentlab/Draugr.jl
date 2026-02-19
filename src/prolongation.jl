@@ -493,7 +493,6 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
     strong_nbrs = Vector{Vector{Int}}(undef, n_fine)
     @inbounds for i in 1:n_fine
         snb = Int[]
-        sizehint!(snb, 8)
         for nz in nzrange(A, i)
             j = cv[nz]
             if j != i && is_strong[nz]

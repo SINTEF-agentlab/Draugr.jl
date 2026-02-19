@@ -498,6 +498,10 @@ mutable struct SetupWorkspace{Tv, Ti<:Integer}
     P_marker::Vector{Int}
     strong_nbrs_offsets::Vector{Int}
     strong_nbrs_data::Vector{Int}
+    # Strength graph buffer (reused across calls)
+    is_strong::Vector{Bool}
+    # Sort permutation buffer (reused across sortperm! calls)
+    sort_perm::Vector{Int}
 end
 
 function SetupWorkspace{Tv, Ti}() where {Tv, Ti}
@@ -507,6 +511,7 @@ function SetupWorkspace{Tv, Ti}() where {Tv, Ti}
         Int[], Int[], Int[],
         Ti[], Ti[], Tv[],
         Int[], Int[], Int[],
+        Bool[], Int[],
     )
 end
 

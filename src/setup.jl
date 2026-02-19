@@ -141,13 +141,29 @@ function _build_levels!(levels::Vector{AMGLevel{Tv, Ti}},
         n = size(A_current, 1)
         n <= config.max_coarse_size && break
         coarsening_alg = _get_coarsening_for_level(config, lvl)
+        # Set old_P in workspace for array reuse during prolongation building (CPU only)
+        old_lvl = lvl <= length(old_levels) ? old_levels[lvl] : nothing
+        if setup_workspace !== nothing
+            if old_lvl !== nothing && !is_gpu && old_lvl.P.colval isa Vector
+                setup_workspace.old_P = old_lvl.P
+            else
+                setup_workspace.old_P = nothing
+            end
+        end
         P, n_coarse = _coarsen_with_fallback(A_current, coarsening_alg, config; backend=backend, block_size=block_size, setup_workspace=setup_workspace)
         n_coarse >= n && break
         n_coarse == 0 && break
         A_cpu = csr_to_cpu(A_current)
-        A_coarse, r_map = compute_coarse_sparsity(A_cpu, P, n_coarse; build_restriction_map=allow_partial_resetup, workspace=galerkin_workspace)
+        # Get old A_coarse for array reuse (stored as next level's A, CPU only)
+        old_A_coarse = nothing
+        if !is_gpu && lvl + 1 <= length(old_levels)
+            old_A_c = old_levels[lvl + 1].A
+            if old_A_c.nzval isa Vector
+                old_A_coarse = old_A_c
+            end
+        end
+        A_coarse, r_map = compute_coarse_sparsity(A_cpu, P, n_coarse; build_restriction_map=allow_partial_resetup, workspace=galerkin_workspace, old_A_coarse=old_A_coarse)
         Pt_map = build_transpose_map(P)
-        old_lvl = lvl <= length(old_levels) ? old_levels[lvl] : nothing
         if is_gpu
             A_dev = _csr_to_device(A_ref, A_cpu)
             P_dev = _prolongation_to_device(A_ref, P)

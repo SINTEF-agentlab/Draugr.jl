@@ -266,7 +266,8 @@ function coarsen_pmis(A_in::CSRMatrix{Tv, Ti}, θ::Real;
         return ones(Int, n), collect(1:n), n
     end
     # Compute strength on GPU if available, then convert to CPU for graph algorithms
-    is_strong_raw = strength_graph(A_in, θ; backend=backend, block_size=block_size)
+    is_strong_raw = strength_graph(A_in, θ; backend=backend, block_size=block_size,
+        is_strong=setup_workspace !== nothing ? setup_workspace.is_strong : nothing)
     is_strong = is_strong_raw isa Array ? is_strong_raw : Array(is_strong_raw)
     A = csr_to_cpu(A_in)
     cv = colvals(A)
@@ -409,7 +410,8 @@ function coarsen_hmis(A_in::CSRMatrix{Tv, Ti}, θ::Real;
         return ones(Int, n), collect(1:n), n
     end
     # Compute strength on GPU if available, then convert to CPU for graph algorithms
-    is_strong_raw = strength_graph(A_in, θ; backend=backend, block_size=block_size)
+    is_strong_raw = strength_graph(A_in, θ; backend=backend, block_size=block_size,
+        is_strong=setup_workspace !== nothing ? setup_workspace.is_strong : nothing)
     is_strong = is_strong_raw isa Array ? is_strong_raw : Array(is_strong_raw)
     A = csr_to_cpu(A_in)
     cv = colvals(A)
@@ -726,7 +728,8 @@ function coarsen_rs(A_in::CSRMatrix{Tv, Ti}, θ::Real;
         return ones(Int, n), collect(1:n), n
     end
     # Compute strength on GPU if available, then convert to CPU for graph algorithms
-    is_strong_raw = strength_graph(A_in, θ; backend=backend, block_size=block_size)
+    is_strong_raw = strength_graph(A_in, θ; backend=backend, block_size=block_size,
+        is_strong=setup_workspace !== nothing ? setup_workspace.is_strong : nothing)
     is_strong = is_strong_raw isa Array ? is_strong_raw : Array(is_strong_raw)
     A = csr_to_cpu(A_in)
     cv = colvals(A)
@@ -1052,7 +1055,8 @@ function coarsen_aggressive_cf(A_in::CSRMatrix{Tv, Ti}, θ::Real, base::Symbol;
     # Second pass: among C-points from first pass, do another CF-splitting
     # using distance-2 strong connections to further reduce the coarse set.
     # Compute strength on GPU if available, then convert to CPU for graph algorithms
-    is_strong_raw = strength_graph(A_eff, θ; backend=backend, block_size=block_size)
+    is_strong_raw = strength_graph(A_eff, θ; backend=backend, block_size=block_size,
+        is_strong=setup_workspace !== nothing ? setup_workspace.is_strong : nothing)
     is_strong = is_strong_raw isa Array ? is_strong_raw : Array(is_strong_raw)
     A_eff = csr_to_cpu(A_eff)
     cv = colvals(A_eff)

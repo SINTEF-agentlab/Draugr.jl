@@ -433,27 +433,27 @@ end
 """
     ProlongationUpdateMap{Ti, Vi}
 
-Stores the data needed to recompute prolongation operator values in-place
-during resetup with `update_P=true`. This enables fast resetup where the
-sparsity pattern of P is preserved but values are recomputed based on
-the new matrix coefficients.
+Stores precomputed index mappings for GPU-compatible in-place update of
+prolongation operator values during resetup with `update_P=true`.
 
-For CF-splitting based methods (PMIS, HMIS, RS), this stores:
-- `cf`: coarse-fine split array (cf[i]=1 for coarse, cf[i]=-1 for fine)
-- `coarse_map`: fine-to-coarse index mapping
-- `n_coarse`: number of coarse points
-- `θ`: strength threshold used during setup
-- `interp_type`: interpolation type (Direct, Standard, ExtendedI)
+For **Direct interpolation**, each P entry k has:
+- `numer_idx[k]`: index into A.nzval for the numerator A[i,j], or 0 for coarse points
+- `denom_offsets[k]:denom_offsets[k+1]-1`: range of indices into `denom_entries`
+- `denom_entries[...]`: indices into A.nzval that sum to form denominator d_i
 
-This allows recomputing the interpolation weights without re-doing the
-expensive CF-splitting phase.
+The update formula is:
+- Coarse points (numer_idx[k] == 0): P.nzval[k] = 1
+- Fine points: P.nzval[k] = -A.nzval[numer_idx[k]] / d_i
+  where d_i = Σ A.nzval[denom_entries[j]] for j in denom range
+
+This stores all classification decisions (strength graph, CF-split) from the
+original setup, so the update only reads new A values at stored indices.
 """
-struct ProlongationUpdateMap{Ti<:Integer}
-    cf::Vector{Int}              # coarse-fine split (CPU)
-    coarse_map::Vector{Int}      # fine-to-coarse mapping (CPU)
-    n_coarse::Int                # number of coarse points
-    θ::Float64                   # strength threshold
-    interp_type::InterpolationType  # interpolation type tag
+struct ProlongationUpdateMap{Ti<:Integer, Vi<:AbstractVector{Ti}}
+    # For each P.nzval entry k:
+    numer_idx::Vi         # A.nzval index for numerator, or 0 for coarse points
+    denom_offsets::Vi     # offset array: nnz_P + 1 entries
+    denom_entries::Vi     # A.nzval indices for denominator terms
 end
 
 # ── AMG Level ─────────────────────────────────────────────────────────────────

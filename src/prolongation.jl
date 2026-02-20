@@ -308,9 +308,6 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
             end
         else
             diag_sign = diag_positive[i] ? 1 : -1
-            if diag_sign == 0
-                diag_sign = 1  # fallback
-            end
             # Collect strong coarse columns and denominator entries
             strong_coarse_cols = Vector{Ti}()
             strong_coarse_nz_idx = Vector{Ti}()  # A.nzval indices for numerators
@@ -323,7 +320,7 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                     push!(denom_nz_idx, Ti(nz))
                 else
                     is_interp_coarse = is_strong[nz] && cf[j] == 1 &&
-                        (diag_sign == 0 || sign(real(nzv[nz])) != diag_sign)
+                        sign(real(nzv[nz])) != diag_sign
                     if is_interp_coarse
                         push!(strong_coarse_cols, Ti(coarse_map[j]))
                         push!(strong_coarse_nz_idx, Ti(nz))

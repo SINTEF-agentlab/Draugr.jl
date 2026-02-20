@@ -97,7 +97,7 @@ function Draugr.amg_setup(A::StaticSparsityMatrixCSR{Tv, Ti}, config::AMGConfig=
 end
 
 """
-    amg_resetup!(hierarchy, A_new::StaticSparsityMatrixCSR, config)
+    amg_resetup!(hierarchy, A_new::StaticSparsityMatrixCSR, config; partial=true, update_P=false)
 
 External API entry point for StaticSparsityMatrixCSR resetup. Converts to the
 internal `CSRMatrix` and forwards to the main `CSRMatrix`-based resetup.
@@ -105,9 +105,10 @@ internal `CSRMatrix` and forwards to the main `CSRMatrix`-based resetup.
 function Draugr.amg_resetup!(hierarchy::AMGHierarchy{Tv, Ti},
                                   A_new::StaticSparsityMatrixCSR{Tv, Ti},
                                   config::AMGConfig=AMGConfig();
-                                  partial::Bool=true) where {Tv, Ti}
+                                  partial::Bool=true,
+                                  update_P::Bool=false) where {Tv, Ti}
     A_csr = Draugr.csr_from_static(A_new)
-    return Draugr.amg_resetup!(hierarchy, A_csr, config; partial=partial)
+    return Draugr.amg_resetup!(hierarchy, A_csr, config; partial=partial, update_P=update_P)
 end
 
 # ── Smoother wrappers for StaticSparsityMatrixCSR ────────────────────────────

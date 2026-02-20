@@ -1,139 +1,82 @@
 """
-    GalerkinWorkspace{Ti}
+    GalerkinWorkspace{Tv, Ti}
 
 Pre-allocated workspace for `compute_coarse_sparsity` to avoid repeated memory
 allocation during resetup.  Create once and pass via the `workspace` keyword.
+All arrays use grow-only semantics (via `_ws_resize!`) so they remain at their
+high-water mark across levels and resetup calls.
 """
-mutable struct GalerkinWorkspace{Ti<:Integer}
-    raw_I::Vector{Ti}
-    raw_J::Vector{Ti}
-    raw_ci::Vector{Ti}
-    raw_pi::Vector{Ti}
-    raw_ai::Vector{Ti}
-    raw_pj::Vector{Ti}
-    perm::Vector{Ti}
+mutable struct GalerkinWorkspace{Tv, Ti<:Integer}
+    col_marker::Vector{Ti}       # generation-based column marker (n_coarse)
+    col_list::Vector{Ti}         # unique columns in current row (n_coarse)
+    val_acc::Vector{Tv}          # dense value accumulator (n_coarse)
+    unique_per_row::Vector{Ti}   # unique column count per row (n_coarse)
+    nz_counts::Vector{Ti}        # triple count per NZ (nnz_c, restriction map only)
+    nz_pos::Vector{Ti}           # fill position per NZ (nnz_c, restriction map only)
 end
 
-GalerkinWorkspace{Ti}() where {Ti} = GalerkinWorkspace{Ti}(Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[])
+GalerkinWorkspace{Tv, Ti}() where {Tv, Ti} = GalerkinWorkspace{Tv, Ti}(Ti[], Ti[], Tv[], Ti[], Ti[], Ti[])
 
 """
-    compute_coarse_sparsity(A_fine, P, n_coarse)
+    compute_coarse_sparsity(A_fine, P, Pt_map, n_coarse)
 
 Determine the sparsity pattern of the coarse grid operator A_c = P^T A_f P.
 Returns a CSRMatrix with the correct structure and values,
 and a RestrictionMap for in-place updates.
+
+Uses the pre-computed TransposeMap (`Pt_map`) to iterate by coarse row,
+avoiding flat triple arrays entirely (O(n_coarse) workspace instead of
+O(ntriples)).
 
 The RestrictionMap groups triples by their destination coarse NZ index so that
 `galerkin_product!` can parallelize over coarse NZ entries without atomics.
 """
 function compute_coarse_sparsity(A_fine::CSRMatrix{Tv, Ti},
                                  P::ProlongationOp{Ti, Tv},
+                                 Pt_map::TransposeMap,
                                  n_coarse::Int;
                                  build_restriction_map::Bool=true,
-                                 workspace::Union{Nothing, GalerkinWorkspace{Ti}}=nothing,
+                                 workspace::Union{Nothing, GalerkinWorkspace{Tv, Ti}}=nothing,
                                  old_A_coarse::Union{Nothing, CSRMatrix}=nothing) where {Tv, Ti}
     n_fine = size(A_fine, 1)
     cv_a = colvals(A_fine)
     nzv_a = nonzeros(A_fine)
 
-    # Pre-compute exact triple count to avoid conservative sizehints and reallocations
-    ntriples = 0
-    @inbounds for i in 1:n_fine
-        p_count_i = Int(P.rowptr[i+1] - P.rowptr[i])
-        for anz in nzrange(A_fine, i)
-            j = cv_a[anz]
-            p_count_j = Int(P.rowptr[j+1] - P.rowptr[j])
-            ntriples += p_count_i * p_count_j
-        end
-    end
-
-    # Phase 1: Collect all (I, J) coarse row-column pairs and triple indices.
-    # We store the coarse row I of each triple to build the CSR structure.
-    # Reuse workspace arrays when available to avoid reallocation during resetup.
+    # Workspace arrays (all n_coarse-sized, grow-only)
     if workspace !== nothing
-        raw_I = resize!(workspace.raw_I, ntriples)
-        raw_J = resize!(workspace.raw_J, ntriples)
-        raw_pi = resize!(workspace.raw_pi, ntriples)
-        raw_ai = resize!(workspace.raw_ai, ntriples)
-        raw_pj = resize!(workspace.raw_pj, ntriples)
-        perm = resize!(workspace.perm, ntriples)
-        if build_restriction_map
-            raw_ci = resize!(workspace.raw_ci, ntriples)
-        end
+        col_marker = _ws_resize!(workspace.col_marker, n_coarse)
+        col_list = _ws_resize!(workspace.col_list, n_coarse)
+        val_acc = _ws_resize!(workspace.val_acc, n_coarse)
+        unique_per_row = _ws_resize!(workspace.unique_per_row, n_coarse)
     else
-        raw_I = Vector{Ti}(undef, ntriples)
-        raw_J = Vector{Ti}(undef, ntriples)
-        raw_pi = Vector{Ti}(undef, ntriples)
-        raw_ai = Vector{Ti}(undef, ntriples)
-        raw_pj = Vector{Ti}(undef, ntriples)
-        perm = Vector{Ti}(undef, ntriples)
-        if build_restriction_map
-            raw_ci = Vector{Ti}(undef, ntriples)
-        end
+        col_marker = Vector{Ti}(undef, n_coarse)
+        col_list = Vector{Ti}(undef, n_coarse)
+        val_acc = Vector{Tv}(undef, n_coarse)
+        unique_per_row = Vector{Ti}(undef, n_coarse)
     end
-    idx = 0
-    @inbounds for i in 1:n_fine
-        for pnz_i in P.rowptr[i]:(P.rowptr[i+1]-1)
-            I = P.colval[pnz_i]
+    @inbounds for k in 1:n_coarse
+        col_marker[k] = zero(Ti)
+    end
+    marker_gen = zero(Ti)
+
+    # Pass 1: Count unique columns per coarse row (iterate via Pt_map).
+    @inbounds for I in 1:n_coarse
+        marker_gen += one(Ti)
+        nuniq = zero(Ti)
+        for ptr in Pt_map.offsets[I]:(Pt_map.offsets[I+1]-1)
+            i = Pt_map.fine_rows[ptr]
             for anz in nzrange(A_fine, i)
                 j = cv_a[anz]
-                for pnz_j in P.rowptr[j]:(P.rowptr[j+1]-1)
+                for pnz_j in P.rowptr[j]:(P.rowptr[j+1]-one(Ti))
                     J = P.colval[pnz_j]
-                    idx += 1
-                    raw_I[idx] = I
-                    raw_J[idx] = J
-                    raw_pi[idx] = Ti(pnz_i)
-                    raw_ai[idx] = Ti(anz)
-                    raw_pj[idx] = Ti(pnz_j)
+                    if col_marker[J] != marker_gen
+                        col_marker[J] = marker_gen
+                        nuniq += one(Ti)
+                    end
                 end
             end
         end
-    end
-
-    # Phase 2: Determine unique (I, J) pairs and build the coarse CSR structure.
-    # First count how many triples fall into each coarse row.
-    row_counts = zeros(Ti, n_coarse)
-    @inbounds for t in 1:ntriples
-        row_counts[raw_I[t]] += one(Ti)
-    end
-
-    # Build rowptr for a temporary row-sorted ordering
-    rowptr_tmp = Vector{Ti}(undef, n_coarse + 1)
-    rowptr_tmp[1] = one(Ti)
-    @inbounds for i in 1:n_coarse
-        rowptr_tmp[i+1] = rowptr_tmp[i] + row_counts[i]
-    end
-
-    # Sort triples by coarse row using a counting sort
-    pos = copy(rowptr_tmp[1:n_coarse])
-    @inbounds for t in 1:ntriples
-        row = raw_I[t]
-        perm[pos[row]] = Ti(t)
-        pos[row] += one(Ti)
-    end
-
-    # Phase 2: Build coarse CSR structure using a sparse row accumulator.
-    # Instead of sorting all triples within each row by column (expensive when
-    # triples >> unique columns), we use a generation-based marker to discover
-    # unique columns and a dense accumulator for values.  Only the unique column
-    # list (much smaller than the number of triples) needs to be sorted.
-    col_marker = zeros(Ti, n_coarse)   # generation-based "seen" marker per column
-    col_list = Vector{Ti}(undef, n_coarse)  # unique columns found in current row
-    marker_gen = zero(Ti)
-
-    # First pass: count unique columns per row
-    unique_per_row = zeros(Ti, n_coarse)
-    @inbounds for row in 1:n_coarse
-        marker_gen += one(Ti)
-        nuniq = zero(Ti)
-        for k in rowptr_tmp[row]:(rowptr_tmp[row+1] - one(Ti))
-            col = raw_J[perm[k]]
-            if col_marker[col] != marker_gen
-                col_marker[col] = marker_gen
-                nuniq += one(Ti)
-            end
-        end
-        unique_per_row[row] = nuniq
+        unique_per_row[I] = nuniq
     end
 
     # Build coarse CSR rowptr — reuse old_A_coarse arrays when available
@@ -156,46 +99,64 @@ function compute_coarse_sparsity(A_fine::CSRMatrix{Tv, Ti},
         rowptr_c[i+1] = rowptr_c[i] + unique_per_row[i]
     end
 
-    # Second pass: fill colval_c and nzval_c using sparse accumulator,
-    # then optionally map triples to NZ indices for the restriction map.
-    # NOTE: marker_gen continues from the first pass (not reset) so generation
-    # values in col_marker from the first pass cannot collide with second-pass values.
-    val_acc = Vector{Tv}(undef, n_coarse)  # dense value accumulator (only touched entries are read)
+    # For restriction map: prepare per-NZ triple counts
+    if build_restriction_map
+        if workspace !== nothing
+            nz_counts = _ws_resize!(workspace.nz_counts, Int(nnz_c))
+        else
+            nz_counts = Vector{Ti}(undef, Int(nnz_c))
+        end
+        @inbounds for k in 1:Int(nnz_c)
+            nz_counts[k] = zero(Ti)
+        end
+    end
 
-    @inbounds for row in 1:n_coarse
+    # Pass 2: Fill colval_c and nzval_c using sparse row accumulator,
+    # and count triples per NZ for the restriction map.
+    @inbounds for I in 1:n_coarse
         marker_gen += one(Ti)
         nuniq = zero(Ti)
-        rs = rowptr_tmp[row]
-        re = rowptr_tmp[row+1] - one(Ti)
-        # Discover unique columns and accumulate values
-        for k in rs:re
-            t = perm[k]
-            col = raw_J[t]
-            if col_marker[col] != marker_gen
-                col_marker[col] = marker_gen
-                nuniq += one(Ti)
-                col_list[nuniq] = col
-                val_acc[col] = zero(Tv)
+        for ptr in Pt_map.offsets[I]:(Pt_map.offsets[I+1]-1)
+            i = Pt_map.fine_rows[ptr]
+            pi_nz = Pt_map.p_nz_idx[ptr]
+            for anz in nzrange(A_fine, i)
+                j = cv_a[anz]
+                for pnz_j in P.rowptr[j]:(P.rowptr[j+1]-one(Ti))
+                    J = P.colval[pnz_j]
+                    if col_marker[J] != marker_gen
+                        col_marker[J] = marker_gen
+                        nuniq += one(Ti)
+                        col_list[nuniq] = J
+                        val_acc[J] = zero(Tv)
+                    end
+                    val_acc[J] += P.nzval[pi_nz] * nzv_a[anz] * P.nzval[pnz_j]
+                end
             end
-            val_acc[col] += P.nzval[raw_pi[t]] * nzv_a[raw_ai[t]] * P.nzval[raw_pj[t]]
         end
         # Sort only the unique columns (much fewer than triples)
         sort!(view(col_list, 1:Int(nuniq)), alg=Base.Sort.InsertionSort)
         # Fill CSR row
-        csr_pos = rowptr_c[row]
-        for i in one(Ti):nuniq
-            col = col_list[i]
+        csr_pos = rowptr_c[I]
+        for k in one(Ti):nuniq
+            col = col_list[k]
             colval_c[csr_pos] = col
             nzval_c[csr_pos] = val_acc[col]
             csr_pos += one(Ti)
         end
-        # Map each triple to its coarse NZ index via binary search (only for restriction map)
+        # Count triples per NZ for restriction map (binary search per triple)
         if build_restriction_map
-            csr_start = rowptr_c[row]
-            csr_end = rowptr_c[row+1] - one(Ti)
-            for k in rs:re
-                t = perm[k]
-                raw_ci[t] = _find_nz_in_row(colval_c, csr_start, csr_end, raw_J[t])
+            csr_start = rowptr_c[I]
+            csr_end = rowptr_c[I+1] - one(Ti)
+            for ptr in Pt_map.offsets[I]:(Pt_map.offsets[I+1]-1)
+                i = Pt_map.fine_rows[ptr]
+                for anz in nzrange(A_fine, i)
+                    j = cv_a[anz]
+                    for pnz_j in P.rowptr[j]:(P.rowptr[j+1]-one(Ti))
+                        J = P.colval[pnz_j]
+                        nz_idx = _find_nz_in_row(colval_c, csr_start, csr_end, J)
+                        nz_counts[nz_idx] += one(Ti)
+                    end
+                end
             end
         end
     end
@@ -206,37 +167,54 @@ function compute_coarse_sparsity(A_fine::CSRMatrix{Tv, Ti},
         return A_coarse, nothing
     end
 
-    # Phase 3: Group triples by coarse NZ destination for contention-free parallel resetup.
-    # Sort triples by their coarse NZ index so each output entry owns a contiguous
-    # range of contributing triples.
-    # Reuse perm buffer for sortperm! to avoid extra allocation.
-    sortperm!(perm, raw_ci)
+    # Phase 3: Build RestrictionMap by filling triple arrays.
+    # Build offset array from nz_counts.
+    nz_offsets = Vector{Ti}(undef, Int(nnz_c) + 1)
+    cumsum_val = one(Ti)
+    for k in 1:Int(nnz_c)
+        nz_offsets[k] = cumsum_val
+        cumsum_val += nz_counts[k]
+    end
+    nz_offsets[Int(nnz_c) + 1] = cumsum_val
+    ntriples = Int(cumsum_val) - 1
 
-    # Copy permuted triple indices for the RestrictionMap (the originals may be
-    # workspace-owned and will be reused on the next call).
+    # Allocate triple arrays
     map_pi = Vector{Ti}(undef, ntriples)
     map_ai = Vector{Ti}(undef, ntriples)
     map_pj = Vector{Ti}(undef, ntriples)
-    @inbounds for i in 1:ntriples
-        p = perm[i]
-        map_pi[i] = raw_pi[p]
-        map_ai[i] = raw_ai[p]
-        map_pj[i] = raw_pj[p]
+
+    # Fill position counters (reuse nz_counts or workspace)
+    if workspace !== nothing
+        nz_pos = _ws_resize!(workspace.nz_pos, Int(nnz_c))
+    else
+        nz_pos = Vector{Ti}(undef, Int(nnz_c))
+    end
+    @inbounds for k in 1:Int(nnz_c)
+        nz_pos[k] = nz_offsets[k]
     end
 
-    # Build an offset array: nz_offsets[k] to nz_offsets[k+1]-1 = triples for coarse NZ k
-    nz_offsets = Vector{Ti}(undef, nnz_c + 1)
-    fill!(nz_offsets, Ti(0))
-    @inbounds for t in 1:ntriples
-        nz_offsets[raw_ci[perm[t]]] += Ti(1)
+    # Pass 3: Fill triple arrays (iterate by coarse row, binary search for NZ index)
+    @inbounds for I in 1:n_coarse
+        csr_start = rowptr_c[I]
+        csr_end = rowptr_c[I+1] - one(Ti)
+        for ptr in Pt_map.offsets[I]:(Pt_map.offsets[I+1]-1)
+            i = Pt_map.fine_rows[ptr]
+            pi_nz = Pt_map.p_nz_idx[ptr]
+            for anz in nzrange(A_fine, i)
+                j = cv_a[anz]
+                for pnz_j in P.rowptr[j]:(P.rowptr[j+1]-one(Ti))
+                    J = P.colval[pnz_j]
+                    nz_idx = _find_nz_in_row(colval_c, csr_start, csr_end, J)
+                    p = nz_pos[nz_idx]
+                    map_pi[p] = Ti(pi_nz)
+                    map_ai[p] = Ti(anz)
+                    map_pj[p] = Ti(pnz_j)
+                    nz_pos[nz_idx] += one(Ti)
+                end
+            end
+        end
     end
-    cumsum_val = Ti(1)
-    for k in 1:nnz_c
-        cnt = nz_offsets[k]
-        nz_offsets[k] = cumsum_val
-        cumsum_val += cnt
-    end
-    nz_offsets[nnz_c + 1] = cumsum_val
+
     r_map = RestrictionMap(nz_offsets, map_pi, map_ai, map_pj)
     return A_coarse, r_map
 end

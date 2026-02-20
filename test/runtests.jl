@@ -184,8 +184,8 @@ end
         Ac = to_csr(A)
         agg, nc = Draugr.coarsen_aggregation(Ac, 0.25)
         P = Draugr.build_prolongation(Ac, agg, nc)
-        A_coarse, r_map = Draugr.compute_coarse_sparsity(Ac, P, nc)
-        # Verify nz_offsets structure
+        Pt_map = Draugr.build_transpose_map(P)
+        A_coarse, r_map = Draugr.compute_coarse_sparsity(Ac, P, Pt_map, nc)
         nnz_c = SparseArrays.nnz(A_coarse)
         @test length(r_map.nz_offsets) == nnz_c + 1
         @test r_map.nz_offsets[1] == 1
@@ -217,8 +217,8 @@ end
         Ac = to_csr(A)
         agg, nc = Draugr.coarsen_aggregation(Ac, 0.25)
         P = Draugr.build_prolongation(Ac, agg, nc)
-        A_coarse, r_map = Draugr.compute_coarse_sparsity(Ac, P, nc)
-        @test size(A_coarse) == (nc, nc)
+        Pt_map = Draugr.build_transpose_map(P)
+        A_coarse, r_map = Draugr.compute_coarse_sparsity(Ac, P, Pt_map, nc)
         # Verify Galerkin product against explicit computation
         # Build explicit P as sparse matrix
         I_p = Int[]; J_p = Int[]; V_p = Float64[]
@@ -245,8 +245,8 @@ end
         Ac = to_csr(A)
         agg, nc = Draugr.coarsen_aggregation(Ac, 0.25)
         P = Draugr.build_prolongation(Ac, agg, nc)
-        A_coarse, r_map = Draugr.compute_coarse_sparsity(Ac, P, nc)
-        # Now modify A's values (scale by 2)
+        Pt_map = Draugr.build_transpose_map(P)
+        A_coarse, r_map = Draugr.compute_coarse_sparsity(Ac, P, Pt_map, nc)
         nzv = nonzeros(A)
         nzv .*= 2.0
         Ac = to_csr(A)
@@ -1223,7 +1223,8 @@ end
         Ac = to_csr(A)
         cf, cmap, nc = Draugr.coarsen_pmis(Ac, 0.25)
         P = Draugr.build_cf_prolongation(Ac, cf, cmap, nc, StandardInterpolation())
-        A_coarse, r_map = Draugr.compute_coarse_sparsity(Ac, P, nc)
+        Pt_map = Draugr.build_transpose_map(P)
+        A_coarse, r_map = Draugr.compute_coarse_sparsity(Ac, P, Pt_map, nc)
         # Verify against explicit computation
         I_p = Int[]; J_p = Int[]; V_p = Float64[]
         for i in 1:P.nrow

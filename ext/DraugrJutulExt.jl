@@ -92,10 +92,8 @@ External API entry point: convert `StaticSparsityMatrixCSR` to `CSRMatrix` once
 and forward to the general CSRMatrix-based setup.
 """
 function Draugr.amg_setup(A::StaticSparsityMatrixCSR{Tv, Ti}, config::AMGConfig=AMGConfig();
-                               backend=Draugr.DEFAULT_BACKEND, block_size::Int=64,
-                               allow_partial_resetup::Bool=true) where {Tv, Ti}
-    return Draugr.amg_setup(Draugr.csr_from_static(A), config; backend=backend, block_size=block_size,
-                            allow_partial_resetup=allow_partial_resetup)
+                               backend=Draugr.DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
+    return Draugr.amg_setup(Draugr.csr_from_static(A), config; backend=backend, block_size=block_size)
 end
 
 """
@@ -107,11 +105,9 @@ internal `CSRMatrix` and forwards to the main `CSRMatrix`-based resetup.
 function Draugr.amg_resetup!(hierarchy::AMGHierarchy{Tv, Ti},
                                   A_new::StaticSparsityMatrixCSR{Tv, Ti},
                                   config::AMGConfig=AMGConfig();
-                                  partial::Bool=true,
-                                  allow_partial_resetup::Bool=true) where {Tv, Ti}
+                                  partial::Bool=true) where {Tv, Ti}
     A_csr = Draugr.csr_from_static(A_new)
-    return Draugr.amg_resetup!(hierarchy, A_csr, config; partial=partial,
-                               allow_partial_resetup=allow_partial_resetup)
+    return Draugr.amg_resetup!(hierarchy, A_csr, config; partial=partial)
 end
 
 # ── Smoother wrappers for StaticSparsityMatrixCSR ────────────────────────────

@@ -196,8 +196,9 @@ Build a prolongation operator from a CF-splitting using the specified interpolat
 function build_cf_prolongation(A::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                                coarse_map::Vector{Int}, n_coarse::Int,
                                interp::InterpolationType, θ::Real=0.25;
-                               backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
-    return _build_interpolation(A, cf, coarse_map, n_coarse, interp, θ; backend=backend, block_size=block_size)
+                               backend=DEFAULT_BACKEND, block_size::Int=64,
+                               setup_workspace=nothing) where {Tv, Ti}
+    return _build_interpolation(A, cf, coarse_map, n_coarse, interp, θ; backend=backend, block_size=block_size, setup_workspace=setup_workspace)
 end
 
 # ── Direct interpolation ─────────────────────────────────────────────────────
@@ -219,9 +220,11 @@ d_i = a_{i,i} + Σ_{k ∈ weak ∪ F_i^s ∪ same_sign} a_{i,k}.
 function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                               coarse_map::Vector{Int}, n_coarse::Int,
                               ::DirectInterpolation, θ::Real=0.25;
-                              backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
+                              backend=DEFAULT_BACKEND, block_size::Int=64,
+                              setup_workspace=nothing) where {Tv, Ti}
     # Compute strength on GPU if available, then convert to CPU for graph algorithms
-    is_strong_raw = strength_graph(A_in, θ; backend=backend, block_size=block_size)
+    is_strong_raw = strength_graph(A_in, θ; backend=backend, block_size=block_size,
+        is_strong=setup_workspace !== nothing ? setup_workspace.is_strong : nothing)
     is_strong = is_strong_raw isa Array ? is_strong_raw : Array(is_strong_raw)
     A = csr_to_cpu(A_in)
     n_fine = size(A, 1)
@@ -260,16 +263,22 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
         end
     end
 
-    # Build rowptr
+    # Build rowptr — reuse old_P arrays when available
     total_nnz = sum(row_counts)
-    rp = Vector{Ti}(undef, n_fine + 1)
+    old_P_reuse = setup_workspace !== nothing ? setup_workspace.old_P : nothing
+    if old_P_reuse !== nothing && old_P_reuse.colval isa Vector
+        rp = resize!(old_P_reuse.rowptr, n_fine + 1)
+        cval = resize!(old_P_reuse.colval, total_nnz)
+        nzv_p = resize!(old_P_reuse.nzval, total_nnz)
+    else
+        rp = Vector{Ti}(undef, n_fine + 1)
+        cval = Vector{Ti}(undef, total_nnz)
+        nzv_p = Vector{Tv}(undef, total_nnz)
+    end
     rp[1] = Ti(1)
     for i in 1:n_fine
         rp[i+1] = rp[i] + Ti(row_counts[i])
     end
-
-    cval = Vector{Ti}(undef, total_nnz)
-    nzv_p = Vector{Tv}(undef, total_nnz)
 
     # Second pass: fill entries
     @inbounds for i in 1:n_fine
@@ -331,7 +340,17 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
         end
     end
 
-    return ProlongationOp{Ti, Tv}(rp, cval, nzv_p, n_fine, n_coarse)
+    if old_P_reuse !== nothing && old_P_reuse.colval isa Vector
+        old_P_reuse.nrow = n_fine
+        old_P_reuse.ncol = n_coarse
+        old_P_reuse.trunc_scaling = nothing
+        if setup_workspace !== nothing
+            setup_workspace.old_P = nothing
+        end
+        return old_P_reuse
+    else
+        return ProlongationOp{Ti, Tv}(rp, cval, nzv_p, n_fine, n_coarse)
+    end
 end
 
 # ── Standard (Classical) interpolation ───────────────────────────────────────
@@ -349,9 +368,11 @@ where d_i = a_{i,i} + Σ_{k∈weak} a_{i,k}
 function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                               coarse_map::Vector{Int}, n_coarse::Int,
                               ::StandardInterpolation, θ::Real=0.25;
-                              backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
+                              backend=DEFAULT_BACKEND, block_size::Int=64,
+                              setup_workspace=nothing) where {Tv, Ti}
     # Compute strength on GPU if available, then convert to CPU for graph algorithms
-    is_strong_raw = strength_graph(A_in, θ; backend=backend, block_size=block_size)
+    is_strong_raw = strength_graph(A_in, θ; backend=backend, block_size=block_size,
+        is_strong=setup_workspace !== nothing ? setup_workspace.is_strong : nothing)
     is_strong = is_strong_raw isa Array ? is_strong_raw : Array(is_strong_raw)
     A = csr_to_cpu(A_in)
     n_fine = size(A, 1)
@@ -359,9 +380,23 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
     nzv = nonzeros(A)
 
     # Build P using COO format, then convert to CSR
-    I_p = Ti[]
-    J_p = Ti[]
-    V_p = Tv[]
+    nnz_hint = nnz(A)
+    if setup_workspace !== nothing
+        I_p = setup_workspace.I_p
+        J_p = setup_workspace.J_p
+        V_p = setup_workspace.V_p
+        empty!(I_p); empty!(J_p); empty!(V_p)
+        sizehint!(I_p, nnz_hint)
+        sizehint!(J_p, nnz_hint)
+        sizehint!(V_p, nnz_hint)
+    else
+        I_p = Ti[]
+        J_p = Ti[]
+        V_p = Tv[]
+        sizehint!(I_p, nnz_hint)
+        sizehint!(J_p, nnz_hint)
+        sizehint!(V_p, nnz_hint)
+    end
 
     @inbounds for i in 1:n_fine
         if cf[i] == 1
@@ -452,7 +487,14 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
         end
     end
 
-    return _coo_to_prolongation(I_p, J_p, V_p, n_fine, n_coarse)
+    old_P_reuse = setup_workspace !== nothing ? setup_workspace.old_P : nothing
+    P = _coo_to_prolongation(I_p, J_p, V_p, n_fine, n_coarse;
+        old_P=old_P_reuse,
+        sort_perm=setup_workspace !== nothing ? setup_workspace.sort_perm : nothing)
+    if setup_workspace !== nothing
+        setup_workspace.old_P = nothing
+    end
+    return P
 end
 
 # ── Extended+i interpolation ─────────────────────────────────────────────────
@@ -467,9 +509,11 @@ interpolation targets, resulting in a larger but more accurate interpolation ste
 function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                               coarse_map::Vector{Int}, n_coarse::Int,
                               interp::ExtendedIInterpolation, θ::Real=0.25;
-                              backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
+                              backend=DEFAULT_BACKEND, block_size::Int=64,
+                              setup_workspace=nothing) where {Tv, Ti}
     # Compute strength on GPU if available, then convert to CPU for graph algorithms
-    is_strong_raw = strength_graph(A_in, θ; backend=backend, block_size=block_size)
+    is_strong_raw = strength_graph(A_in, θ; backend=backend, block_size=block_size,
+        is_strong=setup_workspace !== nothing ? setup_workspace.is_strong : nothing)
     is_strong = is_strong_raw isa Array ? is_strong_raw : Array(is_strong_raw)
     A = csr_to_cpu(A_in)
     n_fine = size(A, 1)
@@ -481,29 +525,82 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
     norm_p = interp.norm_p
     do_rescale = interp.rescale
 
-    # Build strength-based sparse matrix S for determining C-hat
-    # S_diag[i] contains strong neighbors of i (like hypre's S_diag)
-    # Build S as adjacency list: for each node, list of (neighbor, is_strong_F)
-    strong_nbrs = Vector{Vector{Int}}(undef, n_fine)
+    # Build strength-based CSR structure for determining C-hat.
+    # Use flat CSR representation (offsets + data) to avoid allocating Vector{Vector{Int}}.
+    if setup_workspace !== nothing
+        sn_offsets = setup_workspace.strong_nbrs_offsets
+        sn_data = setup_workspace.strong_nbrs_data
+    else
+        sn_offsets = Vector{Int}(undef, n_fine + 1)
+        sn_data = Int[]
+    end
+    _ws_resize!(sn_offsets, n_fine + 1)
+    # Count strong neighbors per row
+    @inbounds begin
+        for i in 1:n_fine
+            cnt = 0
+            for nz in nzrange(A, i)
+                j = cv[nz]
+                if j != i && is_strong[nz]
+                    cnt += 1
+                end
+            end
+            sn_offsets[i] = cnt
+        end
+    end
+    # Cumulative sum to build offsets
+    total_sn = 0
     @inbounds for i in 1:n_fine
-        snb = Int[]
-        for nz in nzrange(A, i)
-            j = cv[nz]
-            if j != i && is_strong[nz]
-                push!(snb, j)
+        cnt = sn_offsets[i]
+        sn_offsets[i] = total_sn + 1
+        total_sn += cnt
+    end
+    sn_offsets[n_fine + 1] = total_sn + 1
+    _ws_resize!(sn_data, total_sn)
+    # Fill data
+    @inbounds begin
+        pos = 0
+        for i in 1:n_fine
+            for nz in nzrange(A, i)
+                j = cv[nz]
+                if j != i && is_strong[nz]
+                    pos += 1
+                    sn_data[pos] = j
+                end
             end
         end
-        strong_nbrs[i] = snb
     end
 
     # P_marker tracks which coarse points are in C-hat for current row
-    P_marker = fill(-1, n_fine)
+    if setup_workspace !== nothing
+        P_marker = _ws_resize!(setup_workspace.P_marker, n_fine)
+        fill!(P_marker, -1)
+    else
+        P_marker = fill(-1, n_fine)
+    end
     strong_f_marker = -2
 
-    I_p = Ti[]
-    J_p = Ti[]
-    V_p = Tv[]
+    nnz_hint = nnz(A)
+    if setup_workspace !== nothing
+        I_p = setup_workspace.I_p
+        J_p = setup_workspace.J_p
+        V_p = setup_workspace.V_p
+        empty!(I_p); empty!(J_p); empty!(V_p)
+        sizehint!(I_p, nnz_hint)
+        sizehint!(J_p, nnz_hint)
+        sizehint!(V_p, nnz_hint)
+    else
+        I_p = Ti[]
+        J_p = Ti[]
+        V_p = Tv[]
+        sizehint!(I_p, nnz_hint)
+        sizehint!(J_p, nnz_hint)
+        sizehint!(V_p, nnz_hint)
+    end
     S_p = do_rescale ? Tv[] : nothing  # per-entry scaling factors
+    if do_rescale
+        sizehint!(S_p, nnz_hint)
+    end
 
     @inbounds for i in 1:n_fine
         if cf[i] == 1
@@ -517,7 +614,8 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
         # Also mark strong F neighbors with strong_f_marker
         chat_indices = Int[]  # indices into P arrays for C-hat points
 
-        for j in strong_nbrs[i]
+        for si in sn_offsets[i]:(sn_offsets[i + 1] - 1)
+            j = sn_data[si]
             if cf[j] == 1
                 # j is a strong C neighbor of i
                 if P_marker[j] < 0
@@ -527,7 +625,8 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
             elseif cf[j] == -1
                 # j is a strong F neighbor of i — mark it and add its C neighbors
                 P_marker[j] = strong_f_marker
-                for k in strong_nbrs[j]
+                for sj in sn_offsets[j]:(sn_offsets[j + 1] - 1)
+                    k = sn_data[sj]
                     if cf[k] == 1 && P_marker[k] < 0
                         P_marker[k] = length(chat_indices)
                         push!(chat_indices, k)
@@ -543,11 +642,12 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
             push!(I_p, Ti(i)); push!(J_p, Ti(best_j)); push!(V_p, one(Tv))
             if do_rescale; push!(S_p, one(Tv)); end
             # Reset markers
-            for j in strong_nbrs[i]
+            for si in sn_offsets[i]:(sn_offsets[i + 1] - 1)
+                j = sn_data[si]
                 P_marker[j] = -1
                 if cf[j] == -1
-                    for k in strong_nbrs[j]
-                        P_marker[k] = -1
+                    for sj in sn_offsets[j]:(sn_offsets[j + 1] - 1)
+                        P_marker[sn_data[sj]] = -1
                     end
                 end
             end
@@ -669,22 +769,29 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
         for j in chat_indices
             P_marker[j] = -1
         end
-        for j in strong_nbrs[i]
+        for si in sn_offsets[i]:(sn_offsets[i + 1] - 1)
+            j = sn_data[si]
             P_marker[j] = -1
             if cf[j] == -1
-                for k in strong_nbrs[j]
-                    P_marker[k] = -1
+                for sj in sn_offsets[j]:(sn_offsets[j + 1] - 1)
+                    P_marker[sn_data[sj]] = -1
                 end
             end
         end
         strong_f_marker -= 1
     end
 
-    P = _coo_to_prolongation(I_p, J_p, V_p, n_fine, n_coarse)
+    _sort_perm = setup_workspace !== nothing ? setup_workspace.sort_perm : nothing
+    old_P_reuse = setup_workspace !== nothing ? setup_workspace.old_P : nothing
     if do_rescale
-        # Attach per-entry scaling factors (sorted with same permutation as nzval)
-        perm = sortperm(collect(zip(I_p, J_p)))
-        P.trunc_scaling = S_p[perm]
+        P = _coo_to_prolongation(I_p, J_p, V_p, n_fine, n_coarse;
+            old_P=old_P_reuse, S_p=S_p, sort_perm=_sort_perm)
+    else
+        P = _coo_to_prolongation(I_p, J_p, V_p, n_fine, n_coarse;
+            old_P=old_P_reuse, sort_perm=_sort_perm)
+    end
+    if setup_workspace !== nothing
+        setup_workspace.old_P = nothing
     end
     return P
 end
@@ -709,28 +816,155 @@ function _find_nearest_coarse(A::CSRMatrix{Tv, Ti}, i::Int,
     return best_j > 0 ? best_j : 1
 end
 
-"""Convert COO format to ProlongationOp (CSR)."""
+"""Scatter COO entries into CSR arrays using counting sort positions."""
+@inline function _scatter_coo_to_csr!(colval, nzval, I_p, J_p, V_p, pos, nnz_p::Int)
+    @inbounds for k in 1:nnz_p
+        row = I_p[k]
+        p = Int(pos[row])
+        colval[p] = J_p[k]
+        nzval[p] = V_p[k]
+        pos[row] += one(eltype(pos))
+    end
+end
+
+"""Scatter COO entries + trunc_scaling into CSR arrays using counting sort positions."""
+@inline function _scatter_coo_to_csr!(colval, nzval, trunc, I_p, J_p, V_p, S_p, pos, nnz_p::Int)
+    @inbounds for k in 1:nnz_p
+        row = I_p[k]
+        p = Int(pos[row])
+        colval[p] = J_p[k]
+        nzval[p] = V_p[k]
+        trunc[p] = S_p[k]
+        pos[row] += one(eltype(pos))
+    end
+end
+
+"""In-place insertion sort of CSR row entries by column index."""
+function _sort_csr_row!(colval::AbstractVector, nzval::AbstractVector,
+                         rs::Int, re::Int)
+    @inbounds for j in (rs+1):re
+        key_c = colval[j]
+        key_v = nzval[j]
+        k = j - 1
+        while k >= rs && colval[k] > key_c
+            colval[k+1] = colval[k]
+            nzval[k+1] = nzval[k]
+            k -= 1
+        end
+        colval[k+1] = key_c
+        nzval[k+1] = key_v
+    end
+end
+
+"""In-place insertion sort of CSR row entries by column index, also permuting trunc_scaling."""
+function _sort_csr_row!(colval::AbstractVector, nzval::AbstractVector,
+                         trunc::AbstractVector, rs::Int, re::Int)
+    @inbounds for j in (rs+1):re
+        key_c = colval[j]
+        key_v = nzval[j]
+        key_t = trunc[j]
+        k = j - 1
+        while k >= rs && colval[k] > key_c
+            colval[k+1] = colval[k]
+            nzval[k+1] = nzval[k]
+            trunc[k+1] = trunc[k]
+            k -= 1
+        end
+        colval[k+1] = key_c
+        nzval[k+1] = key_v
+        trunc[k+1] = key_t
+    end
+end
+
+"""Convert COO format to ProlongationOp (CSR) using counting sort by row
+followed by per-row insertion sort by column. Much faster than global
+sortperm for typical prolongation operators with few entries per row.
+
+When `old_P` is provided, its arrays are resized and reused instead of
+allocating new ones. When `S_p` is provided, it is reordered into CSR
+order and stored as `trunc_scaling`. `sort_perm` is used as a temporary
+position buffer during the counting sort."""
 function _coo_to_prolongation(I_p::Vector{Ti}, J_p::Vector{Ti}, V_p::Vector{Tv},
-                              n_fine::Int, n_coarse::Int) where {Ti, Tv}
-    # Sort by (row, col)
-    perm = sortperm(collect(zip(I_p, J_p)))
-    I_s = I_p[perm]
-    J_s = J_p[perm]
-    V_s = V_p[perm]
-    nnz_p = length(I_s)
-    rp = Vector{Ti}(undef, n_fine + 1)
+                              n_fine::Int, n_coarse::Int;
+                              old_P::Union{Nothing, ProlongationOp}=nothing,
+                              S_p::Union{Nothing, Vector}=nothing,
+                              sort_perm::Union{Nothing,Vector{Int}}=nothing) where {Ti, Tv}
+    nnz_p = length(I_p)
+
+    # Get or create output arrays, reusing old_P when available
+    if old_P !== nothing && old_P.colval isa Vector
+        rp = resize!(old_P.rowptr, n_fine + 1)
+        colval = resize!(old_P.colval, nnz_p)
+        nzval = resize!(old_P.nzval, nnz_p)
+    else
+        rp = Vector{Ti}(undef, n_fine + 1)
+        colval = Vector{Ti}(undef, nnz_p)
+        nzval = Vector{Tv}(undef, nnz_p)
+    end
+
+    # Handle trunc_scaling: resize from old_P or allocate
+    if S_p !== nothing
+        if old_P !== nothing && old_P.trunc_scaling isa Vector
+            trunc = resize!(old_P.trunc_scaling, nnz_p)
+        else
+            trunc = Vector{Tv}(undef, nnz_p)
+        end
+    else
+        trunc = nothing
+    end
+
+    # 1. Count entries per row
     fill!(rp, Ti(0))
-    for k in 1:nnz_p
-        rp[I_s[k]] += Ti(1)
+    @inbounds for k in 1:nnz_p
+        rp[I_p[k]] += Ti(1)
     end
-    cumsum = Ti(1)
-    for i in 1:n_fine
+
+    # 2. Build rowptr (cumulative sum)
+    cumsum_val = Ti(1)
+    @inbounds for i in 1:n_fine
         count = rp[i]
-        rp[i] = cumsum
-        cumsum += count
+        rp[i] = cumsum_val
+        cumsum_val += count
     end
-    rp[n_fine + 1] = cumsum
-    return ProlongationOp{Ti, Tv}(rp, J_s, V_s, n_fine, n_coarse)
+    rp[n_fine + 1] = cumsum_val
+
+    # 3. Counting sort: distribute COO entries into CSR positions
+    if sort_perm !== nothing
+        _ws_resize!(sort_perm, n_fine)
+        pos = sort_perm
+    else
+        pos = Vector{Int}(undef, n_fine)
+    end
+    copyto!(pos, 1, rp, 1, n_fine)
+
+    if trunc !== nothing
+        _scatter_coo_to_csr!(colval, nzval, trunc, I_p, J_p, V_p, S_p, pos, nnz_p)
+    else
+        _scatter_coo_to_csr!(colval, nzval, I_p, J_p, V_p, pos, nnz_p)
+    end
+
+    # 4. Sort each row by column (insertion sort — rows are typically small)
+    if trunc !== nothing
+        @inbounds for i in 1:n_fine
+            _sort_csr_row!(colval, nzval, trunc, Int(rp[i]), Int(rp[i+1]) - 1)
+        end
+    else
+        @inbounds for i in 1:n_fine
+            _sort_csr_row!(colval, nzval, Int(rp[i]), Int(rp[i+1]) - 1)
+        end
+    end
+
+    # Return ProlongationOp (mutate old_P or create new)
+    if old_P !== nothing && old_P.colval isa Vector
+        old_P.nrow = n_fine
+        old_P.ncol = n_coarse
+        old_P.trunc_scaling = trunc
+        return old_P
+    elseif trunc !== nothing
+        return ProlongationOp{Ti, Tv, Vector{Ti}, Vector{Tv}}(rp, colval, nzval, n_fine, n_coarse, trunc)
+    else
+        return ProlongationOp{Ti, Tv}(rp, colval, nzval, n_fine, n_coarse)
+    end
 end
 
 """

@@ -1,5 +1,5 @@
 """
-    amg_resetup!(hierarchy, A_new::CSRMatrix, config; partial=true, allow_partial_resetup=true)
+    amg_resetup!(hierarchy, A_new::CSRMatrix, config; partial=true)
 
 Main resetup implementation using the internal `CSRMatrix` type.
 All other `amg_resetup!` methods (for `SparseMatrixCSC`, GPU types, etc.)
@@ -8,11 +8,11 @@ and forward to this method.
 
 When `partial=true` (the default), only the matrix values, Galerkin products,
 smoothers and coarse solver are recomputed using the pre-built restriction maps.
-This requires the hierarchy to have been set up with `allow_partial_resetup=true`.
+This requires the hierarchy to have been set up with `config.allow_partial_resetup=true`.
 
 When `partial=false`, the hierarchy is rebuilt from scratch (new coarsening,
 prolongation, smoothers, etc.) while reusing workspace arrays from the existing
-levels where possible. The `allow_partial_resetup` keyword controls whether
+levels where possible. The `config.allow_partial_resetup` setting controls whether
 restriction maps are built for future partial resetups.
 
 The backend and block_size are taken from the hierarchy (set during `amg_setup`).
@@ -20,8 +20,7 @@ The backend and block_size are taken from the hierarchy (set during `amg_setup`)
 function amg_resetup!(hierarchy::AMGHierarchy{Tv, Ti},
                       A_new::CSRMatrix{Tv, Ti},
                       config::AMGConfig=AMGConfig();
-                      partial::Bool=true,
-                      allow_partial_resetup::Bool=true) where {Tv, Ti}
+                      partial::Bool=true) where {Tv, Ti}
     backend = hierarchy.backend
     block_size = hierarchy.block_size
     if partial
@@ -55,7 +54,8 @@ function amg_resetup!(hierarchy::AMGHierarchy{Tv, Ti},
         A_ref = device_ref === nothing ? A_new : device_ref
         A_coarsest = _build_levels!(hierarchy.levels, A_new, config;
                                     backend=backend, block_size=block_size,
-                                    allow_partial_resetup=allow_partial_resetup,
+                                    galerkin_workspace=hierarchy.galerkin_workspace,
+                                    setup_workspace=hierarchy.setup_workspace,
                                     device_ref=device_ref)
         coarse_dense, coarse_factor, coarse_x, coarse_b, solve_r =
             _build_coarse_solver(A_coarsest, A_ref, n_finest, config;
@@ -70,7 +70,7 @@ function amg_resetup!(hierarchy::AMGHierarchy{Tv, Ti},
 end
 
 """
-    amg_resetup!(hierarchy, A_new::SparseMatrixCSC, config; partial=true, allow_partial_resetup=true)
+    amg_resetup!(hierarchy, A_new::SparseMatrixCSC, config; partial=true)
 
 External API entry point: convert `SparseMatrixCSC` to `CSRMatrix` via
 `csr_from_csc` and forward to the main `CSRMatrix`-based resetup.
@@ -78,11 +78,9 @@ External API entry point: convert `SparseMatrixCSC` to `CSRMatrix` via
 function amg_resetup!(hierarchy::AMGHierarchy{Tv, Ti},
                       A_new::SparseMatrixCSC{Tv, Ti},
                       config::AMGConfig=AMGConfig();
-                      partial::Bool=true,
-                      allow_partial_resetup::Bool=true) where {Tv, Ti}
+                      partial::Bool=true) where {Tv, Ti}
     A_csr = csr_from_csc(A_new)
-    return amg_resetup!(hierarchy, A_csr, config; partial=partial,
-                        allow_partial_resetup=allow_partial_resetup)
+    return amg_resetup!(hierarchy, A_csr, config; partial=partial)
 end
 
 """

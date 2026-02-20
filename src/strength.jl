@@ -33,7 +33,7 @@ function strength_graph(A::CSRMatrix{Tv, Ti}, θ::Real, ::AbsoluteStrength;
     if is_strong === nothing
         is_strong_buf = KernelAbstractions.zeros(be, Bool, nnz(A))
     else
-        resize!(is_strong, nnz(A))
+        _ws_resize!(is_strong, nnz(A))
         fill!(is_strong, false)
         is_strong_buf = is_strong
     end
@@ -94,7 +94,7 @@ function strength_graph(A::CSRMatrix{Tv, Ti}, θ::Real, ::SignedStrength;
     if is_strong === nothing
         is_strong_buf = KernelAbstractions.zeros(be, Bool, nnz(A))
     else
-        resize!(is_strong, nnz(A))
+        _ws_resize!(is_strong, nnz(A))
         fill!(is_strong, false)
         is_strong_buf = is_strong
     end

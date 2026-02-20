@@ -452,13 +452,17 @@ that stores the full graph connectivity to enable recomputation.
 - `is_strong`: Boolean array marking strong connections in A
 - `cf`: Coarse/fine split (cf[i]=1 for coarse, -1 for fine)
 - `coarse_map`: Maps fine indices to coarse indices for coarse points
-- `P_rowptr`: CSR rowptr for P structure
-- `P_coarse_col`: For each P entry, which coarse column it maps to
+- `diag_nz_idx`: Diagonal A.nzval index for each row
 
-For Direct interpolation only (simple update):
-- `entry_type`: 0=coarse (P=1), 1=fine with formula
+Per-entry formula data:
+- `entry_type`: 0=coarse point (P=1), 1=Direct formula, 2=Standard, 3=Extended+i
 - `numer_idx`: A.nzval index for numerator term (0 for coarse)
 - `denom_offsets`, `denom_entries`: A.nzval indices for denominator sum
+
+Strong neighbor structure (for Standard/Extended+i row recomputation):
+- `strong_nbrs_offsets`: CSR offset array (n_fine + 1)
+- `strong_nbrs_cols`: column indices of strong neighbors
+- `strong_nbrs_nz`: A.nzval indices of strong neighbors
 """
 struct ProlongationUpdateMap{Ti<:Integer}
     interp_type::Int                    # 1=Direct, 2=Standard, 3=Extended+i
@@ -466,13 +470,12 @@ struct ProlongationUpdateMap{Ti<:Integer}
     cf::Vector{Int}                     # coarse/fine split (n_fine)
     coarse_map::Vector{Int}             # fine-to-coarse mapping (n_fine)
     diag_nz_idx::Vector{Ti}             # diagonal A.nzval index for each row
-    # For Direct interpolation (entry_type[k]==1):
-    entry_type::Vector{Ti}              # 0=coarse, 1=direct formula
+    # Per-entry formula data
+    entry_type::Vector{Ti}              # 0=coarse (P=1), 1+=compute formula
     numer_idx::Vector{Ti}               # A.nzval index for numerator
     denom_offsets::Vector{Ti}           # offset array for denominator
     denom_entries::Vector{Ti}           # A.nzval indices for denominator
-    # For Standard/Extended+i: store extra connectivity info
-    # Strong neighbors per row (for computing distribution weights)
+    # Strong neighbor structure for Standard/Extended+i row recomputation
     strong_nbrs_offsets::Vector{Ti}     # offset array (n_fine + 1)
     strong_nbrs_cols::Vector{Ti}        # column indices of strong neighbors
     strong_nbrs_nz::Vector{Ti}          # A.nzval indices of strong neighbors

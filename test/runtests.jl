@@ -609,12 +609,12 @@ end
         config = AMGConfig(coarsening=HMISCoarsening(0.5, StandardInterpolation()))
         hierarchy = amg_setup(A, config)
         @test length(hierarchy.levels) > 0
-        # Standard interpolation update map not yet implemented
+        # Standard interpolation now supports update_P (interp_type=2)
         for lvl in hierarchy.levels
-            @test lvl.P_update_map === nothing
+            @test lvl.P_update_map !== nothing
+            @test lvl.P_update_map.interp_type == 2
         end
         nonzeros(A) .*= 2.0
-        # update_P=true should be a no-op (falls back to partial=true behavior)
         amg_resetup!(hierarchy, A, config; partial=true, update_P=true)
         b = rand(N)
         x = zeros(N)
@@ -630,12 +630,12 @@ end
         config = AMGConfig(coarsening=HMISCoarsening(0.5, ExtendedIInterpolation()))
         hierarchy = amg_setup(A, config)
         @test length(hierarchy.levels) > 0
-        # Extended+i interpolation update map not yet implemented
+        # Extended+i interpolation now supports update_P (interp_type=3)
         for lvl in hierarchy.levels
-            @test lvl.P_update_map === nothing
+            @test lvl.P_update_map !== nothing
+            @test lvl.P_update_map.interp_type == 3
         end
         nonzeros(A) .*= 2.0
-        # update_P=true should be a no-op (falls back to partial=true behavior)
         amg_resetup!(hierarchy, A, config; partial=true, update_P=true)
         b = rand(N)
         x = zeros(N)

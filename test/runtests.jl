@@ -531,6 +531,136 @@ end
         @test norm(r) / norm(b) < 1e-8
     end
 
+    @testset "AMG Resetup - update_P=true with HMIS coarsening" begin
+        n = 10
+        A = poisson2d_csr(n)
+        N = n*n
+        config = AMGConfig(coarsening=HMISCoarsening(0.5, DirectInterpolation()))
+        hierarchy = amg_setup(A, config)
+        @test length(hierarchy.levels) > 0
+        # P_update_map should be present for CF-splitting methods
+        for lvl in hierarchy.levels
+            @test lvl.P_update_map !== nothing
+        end
+        # Solve with original matrix
+        b = rand(N)
+        x1 = zeros(N)
+        x1, niter1 = amg_solve!(x1, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r1 = b - sparse(A.At') * x1
+        @test norm(r1) / norm(b) < 1e-8
+        # Scale matrix and resetup with update_P=true
+        nonzeros(A) .*= 2.0
+        amg_resetup!(hierarchy, A, config; partial=true, update_P=true)
+        # Solve with updated matrix
+        x2 = zeros(N)
+        x2, niter2 = amg_solve!(x2, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r2 = b - sparse(A.At') * x2
+        @test norm(r2) / norm(b) < 1e-8
+    end
+
+    @testset "AMG Resetup - update_P=true with PMIS coarsening" begin
+        n = 10
+        A = poisson2d_csr(n)
+        N = n*n
+        config = AMGConfig(coarsening=PMISCoarsening(0.5, DirectInterpolation()))
+        hierarchy = amg_setup(A, config)
+        if length(hierarchy.levels) > 0
+            # P_update_map should be present
+            for lvl in hierarchy.levels
+                @test lvl.P_update_map !== nothing
+            end
+            # Scale and resetup with update_P=true
+            nonzeros(A) .*= 2.0
+            amg_resetup!(hierarchy, A, config; partial=true, update_P=true)
+            b = rand(N)
+            x = zeros(N)
+            x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+            r = b - sparse(A.At') * x
+            @test norm(r) / norm(b) < 1e-8
+        end
+    end
+
+    @testset "AMG Resetup - update_P=true with RS coarsening" begin
+        n = 10
+        A = poisson2d_csr(n)
+        N = n*n
+        config = AMGConfig(coarsening=RSCoarsening(0.5, DirectInterpolation()))
+        hierarchy = amg_setup(A, config)
+        if length(hierarchy.levels) > 0
+            # P_update_map should be present
+            for lvl in hierarchy.levels
+                @test lvl.P_update_map !== nothing
+            end
+            # Scale and resetup with update_P=true
+            nonzeros(A) .*= 2.0
+            amg_resetup!(hierarchy, A, config; partial=true, update_P=true)
+            b = rand(N)
+            x = zeros(N)
+            x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+            r = b - sparse(A.At') * x
+            @test norm(r) / norm(b) < 1e-8
+        end
+    end
+
+    @testset "AMG Resetup - update_P=true with StandardInterpolation" begin
+        n = 10
+        A = poisson2d_csr(n)
+        N = n*n
+        config = AMGConfig(coarsening=HMISCoarsening(0.5, StandardInterpolation()))
+        hierarchy = amg_setup(A, config)
+        @test length(hierarchy.levels) > 0
+        for lvl in hierarchy.levels
+            @test lvl.P_update_map !== nothing
+        end
+        nonzeros(A) .*= 2.0
+        amg_resetup!(hierarchy, A, config; partial=true, update_P=true)
+        b = rand(N)
+        x = zeros(N)
+        x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r = b - sparse(A.At') * x
+        @test norm(r) / norm(b) < 1e-8
+    end
+
+    @testset "AMG Resetup - update_P=true with ExtendedIInterpolation" begin
+        n = 10
+        A = poisson2d_csr(n)
+        N = n*n
+        config = AMGConfig(coarsening=HMISCoarsening(0.5, ExtendedIInterpolation()))
+        hierarchy = amg_setup(A, config)
+        @test length(hierarchy.levels) > 0
+        for lvl in hierarchy.levels
+            @test lvl.P_update_map !== nothing
+        end
+        nonzeros(A) .*= 2.0
+        amg_resetup!(hierarchy, A, config; partial=true, update_P=true)
+        b = rand(N)
+        x = zeros(N)
+        x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r = b - sparse(A.At') * x
+        @test norm(r) / norm(b) < 1e-8
+    end
+
+    @testset "AMG Resetup - update_P does not impact Aggregation" begin
+        n = 10
+        A = poisson2d_csr(n)
+        N = n*n
+        config = AMGConfig(coarsening=AggregationCoarsening())
+        hierarchy = amg_setup(A, config)
+        @test length(hierarchy.levels) > 0
+        # P_update_map should be nothing for aggregation-based methods
+        for lvl in hierarchy.levels
+            @test lvl.P_update_map === nothing
+        end
+        # update_P=true should still work (just does nothing for aggregation)
+        nonzeros(A) .*= 2.0
+        amg_resetup!(hierarchy, A, config; partial=true, update_P=true)
+        b = rand(N)
+        x = zeros(N)
+        x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r = b - sparse(A.At') * x
+        @test norm(r) / norm(b) < 1e-8
+    end
+
     @testset "Small System Direct Solve" begin
         # System small enough to be solved directly
         A = poisson1d_csr(5)

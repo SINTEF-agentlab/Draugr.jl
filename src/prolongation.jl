@@ -186,19 +186,23 @@ end
 # ══════════════════════════════════════════════════════════════════════════════
 
 """
-    build_cf_prolongation(A, cf, coarse_map, n_coarse, interp, θ)
+    build_cf_prolongation(A, cf, coarse_map, n_coarse, interp, θ; build_update_map=false)
 
 Build a prolongation operator from a CF-splitting using the specified interpolation method.
 - `cf[i] == 1` → coarse point, `cf[i] == -1` → fine point
 - `coarse_map[i]` → coarse-grid index for coarse points
 - `θ` → strength threshold used consistently for interpolation stencil selection
+- `build_update_map` → if true, also returns a `ProlongationUpdateMap` for in-place value update
+
+Returns `(P, P_update_map)` where P_update_map is `nothing` if `build_update_map=false`.
 """
 function build_cf_prolongation(A::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                                coarse_map::Vector{Int}, n_coarse::Int,
                                interp::InterpolationType, θ::Real=0.25;
                                backend=DEFAULT_BACKEND, block_size::Int=64,
-                               setup_workspace=nothing) where {Tv, Ti}
-    return _build_interpolation(A, cf, coarse_map, n_coarse, interp, θ; backend=backend, block_size=block_size, setup_workspace=setup_workspace)
+                               setup_workspace=nothing,
+                               build_update_map::Bool=false) where {Tv, Ti}
+    return _build_interpolation(A, cf, coarse_map, n_coarse, interp, θ; backend=backend, block_size=block_size, setup_workspace=setup_workspace, build_update_map=build_update_map)
 end
 
 # ── Direct interpolation ─────────────────────────────────────────────────────
@@ -216,12 +220,16 @@ such connections are treated as weak and lumped into the diagonal correction.
 P[i, coarse_map[i]] = 1 for coarse points.
 P[i, coarse_map[j]] = -a_{i,j} / d_i for fine points, where j ∈ C_i^s and
 d_i = a_{i,i} + Σ_{k ∈ weak ∪ F_i^s ∪ same_sign} a_{i,k}.
+
+When `build_update_map=true`, also builds a `ProlongationUpdateMap` that stores
+all index mappings needed for in-place P value update with KernelAbstractions.
 """
 function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                               coarse_map::Vector{Int}, n_coarse::Int,
                               ::DirectInterpolation, θ::Real=0.25;
                               backend=DEFAULT_BACKEND, block_size::Int=64,
-                              setup_workspace=nothing) where {Tv, Ti}
+                              setup_workspace=nothing,
+                              build_update_map::Bool=false) where {Tv, Ti}
     # Compute strength on GPU if available, then convert to CPU for graph algorithms
     is_strong_raw = strength_graph(A_in, θ; backend=backend, block_size=block_size,
         is_strong=setup_workspace !== nothing ? setup_workspace.is_strong : nothing)
@@ -230,21 +238,35 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
     n_fine = size(A, 1)
     cv = colvals(A)
     nzv = nonzeros(A)
+    rp_A = rowptr(A)
 
-    # First pass: count entries per row
+    # First pass: count entries per row and determine sign classification
     row_counts = zeros(Int, n_fine)
+    diag_positive = Vector{Bool}(undef, n_fine)
+    diag_nz_idx = Vector{Ti}(undef, n_fine)
+    
     @inbounds for i in 1:n_fine
+        diag_nz_idx[i] = Ti(0)
         if cf[i] == 1
             row_counts[i] = 1  # coarse point: identity mapping
+            diag_positive[i] = true
+            for nz in nzrange(A, i)
+                if cv[nz] == i
+                    diag_nz_idx[i] = Ti(nz)
+                    break
+                end
+            end
         else
-            # Find diagonal sign
+            # Find diagonal sign and index
             a_ii = zero(Tv)
             for nz in nzrange(A, i)
                 if cv[nz] == i
                     a_ii = nzv[nz]
+                    diag_nz_idx[i] = Ti(nz)
                     break
                 end
             end
+            diag_positive[i] = real(a_ii) >= 0
             diag_sign = sign(real(a_ii))
             # Fine point: count strong coarse neighbors with opposite sign
             for nz in nzrange(A, i)
@@ -280,39 +302,73 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
         rp[i+1] = rp[i] + Ti(row_counts[i])
     end
 
-    # Second pass: fill entries
+    # Prepare update map arrays if requested
+    if build_update_map
+        entry_type = Vector{Ti}(undef, total_nnz)
+        numer_idx = Vector{Ti}(undef, total_nnz)
+        denom_offsets = Vector{Ti}(undef, total_nnz + 1)
+        denom_entries_list = Ti[]
+        # For Standard/Extended+i: strong neighbor structure
+        strong_nbrs_offsets = Vector{Ti}(undef, n_fine + 1)
+        strong_nbrs_cols_list = Ti[]
+        strong_nbrs_nz_list = Ti[]
+    end
+
+    # Second pass: fill entries and build update map
     @inbounds for i in 1:n_fine
         pos = rp[i]
+        
+        # Build strong neighbor list if update map requested
+        if build_update_map
+            strong_nbrs_offsets[i] = Ti(length(strong_nbrs_cols_list) + 1)
+            for nz in nzrange(A, i)
+                j = cv[nz]
+                if j != i && is_strong[nz]
+                    push!(strong_nbrs_cols_list, Ti(j))
+                    push!(strong_nbrs_nz_list, Ti(nz))
+                end
+            end
+        end
+        
         if cf[i] == 1
             cval[pos] = Ti(coarse_map[i])
             nzv_p[pos] = one(Tv)
+            if build_update_map
+                entry_type[pos] = Ti(0)  # coarse point: P=1
+                numer_idx[pos] = Ti(0)
+                denom_offsets[pos] = Ti(length(denom_entries_list) + 1)
+            end
         else
-            # Compute diagonal correction: d_i = a_{i,i} + Σ weak/fine/same-sign connections
-            a_ii = zero(Tv)
-            sum_nonC = zero(Tv)
+            diag_sign = diag_positive[i] ? 1 : -1
+            # Collect strong coarse columns and denominator entries
             strong_coarse_cols = Vector{Ti}()
-            strong_coarse_vals = Vector{Tv}()
-            diag_sign = zero(real(Tv))
+            strong_coarse_nz_idx = Vector{Ti}()  # A.nzval indices for numerators
+            denom_nz_idx = Vector{Ti}()          # A.nzval indices for denominator
+            
             for nz in nzrange(A, i)
                 j = cv[nz]
                 if j == i
-                    a_ii = nzv[nz]
-                    diag_sign = sign(real(a_ii))
-                end
-            end
-            for nz in nzrange(A, i)
-                j = cv[nz]
-                j == i && continue
-                is_interp_coarse = is_strong[nz] && cf[j] == 1 &&
-                    (diag_sign == 0 || sign(real(nzv[nz])) != diag_sign)
-                if is_interp_coarse
-                    push!(strong_coarse_cols, Ti(coarse_map[j]))
-                    push!(strong_coarse_vals, nzv[nz])
+                    # Diagonal always in denominator
+                    push!(denom_nz_idx, Ti(nz))
                 else
-                    sum_nonC += nzv[nz]
+                    is_interp_coarse = is_strong[nz] && cf[j] == 1 &&
+                        sign(real(nzv[nz])) != diag_sign
+                    if is_interp_coarse
+                        push!(strong_coarse_cols, Ti(coarse_map[j]))
+                        push!(strong_coarse_nz_idx, Ti(nz))
+                    else
+                        # Weak/fine connections go to denominator
+                        push!(denom_nz_idx, Ti(nz))
+                    end
                 end
             end
-            d_i = a_ii + sum_nonC
+            
+            # Compute d_i for this row
+            d_i = zero(Tv)
+            for nz_idx in denom_nz_idx
+                d_i += nzv[nz_idx]
+            end
+            
             if isempty(strong_coarse_cols)
                 # Fallback: assign to nearest coarse neighbor (any connection)
                 best_j = 0
@@ -330,14 +386,51 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                 end
                 cval[pos] = Ti(best_j)
                 nzv_p[pos] = one(Tv)
+                if build_update_map
+                    entry_type[pos] = Ti(0)  # fallback = P=1
+                    numer_idx[pos] = Ti(0)
+                    denom_offsets[pos] = Ti(length(denom_entries_list) + 1)
+                end
             else
                 for k in eachindex(strong_coarse_cols)
                     cval[pos] = strong_coarse_cols[k]
-                    nzv_p[pos] = abs(d_i) > _safe_threshold(Tv, abs(d_i)) ? -strong_coarse_vals[k] / d_i : zero(Tv)
+                    abs_d_i = abs(d_i)
+                    nzv_p[pos] = abs_d_i > _safe_threshold(Tv, abs_d_i) ? -nzv[strong_coarse_nz_idx[k]] / d_i : zero(Tv)
+                    if build_update_map
+                        entry_type[pos] = Ti(1)  # fine point: compute from A
+                        numer_idx[pos] = strong_coarse_nz_idx[k]
+                        # Denominator is the same for all P entries in this row
+                        denom_offsets[pos] = Ti(length(denom_entries_list) + 1)
+                        append!(denom_entries_list, denom_nz_idx)
+                    end
                     pos += 1
                 end
             end
         end
+    end
+
+    # Finalize update map
+    P_update_map = nothing
+    if build_update_map
+        denom_offsets[total_nnz + 1] = Ti(length(denom_entries_list) + 1)
+        strong_nbrs_offsets[n_fine + 1] = Ti(length(strong_nbrs_cols_list) + 1)
+        denom_entries = Vector{Ti}(denom_entries_list)
+        strong_nbrs_cols = Vector{Ti}(strong_nbrs_cols_list)
+        strong_nbrs_nz = Vector{Ti}(strong_nbrs_nz_list)
+        P_update_map = ProlongationUpdateMap{Ti}(
+            1,  # interp_type = Direct
+            copy(is_strong),
+            copy(cf),
+            copy(coarse_map),
+            diag_nz_idx,
+            entry_type,
+            numer_idx,
+            denom_offsets,
+            denom_entries,
+            strong_nbrs_offsets,
+            strong_nbrs_cols,
+            strong_nbrs_nz
+        )
     end
 
     if old_P_reuse !== nothing && old_P_reuse.colval isa Vector
@@ -347,9 +440,9 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
         if setup_workspace !== nothing
             setup_workspace.old_P = nothing
         end
-        return old_P_reuse
+        return old_P_reuse, P_update_map
     else
-        return ProlongationOp{Ti, Tv}(rp, cval, nzv_p, n_fine, n_coarse)
+        return ProlongationOp{Ti, Tv}(rp, cval, nzv_p, n_fine, n_coarse), P_update_map
     end
 end
 
@@ -364,12 +457,17 @@ Standard (classical Ruge-Stüben) interpolation. For each fine point i:
 
 w_j = -(a_{i,j} + Σ_{k∈F_i^s} a_{i,k} * a_{k,j} / Σ_{m∈C_i} a_{k,m}) / d_i
 where d_i = a_{i,i} + Σ_{k∈weak} a_{i,k}
+
+When `build_update_map=true`, stores the complete graph structure (is_strong, cf, 
+coarse_map, strong neighbors) to enable efficient P value recomputation via
+KernelAbstractions kernels.
 """
 function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                               coarse_map::Vector{Int}, n_coarse::Int,
                               ::StandardInterpolation, θ::Real=0.25;
                               backend=DEFAULT_BACKEND, block_size::Int=64,
-                              setup_workspace=nothing) where {Tv, Ti}
+                              setup_workspace=nothing,
+                              build_update_map::Bool=false) where {Tv, Ti}
     # Compute strength on GPU if available, then convert to CPU for graph algorithms
     is_strong_raw = strength_graph(A_in, θ; backend=backend, block_size=block_size,
         is_strong=setup_workspace !== nothing ? setup_workspace.is_strong : nothing)
@@ -378,6 +476,38 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
     n_fine = size(A, 1)
     cv = colvals(A)
     nzv = nonzeros(A)
+
+    # Build strong neighbor structure for update map
+    diag_nz_idx = Vector{Ti}(undef, n_fine)
+    if build_update_map
+        strong_nbrs_offsets = Vector{Ti}(undef, n_fine + 1)
+        strong_nbrs_cols_list = Ti[]
+        strong_nbrs_nz_list = Ti[]
+    end
+    
+    # First pass: find diagonal indices and build strong neighbor structure
+    @inbounds for i in 1:n_fine
+        diag_nz_idx[i] = Ti(0)
+        for nz in nzrange(A, i)
+            if cv[nz] == i
+                diag_nz_idx[i] = Ti(nz)
+                break
+            end
+        end
+        if build_update_map
+            strong_nbrs_offsets[i] = Ti(length(strong_nbrs_cols_list) + 1)
+            for nz in nzrange(A, i)
+                j = cv[nz]
+                if j != i && is_strong[nz]
+                    push!(strong_nbrs_cols_list, Ti(j))
+                    push!(strong_nbrs_nz_list, Ti(nz))
+                end
+            end
+        end
+    end
+    if build_update_map
+        strong_nbrs_offsets[n_fine + 1] = Ti(length(strong_nbrs_cols_list) + 1)
+    end
 
     # Build P using COO format, then convert to CSR
     nnz_hint = nnz(A)
@@ -398,39 +528,63 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
         sizehint!(V_p, nnz_hint)
     end
 
+    # For update map: store entry types and per-entry numerator/denominator info
+    if build_update_map
+        entry_types_list = Ti[]
+        numer_idx_list = Ti[]  # Single A.nzval index for direct entries
+        denom_offsets_list = Ti[1]
+        denom_entries_list = Ti[]
+    end
+
     @inbounds for i in 1:n_fine
         if cf[i] == 1
             push!(I_p, Ti(i)); push!(J_p, Ti(coarse_map[i])); push!(V_p, one(Tv))
+            if build_update_map
+                push!(entry_types_list, Ti(0))  # coarse = P=1
+                push!(numer_idx_list, Ti(0))
+                push!(denom_offsets_list, Ti(length(denom_entries_list) + 1))
+            end
             continue
         end
         # Classify connections of fine point i
         a_ii = zero(Tv)
+        diag_nz = diag_nz_idx[i]
+        if diag_nz > 0
+            a_ii = nzv[diag_nz]
+        end
         sum_weak = zero(Tv)
-        strong_coarse = Dict{Int, Tv}()  # coarse_map[j] → a_{i,j}
-        strong_fine = Tuple{Int, Tv}[]   # (fine node k, a_{i,k})
+        weak_nz_indices = Ti[]
+        strong_coarse = Dict{Int, Tv}()       # coarse_map[j] → a_{i,j}
+        strong_coarse_nz = Dict{Int, Ti}()    # coarse_map[j] → A.nzval index
+        strong_fine = Tuple{Int, Tv, Ti}[]    # (fine node k, a_{i,k}, nz index)
+        
         for nz in nzrange(A, i)
             j = cv[nz]
             if j == i
-                a_ii = nzv[nz]
+                continue  # already handled
             elseif is_strong[nz] && cf[j] == 1
                 cm = coarse_map[j]
                 strong_coarse[cm] = get(strong_coarse, cm, zero(Tv)) + nzv[nz]
+                # Store A.nzval index for this direct contribution
+                if !haskey(strong_coarse_nz, cm)
+                    strong_coarse_nz[cm] = Ti(nz)
+                end
             elseif is_strong[nz] && cf[j] == -1
-                push!(strong_fine, (j, nzv[nz]))
+                push!(strong_fine, (j, nzv[nz], Ti(nz)))
             else
                 sum_weak += nzv[nz]
+                push!(weak_nz_indices, Ti(nz))
             end
         end
         d_i = a_ii + sum_weak
+        
         # Add indirect contributions from strong fine neighbors
         contributions = Dict{Int, Tv}()
         for (cm, a_ij) in strong_coarse
             contributions[cm] = a_ij
         end
-        for (k, a_ik) in strong_fine
+        for (k, a_ik, nz_ik) in strong_fine
             # Find coarse connections of fine point k
-            # hypre formula: distribute = a_{i,k} / sum where
-            # sum = Σ a_{k,m} for m in (C_i ∪ {i}) with opposite sign to a_{k,k}
             diag_k = zero(Tv)
             for nz2 in nzrange(A, k)
                 if cv[nz2] == k
@@ -447,13 +601,11 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                 a_kj = nzv[nz2]
                 if cf[j2] == 1
                     cm2 = coarse_map[j2]
-                    # Only distribute to coarse points in C_i
                     if haskey(strong_coarse, cm2) && sgn * real(a_kj) < 0
                         coarse_vals_k[cm2] = get(coarse_vals_k, cm2, zero(Tv)) + a_kj
                         sum_C_k += a_kj
                     end
                 end
-                # Also include connection back to i in the sum
                 if j2 == i && sgn * real(a_kj) < 0
                     sum_C_k += a_kj
                 end
@@ -463,7 +615,6 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                 for (cm2, a_kj) in coarse_vals_k
                     contributions[cm2] = get(contributions, cm2, zero(Tv)) + distribute * a_kj
                 end
-                # Diagonal contribution: a_{k,i} * distribute
                 for nz2 in nzrange(A, k)
                     if cv[nz2] == i && sgn * real(nzv[nz2]) < 0
                         d_i += distribute * nzv[nz2]
@@ -471,18 +622,36 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                     end
                 end
             else
-                # Lump into diagonal
                 d_i += a_ik
             end
         end
+        
         if isempty(contributions)
             # Fallback: map to nearest coarse point
             best_j = _find_nearest_coarse(A, i, cf, coarse_map)
             push!(I_p, Ti(i)); push!(J_p, Ti(best_j)); push!(V_p, one(Tv))
+            if build_update_map
+                push!(entry_types_list, Ti(0))  # fallback = P=1
+                push!(numer_idx_list, Ti(0))
+                push!(denom_offsets_list, Ti(length(denom_entries_list) + 1))
+            end
         else
             for (cm, val) in contributions
                 w = abs(d_i) > eps(real(Tv)) ? -val / d_i : zero(Tv)
                 push!(I_p, Ti(i)); push!(J_p, Ti(cm)); push!(V_p, w)
+                if build_update_map
+                    # For Standard interpolation, mark as type 2 (needs full recomputation)
+                    push!(entry_types_list, Ti(2))
+                    # Store the direct A index for this coarse column if available
+                    numer_nz = get(strong_coarse_nz, cm, Ti(0))
+                    push!(numer_idx_list, numer_nz)
+                    # Store denominator indices (diagonal + weak)
+                    push!(denom_offsets_list, Ti(length(denom_entries_list) + 1))
+                    if diag_nz > 0
+                        push!(denom_entries_list, diag_nz)
+                    end
+                    append!(denom_entries_list, weak_nz_indices)
+                end
             end
         end
     end
@@ -494,7 +663,34 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
     if setup_workspace !== nothing
         setup_workspace.old_P = nothing
     end
-    return P
+    
+    # Build update map with full graph structure for Standard interpolation
+    P_update_map = nothing
+    if build_update_map
+        entry_type = Vector{Ti}(entry_types_list)
+        numer_idx = Vector{Ti}(numer_idx_list)
+        denom_offsets = Vector{Ti}(denom_offsets_list)
+        denom_entries = Vector{Ti}(denom_entries_list)
+        strong_nbrs_cols = Vector{Ti}(strong_nbrs_cols_list)
+        strong_nbrs_nz = Vector{Ti}(strong_nbrs_nz_list)
+        
+        P_update_map = ProlongationUpdateMap{Ti}(
+            2,  # interp_type = Standard
+            copy(is_strong),
+            copy(cf),
+            copy(coarse_map),
+            diag_nz_idx,
+            entry_type,
+            numer_idx,
+            denom_offsets,
+            denom_entries,
+            strong_nbrs_offsets,
+            strong_nbrs_cols,
+            strong_nbrs_nz
+        )
+    end
+    
+    return P, P_update_map
 end
 
 # ── Extended+i interpolation ─────────────────────────────────────────────────
@@ -510,7 +706,8 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                               coarse_map::Vector{Int}, n_coarse::Int,
                               interp::ExtendedIInterpolation, θ::Real=0.25;
                               backend=DEFAULT_BACKEND, block_size::Int=64,
-                              setup_workspace=nothing) where {Tv, Ti}
+                              setup_workspace=nothing,
+                              build_update_map::Bool=false) where {Tv, Ti}
     # Compute strength on GPU if available, then convert to CPU for graph algorithms
     is_strong_raw = strength_graph(A_in, θ; backend=backend, block_size=block_size,
         is_strong=setup_workspace !== nothing ? setup_workspace.is_strong : nothing)
@@ -793,7 +990,77 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
     if setup_workspace !== nothing
         setup_workspace.old_P = nothing
     end
-    return P
+    
+    # Build update map with full graph structure for Extended+i interpolation
+    P_update_map = nothing
+    if build_update_map
+        # We need to store the complete graph structure for Extended+i
+        # The sn_offsets and sn_data already contain strong neighbor info
+        # Build diagonal indices
+        diag_nz_idx = Vector{Ti}(undef, n_fine)
+        strong_nbrs_nz_list = Ti[]
+        @inbounds for i in 1:n_fine
+            diag_nz_idx[i] = Ti(0)
+            for nz in nzrange(A, i)
+                if cv[nz] == i
+                    diag_nz_idx[i] = Ti(nz)
+                    break
+                end
+            end
+        end
+        
+        # Build strong neighbor nz indices
+        @inbounds for i in 1:n_fine
+            for nz in nzrange(A, i)
+                j = cv[nz]
+                if j != i && is_strong[nz]
+                    push!(strong_nbrs_nz_list, Ti(nz))
+                end
+            end
+        end
+        
+        # For Extended+i, all entries need full recomputation (entry_type=3)
+        nnz_P = length(P.nzval)
+        entry_type = fill(Ti(3), nnz_P)
+        numer_idx = zeros(Ti, nnz_P)
+        denom_offsets = Vector{Ti}(undef, nnz_P + 1)
+        denom_entries = Ti[]
+        
+        # Mark coarse points as type 0
+        for i in 1:n_fine
+            if cf[i] == 1
+                for p_nz in P.rowptr[i]:(P.rowptr[i+1]-1)
+                    entry_type[p_nz] = Ti(0)
+                end
+            end
+        end
+        
+        # Simple denom_offsets (not used for type 3, but needs valid structure)
+        for k in 1:(nnz_P + 1)
+            denom_offsets[k] = Ti(1)
+        end
+        
+        strong_nbrs_cols = Vector{Ti}(sn_data)
+        strong_nbrs_nz = Vector{Ti}(strong_nbrs_nz_list)
+        strong_nbrs_offsets = Vector{Ti}(sn_offsets)
+        
+        P_update_map = ProlongationUpdateMap{Ti}(
+            3,  # interp_type = Extended+i
+            copy(is_strong),
+            copy(cf),
+            copy(coarse_map),
+            diag_nz_idx,
+            entry_type,
+            numer_idx,
+            denom_offsets,
+            denom_entries,
+            strong_nbrs_offsets,
+            strong_nbrs_cols,
+            strong_nbrs_nz
+        )
+    end
+    
+    return P, P_update_map
 end
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -1058,4 +1325,415 @@ end
         end
         b_coarse[J] = acc
     end
+end
+
+# ══════════════════════════════════════════════════════════════════════════════
+# In-place prolongation value update for resetup
+# ══════════════════════════════════════════════════════════════════════════════
+
+"""
+    _update_prolongation_values!(level, A; backend, block_size)
+
+Update the prolongation operator values in-place based on new matrix A.
+The sparsity pattern of P is preserved (same rowptr, colval), but nzval
+is recomputed using the stored graph structure in level.P_update_map.
+
+This uses GPU-compatible KernelAbstractions kernels. The precomputed map
+stores all classification decisions (strength graph, CF-split) from setup,
+so P value updates use the same graph structure with new A values.
+
+Dispatch based on interpolation type:
+- Direct (type 1): Simple formula P[k] = -A[numer_idx[k]] / d_i
+- Standard (type 2): Full row-by-row recomputation with indirect contributions
+- Extended+i (type 3): Full row-by-row recomputation with extended stencil
+"""
+function _update_prolongation_values!(level::AMGLevel{Tv, Ti}, A::CSRMatrix{Tv, Ti};
+                                      backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
+    P_update_map = level.P_update_map
+    P_update_map === nothing && return level.P
+    
+    interp_type = P_update_map.interp_type
+    if interp_type == 1
+        # Direct interpolation: use simple kernel
+        _update_P_direct_kernel!(level.P, A, P_update_map; backend=backend, block_size=block_size)
+    elseif interp_type == 2
+        # Standard interpolation: full row recomputation
+        _update_P_standard!(level.P, A, P_update_map)
+    elseif interp_type == 3
+        # Extended+i interpolation: full row recomputation
+        _update_P_extendedi!(level.P, A, P_update_map)
+    end
+    
+    return level.P
+end
+
+"""
+    _update_P_direct_kernel!(P, A, P_update_map; backend, block_size)
+
+GPU-compatible kernel for Direct interpolation P value update.
+
+For each P entry k:
+- If entry_type[k] == 0: P[k] = 1 (coarse point or fallback)
+- If entry_type[k] == 1: P[k] = -A[numer_idx[k]] / d_i where d_i = Σ A[denom_entries[j]]
+"""
+function _update_P_direct_kernel!(P::ProlongationOp, A::CSRMatrix{Tv, Ti},
+                                  P_update_map::ProlongationUpdateMap;
+                                  backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
+    be = _get_backend(P.nzval)
+    A_nzval = nonzeros(A)
+    P_nzval = P.nzval
+    entry_type = P_update_map.entry_type
+    numer_idx = P_update_map.numer_idx
+    denom_offsets = P_update_map.denom_offsets
+    denom_entries = P_update_map.denom_entries
+    nnz_P = length(P_nzval)
+    
+    kernel! = _p_direct_update_kernel!(be, block_size)
+    kernel!(P_nzval, A_nzval, entry_type, numer_idx, denom_offsets, denom_entries; ndrange=nnz_P)
+    _synchronize(be)
+    
+    return P
+end
+
+@kernel function _p_direct_update_kernel!(P_nzval, @Const(A_nzval), @Const(entry_type),
+                                          @Const(numer_idx), @Const(denom_offsets), @Const(denom_entries))
+    k = @index(Global)
+    @inbounds begin
+        if entry_type[k] == 0
+            # Coarse point or fallback: P value = 1
+            P_nzval[k] = one(eltype(P_nzval))
+        else
+            # Direct formula: P[k] = -A[numer] / d_i
+            numer = numer_idx[k]
+            d_i = zero(eltype(A_nzval))
+            for j in denom_offsets[k]:(denom_offsets[k+1]-1)
+                d_i += A_nzval[denom_entries[j]]
+            end
+            abs_d_i = abs(d_i)
+            threshold = eps(real(eltype(A_nzval))) * max(one(real(eltype(A_nzval))), abs_d_i)
+            if abs_d_i > threshold
+                P_nzval[k] = -A_nzval[numer] / d_i
+            else
+                P_nzval[k] = zero(eltype(P_nzval))
+            end
+        end
+    end
+end
+
+"""
+    _update_P_standard!(P, A, P_update_map)
+
+CPU-based Standard interpolation P value update.
+Uses stored graph structure to recompute interpolation weights.
+"""
+function _update_P_standard!(P::ProlongationOp{Ti, Tv}, A::CSRMatrix{Tv, Ti},
+                             P_update_map::ProlongationUpdateMap{Ti}) where {Tv, Ti}
+    A_cpu = csr_to_cpu(A)
+    P_nzval = P.nzval isa Array ? P.nzval : Array(P.nzval)
+    P_rowptr = P.rowptr isa Array ? P.rowptr : Array(P.rowptr)
+    P_colval = P.colval isa Array ? P.colval : Array(P.colval)
+    
+    is_strong = P_update_map.is_strong
+    cf = P_update_map.cf
+    coarse_map = P_update_map.coarse_map
+    strong_nbrs_offsets = P_update_map.strong_nbrs_offsets
+    strong_nbrs_cols = P_update_map.strong_nbrs_cols
+    strong_nbrs_nz = P_update_map.strong_nbrs_nz
+    
+    n_fine = length(cf)
+    cv = colvals(A_cpu)
+    nzv = nonzeros(A_cpu)
+    
+    @inbounds for i in 1:n_fine
+        p_start = Int(P_rowptr[i])
+        p_end = Int(P_rowptr[i+1]) - 1
+        
+        if cf[i] == 1
+            # Coarse point: P = 1
+            if p_start <= p_end
+                P_nzval[p_start] = one(Tv)
+            end
+            continue
+        end
+        
+        # Classify connections using stored strength graph
+        a_ii = zero(Tv)
+        sum_weak = zero(Tv)
+        strong_coarse = Dict{Int, Tv}()
+        strong_fine = Tuple{Int, Tv}[]
+        
+        for nz in nzrange(A_cpu, i)
+            j = cv[nz]
+            if j == i
+                a_ii = nzv[nz]
+            elseif is_strong[nz] && cf[j] == 1
+                cm = coarse_map[j]
+                strong_coarse[cm] = get(strong_coarse, cm, zero(Tv)) + nzv[nz]
+            elseif is_strong[nz] && cf[j] == -1
+                push!(strong_fine, (j, nzv[nz]))
+            else
+                sum_weak += nzv[nz]
+            end
+        end
+        
+        d_i = a_ii + sum_weak
+        
+        # Indirect contributions from strong fine neighbors
+        contributions = Dict{Int, Tv}()
+        for (cm, a_ij) in strong_coarse
+            contributions[cm] = a_ij
+        end
+        
+        for (k, a_ik) in strong_fine
+            diag_k = zero(Tv)
+            for nz2 in nzrange(A_cpu, k)
+                if cv[nz2] == k
+                    diag_k = nzv[nz2]
+                    break
+                end
+            end
+            sgn = real(diag_k) < 0 ? -1 : 1
+            sum_C_k = zero(Tv)
+            coarse_vals_k = Dict{Int, Tv}()
+            for nz2 in nzrange(A_cpu, k)
+                j2 = cv[nz2]
+                j2 == k && continue
+                a_kj = nzv[nz2]
+                if cf[j2] == 1
+                    cm2 = coarse_map[j2]
+                    if haskey(strong_coarse, cm2) && sgn * real(a_kj) < 0
+                        coarse_vals_k[cm2] = get(coarse_vals_k, cm2, zero(Tv)) + a_kj
+                        sum_C_k += a_kj
+                    end
+                end
+                if j2 == i && sgn * real(a_kj) < 0
+                    sum_C_k += a_kj
+                end
+            end
+            if abs(sum_C_k) > eps(real(Tv))
+                distribute = a_ik / sum_C_k
+                for (cm2, a_kj) in coarse_vals_k
+                    contributions[cm2] = get(contributions, cm2, zero(Tv)) + distribute * a_kj
+                end
+                for nz2 in nzrange(A_cpu, k)
+                    if cv[nz2] == i && sgn * real(nzv[nz2]) < 0
+                        d_i += distribute * nzv[nz2]
+                        break
+                    end
+                end
+            else
+                d_i += a_ik
+            end
+        end
+        
+        # Update P values for this row
+        if isempty(contributions)
+            for p_nz in p_start:p_end
+                P_nzval[p_nz] = one(Tv)
+            end
+        else
+            for p_nz in p_start:p_end
+                coarse_col = Int(P_colval[p_nz])
+                if haskey(contributions, coarse_col)
+                    val = contributions[coarse_col]
+                    P_nzval[p_nz] = abs(d_i) > eps(real(Tv)) ? -val / d_i : zero(Tv)
+                else
+                    P_nzval[p_nz] = one(Tv)  # fallback
+                end
+            end
+        end
+    end
+    
+    # Copy back to device if needed
+    if !(P.nzval isa Array)
+        copyto!(P.nzval, P_nzval)
+    end
+    
+    return P
+end
+
+"""
+    _update_P_extendedi!(P, A, P_update_map)
+
+CPU-based Extended+i interpolation P value update.
+Uses stored graph structure to recompute interpolation weights.
+"""
+function _update_P_extendedi!(P::ProlongationOp{Ti, Tv}, A::CSRMatrix{Tv, Ti},
+                              P_update_map::ProlongationUpdateMap{Ti}) where {Tv, Ti}
+    A_cpu = csr_to_cpu(A)
+    P_nzval = P.nzval isa Array ? P.nzval : Array(P.nzval)
+    P_rowptr = P.rowptr isa Array ? P.rowptr : Array(P.rowptr)
+    P_colval = P.colval isa Array ? P.colval : Array(P.colval)
+    
+    is_strong = P_update_map.is_strong
+    cf = P_update_map.cf
+    coarse_map = P_update_map.coarse_map
+    sn_offsets = P_update_map.strong_nbrs_offsets
+    sn_data = P_update_map.strong_nbrs_cols
+    
+    n_fine = length(cf)
+    cv = colvals(A_cpu)
+    nzv = nonzeros(A_cpu)
+    
+    # P_marker for tracking C-hat
+    P_marker = fill(-1, n_fine)
+    strong_f_marker = -2
+    
+    @inbounds for i in 1:n_fine
+        p_start = Int(P_rowptr[i])
+        p_end = Int(P_rowptr[i+1]) - 1
+        
+        if cf[i] == 1
+            if p_start <= p_end
+                P_nzval[p_start] = one(Tv)
+            end
+            continue
+        end
+        
+        # Phase 1: Determine C-hat
+        chat_indices = Int[]
+        for si in sn_offsets[i]:(sn_offsets[i+1]-1)
+            j = sn_data[si]
+            if cf[j] == 1
+                if P_marker[j] < 0
+                    P_marker[j] = length(chat_indices)
+                    push!(chat_indices, j)
+                end
+            elseif cf[j] == -1
+                P_marker[j] = strong_f_marker
+                for sj in sn_offsets[j]:(sn_offsets[j+1]-1)
+                    k = sn_data[sj]
+                    if cf[k] == 1 && P_marker[k] < 0
+                        P_marker[k] = length(chat_indices)
+                        push!(chat_indices, k)
+                    end
+                end
+            end
+        end
+        
+        n_chat = length(chat_indices)
+        if n_chat == 0
+            for p_nz in p_start:p_end
+                P_nzval[p_nz] = one(Tv)
+            end
+            # Reset markers
+            for si in sn_offsets[i]:(sn_offsets[i+1]-1)
+                j = sn_data[si]
+                P_marker[j] = -1
+                if cf[j] == -1
+                    for sj in sn_offsets[j]:(sn_offsets[j+1]-1)
+                        P_marker[sn_data[sj]] = -1
+                    end
+                end
+            end
+            strong_f_marker -= 1
+            continue
+        end
+        
+        # Phase 2: Compute weights
+        P_data = zeros(Tv, n_chat)
+        diagonal = zero(Tv)
+        
+        for nz in nzrange(A_cpu, i)
+            j = cv[nz]
+            a_ij = nzv[nz]
+            
+            if j == i
+                diagonal += a_ij
+                continue
+            end
+            
+            p_idx = P_marker[j]
+            if p_idx >= 0
+                P_data[p_idx + 1] += a_ij
+            elseif p_idx == strong_f_marker
+                diag_j = zero(Tv)
+                for nz3 in nzrange(A_cpu, j)
+                    if cv[nz3] == j
+                        diag_j = nzv[nz3]
+                        break
+                    end
+                end
+                sgn = real(diag_j) < 0 ? -1 : 1
+                
+                sum_val = zero(Tv)
+                for nz2 in nzrange(A_cpu, j)
+                    m = cv[nz2]
+                    m == j && continue
+                    a_jm = nzv[nz2]
+                    if sgn * real(a_jm) < 0
+                        if P_marker[m] >= 0 || m == i
+                            sum_val += a_jm
+                        end
+                    end
+                end
+                
+                if abs(sum_val) > eps(real(Tv))
+                    distribute = a_ij / sum_val
+                    for nz2 in nzrange(A_cpu, j)
+                        m = cv[nz2]
+                        m == j && continue
+                        a_jm = nzv[nz2]
+                        if sgn * real(a_jm) < 0
+                            p_idx_m = P_marker[m]
+                            if p_idx_m >= 0
+                                P_data[p_idx_m + 1] += distribute * a_jm
+                            elseif m == i
+                                diagonal += distribute * a_jm
+                            end
+                        end
+                    end
+                else
+                    diagonal += a_ij
+                end
+            else
+                diagonal += a_ij
+            end
+        end
+        
+        # Phase 3: Finalize weights
+        if abs(diagonal) > eps(real(Tv))
+            for idx in 1:n_chat
+                P_data[idx] /= -diagonal
+            end
+        end
+        
+        # Update P values for this row
+        for p_nz in p_start:p_end
+            coarse_col = Int(P_colval[p_nz])
+            found = false
+            for idx in 1:n_chat
+                if coarse_map[chat_indices[idx]] == coarse_col
+                    P_nzval[p_nz] = P_data[idx]
+                    found = true
+                    break
+                end
+            end
+            if !found
+                P_nzval[p_nz] = one(Tv)
+            end
+        end
+        
+        # Reset markers
+        for j in chat_indices
+            P_marker[j] = -1
+        end
+        for si in sn_offsets[i]:(sn_offsets[i+1]-1)
+            j = sn_data[si]
+            P_marker[j] = -1
+            if cf[j] == -1
+                for sj in sn_offsets[j]:(sn_offsets[j+1]-1)
+                    P_marker[sn_data[sj]] = -1
+                end
+            end
+        end
+        strong_f_marker -= 1
+    end
+    
+    # Copy back to device if needed
+    if !(P.nzval isa Array)
+        copyto!(P.nzval, P_nzval)
+    end
+    
+    return P
 end

@@ -430,6 +430,57 @@ struct RestrictionMap{Ti<:Integer, Vi<:AbstractVector{Ti}}
     triple_pj_idx::Vi     # P.nzval index for p_j weight (sorted by dest NZ)
 end
 
+"""
+    ProlongationUpdateMap
+
+Stores precomputed index mappings for efficient in-place update of prolongation
+operator values during resetup with `update_P=true`. All graph structure
+decisions (strength, CF-split, etc.) are fixed at setup time.
+
+## Design Philosophy
+
+For Direct interpolation: P[i,c] = -A[i,c] / d_i where d_i = diagonal + weak sum
+- Simple linear formula with fixed coefficient 1.0 on numerator A entry
+
+For Standard/Extended+i interpolation: The formula involves indirect contributions
+where weights themselves depend on A values. These use a more complex structure
+that stores the full graph connectivity to enable recomputation.
+
+## Fields
+
+- `interp_type`: 1=Direct, 2=Standard, 3=Extended+i
+- `is_strong`: Boolean array marking strong connections in A
+- `cf`: Coarse/fine split (cf[i]=1 for coarse, -1 for fine)
+- `coarse_map`: Maps fine indices to coarse indices for coarse points
+- `diag_nz_idx`: Diagonal A.nzval index for each row
+
+Per-entry formula data:
+- `entry_type`: 0=coarse point (P=1), 1=Direct formula, 2=Standard, 3=Extended+i
+- `numer_idx`: A.nzval index for numerator term (0 for coarse)
+- `denom_offsets`, `denom_entries`: A.nzval indices for denominator sum
+
+Strong neighbor structure (for Standard/Extended+i row recomputation):
+- `strong_nbrs_offsets`: CSR offset array (n_fine + 1)
+- `strong_nbrs_cols`: column indices of strong neighbors
+- `strong_nbrs_nz`: A.nzval indices of strong neighbors
+"""
+struct ProlongationUpdateMap{Ti<:Integer}
+    interp_type::Int                    # 1=Direct, 2=Standard, 3=Extended+i
+    is_strong::Vector{Bool}             # strong connection mask (nnz_A)
+    cf::Vector{Int}                     # coarse/fine split (n_fine)
+    coarse_map::Vector{Int}             # fine-to-coarse mapping (n_fine)
+    diag_nz_idx::Vector{Ti}             # diagonal A.nzval index for each row
+    # Per-entry formula data
+    entry_type::Vector{Ti}              # 0=coarse (P=1), 1+=compute formula
+    numer_idx::Vector{Ti}               # A.nzval index for numerator
+    denom_offsets::Vector{Ti}           # offset array for denominator
+    denom_entries::Vector{Ti}           # A.nzval indices for denominator
+    # Strong neighbor structure for Standard/Extended+i row recomputation
+    strong_nbrs_offsets::Vector{Ti}     # offset array (n_fine + 1)
+    strong_nbrs_cols::Vector{Ti}        # column indices of strong neighbors
+    strong_nbrs_nz::Vector{Ti}          # A.nzval indices of strong neighbors
+end
+
 # ── AMG Level ─────────────────────────────────────────────────────────────────
 """
     AMGLevel{Tv, Ti}
@@ -440,6 +491,10 @@ happens at the API boundary in `amg_setup` and `amg_resetup!`.
 
 Workspace vectors (`r`, `xc`, `bc`) are allocated on the same device as the
 matrix arrays to avoid host/device memory mixing in GPU kernels.
+
+When `allow_partial_resetup=true` and using CF-splitting based coarsening,
+the `P_update_map` field stores the coarse-fine split and mapping data
+needed for in-place P value update with `update_P=true`.
 """
 mutable struct AMGLevel{Tv, Ti<:Integer}
     A::CSRMatrix{Tv, Ti}
@@ -450,6 +505,7 @@ mutable struct AMGLevel{Tv, Ti<:Integer}
     r::AbstractVector{Tv}      # residual workspace
     xc::AbstractVector{Tv}     # coarse solution workspace
     bc::AbstractVector{Tv}     # coarse RHS workspace
+    P_update_map::Union{Nothing, ProlongationUpdateMap}  # for update_P=true resetup
 end
 
 # ── AMG Hierarchy ─────────────────────────────────────────────────────────────

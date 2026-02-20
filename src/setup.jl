@@ -39,6 +39,36 @@ function _restriction_map_to_device(ref::CSRMatrix, r_map::RestrictionMap)
 end
 
 """
+    _prolongation_update_map_to_device(ref, p_map) -> ProlongationUpdateMap
+
+Copy a ProlongationUpdateMap to the same device as `ref`'s arrays.
+"""
+function _prolongation_update_map_to_device(ref::CSRMatrix, p_map::ProlongationUpdateMap{Ti}) where Ti
+    # For Standard/Extended+i, the graph data stays on CPU (is_strong, cf, coarse_map are needed as-is)
+    # Only the entry_type, numer_idx, denom arrays may need device conversion for Direct interp
+    entry_type = _to_device(ref, p_map.entry_type)
+    numer_idx = _to_device(ref, p_map.numer_idx)
+    denom_offsets = _to_device(ref, p_map.denom_offsets)
+    denom_entries = _to_device(ref, p_map.denom_entries)
+    
+    # Graph structure stays on CPU for Standard/Extended+i recomputation
+    return ProlongationUpdateMap{Ti}(
+        p_map.interp_type,
+        p_map.is_strong,      # stays on CPU
+        p_map.cf,             # stays on CPU
+        p_map.coarse_map,     # stays on CPU
+        p_map.diag_nz_idx,    # stays on CPU (used by CPU update functions)
+        entry_type,
+        numer_idx,
+        denom_offsets,
+        denom_entries,
+        p_map.strong_nbrs_offsets,  # stays on CPU
+        p_map.strong_nbrs_cols,     # stays on CPU
+        p_map.strong_nbrs_nz        # stays on CPU
+    )
+end
+
+"""
     amg_setup(A::SparseMatrixCSC, config; backend, block_size) -> AMGHierarchy
 
 External API entry point: convert `SparseMatrixCSC` to `CSRMatrix` once
@@ -150,7 +180,9 @@ function _build_levels!(levels::Vector{AMGLevel{Tv, Ti}},
                 setup_workspace.old_P = nothing
             end
         end
-        P, n_coarse = _coarsen_with_fallback(A_current, coarsening_alg, config; backend=backend, block_size=block_size, setup_workspace=setup_workspace)
+        # Build P_update_map only for CF-splitting methods when allow_partial_resetup is enabled
+        build_P_update_map = allow_partial_resetup && uses_cf_splitting(coarsening_alg)
+        P, n_coarse, P_update_map = _coarsen_with_fallback(A_current, coarsening_alg, config; backend=backend, block_size=block_size, setup_workspace=setup_workspace, build_P_update_map=build_P_update_map)
         n_coarse >= n && break
         n_coarse == 0 && break
         A_cpu = csr_to_cpu(A_current)
@@ -166,22 +198,24 @@ function _build_levels!(levels::Vector{AMGLevel{Tv, Ti}},
         # iterate by coarse row (P^T structure)
         Pt_map = build_transpose_map(P)
         A_coarse, r_map = compute_coarse_sparsity(A_cpu, P, Pt_map, n_coarse; build_restriction_map=allow_partial_resetup, workspace=galerkin_workspace, old_A_coarse=old_A_coarse)
+        # P_update_map is now returned directly from _coarsen_with_fallback
         if is_gpu
             A_dev = _csr_to_device(A_ref, A_cpu)
             P_dev = _prolongation_to_device(A_ref, P)
             Pt_map_dev = _transpose_map_to_device(A_ref, Pt_map)
             r_map_dev = r_map === nothing ? nothing : _restriction_map_to_device(A_ref, r_map)
+            P_update_map_dev = P_update_map === nothing ? nothing : _prolongation_update_map_to_device(A_ref, P_update_map)
             smoother = build_smoother(A_dev, config.smoother, config.jacobi_omega; backend=backend, block_size=block_size)
             r = _reuse_or_allocate_vector(old_lvl, :r, A_ref, Tv, n)
             xc = _reuse_or_allocate_vector(old_lvl, :xc, A_ref, Tv, n_coarse)
             bc = _reuse_or_allocate_vector(old_lvl, :bc, A_ref, Tv, n_coarse)
-            level = AMGLevel{Tv, Ti}(A_dev, P_dev, Pt_map_dev, r_map_dev, smoother, r, xc, bc)
+            level = AMGLevel{Tv, Ti}(A_dev, P_dev, Pt_map_dev, r_map_dev, smoother, r, xc, bc, P_update_map_dev)
         else
             smoother = build_smoother(A_cpu, config.smoother, config.jacobi_omega; backend=backend, block_size=block_size)
             r = _reuse_or_allocate_vector(old_lvl, :r, A_ref, Tv, n)
             xc = _reuse_or_allocate_vector(old_lvl, :xc, A_ref, Tv, n_coarse)
             bc = _reuse_or_allocate_vector(old_lvl, :bc, A_ref, Tv, n_coarse)
-            level = AMGLevel{Tv, Ti}(A_cpu, P, Pt_map, r_map, smoother, r, xc, bc)
+            level = AMGLevel{Tv, Ti}(A_cpu, P, Pt_map, r_map, smoother, r, xc, bc, P_update_map)
         end
         push!(levels, level)
         A_current = A_coarse
@@ -233,32 +267,39 @@ function _build_coarse_solver(A_current::CSRMatrix{Tv}, A_ref::CSRMatrix,
 end
 
 """
-    _coarsen_with_fallback(A, alg, config)
+    _coarsen_with_fallback(A, alg, config; build_P_update_map=false)
 
 Attempt coarsening. If the result is poor (n_coarse/n > 0.8), retry with
 progressively lower θ (halving each time, up to 3 attempts). This handles
 the common case where coarser-level matrices have sparser strong connectivity
 and the original θ is too aggressive.
+
+When `build_P_update_map=true` and using CF-splitting coarsening, also returns
+the data needed to recompute P values in-place during resetup.
+
+Returns `(P, n_coarse, cf_info)` where `cf_info` is either `nothing` for
+aggregation-based methods, or a NamedTuple with CF-split data for CF methods.
 """
 function _coarsen_with_fallback(A::CSRMatrix, alg::CoarseningAlgorithm,
                                 config::AMGConfig;
                                 backend=DEFAULT_BACKEND, block_size::Int=64,
-                                setup_workspace=nothing)
+                                setup_workspace=nothing,
+                                build_P_update_map::Bool=false)
     n = size(A, 1)
-    P, n_coarse = _coarsen_and_build_P(A, alg, config; backend=backend, block_size=block_size, setup_workspace=setup_workspace)
+    P, n_coarse, cf_info = _coarsen_and_build_P(A, alg, config; backend=backend, block_size=block_size, setup_workspace=setup_workspace, build_P_update_map=build_P_update_map)
     # If coarsening is adequate, return
-    (n_coarse < 0.8 * n || n <= config.max_coarse_size) && return P, n_coarse
+    (n_coarse < 0.8 * n || n <= config.max_coarse_size) && return P, n_coarse, cf_info
     # Try reducing θ
     for attempt in 1:3
         reduced_alg = _reduce_theta(alg, 0.5^attempt)
-        reduced_alg === nothing && return P, n_coarse  # no θ to reduce
-        P2, nc2 = _coarsen_and_build_P(A, reduced_alg, config; backend=backend, block_size=block_size, setup_workspace=setup_workspace)
+        reduced_alg === nothing && return P, n_coarse, cf_info  # no θ to reduce
+        P2, nc2, cf_info2 = _coarsen_and_build_P(A, reduced_alg, config; backend=backend, block_size=block_size, setup_workspace=setup_workspace, build_P_update_map=build_P_update_map)
         if nc2 < n_coarse
-            P, n_coarse = P2, nc2
+            P, n_coarse, cf_info = P2, nc2, cf_info2
         end
         (n_coarse < 0.8 * n) && break
     end
-    return P, n_coarse
+    return P, n_coarse, cf_info
 end
 
 """Reduce the θ parameter of a coarsening algorithm by a factor. Returns nothing
@@ -272,25 +313,31 @@ _reduce_theta(a::AggressiveCoarsening, f) = AggressiveCoarsening(a.θ * f, a.bas
 _reduce_theta(::CoarseningAlgorithm, _) = nothing
 
 """
-    _coarsen_and_build_P(A, alg, config)
+    _coarsen_and_build_P(A, alg, config; build_P_update_map=false)
 
 Perform coarsening and build the prolongation operator. Dispatches based on
 whether the algorithm uses CF-splitting or aggregation.
 When max_row_sum is configured, strength computation uses a weakened matrix.
+
+Returns `(P, n_coarse, cf_info)` where `cf_info` is:
+- For CF-splitting methods with `build_P_update_map=true`: a NamedTuple
+  `(cf=cf, coarse_map=coarse_map, θ=θ, interp_type=interp)`
+- Otherwise: `nothing`
 """
 function _coarsen_and_build_P(A::CSRMatrix, alg::CoarseningAlgorithm,
                               config::AMGConfig=AMGConfig();
                               backend=DEFAULT_BACKEND, block_size::Int=64,
-                              setup_workspace=nothing)
+                              setup_workspace=nothing,
+                              build_P_update_map::Bool=false)
     if uses_cf_splitting(alg)
         cf, coarse_map, n_coarse = coarsen_cf(A, alg, config; backend=backend, block_size=block_size, setup_workspace=setup_workspace)
-        P = build_cf_prolongation(A, cf, coarse_map, n_coarse, alg.interpolation, alg.θ; backend=backend, block_size=block_size, setup_workspace=setup_workspace)
+        P, P_update_map = build_cf_prolongation(A, cf, coarse_map, n_coarse, alg.interpolation, alg.θ; backend=backend, block_size=block_size, setup_workspace=setup_workspace, build_update_map=build_P_update_map)
         # Apply interpolation truncation if configured
         tf = _get_trunc_factor(alg.interpolation)
         if tf > 0
             P = _truncate_interpolation(P, tf)
         end
-        return P, n_coarse
+        return P, n_coarse, P_update_map
     else
         agg, n_coarse = coarsen(A, alg, config; backend=backend, block_size=block_size, setup_workspace=setup_workspace)
         P = build_prolongation(A, agg, n_coarse)
@@ -298,14 +345,15 @@ function _coarsen_and_build_P(A::CSRMatrix, alg::CoarseningAlgorithm,
         if _has_filtering(alg) && alg.filtering
             P = _filter_prolongation(P, alg.filter_tol)
         end
-        return P, n_coarse
+        return P, n_coarse, nothing
     end
 end
 
 function _coarsen_and_build_P(A::CSRMatrix, alg::SmoothedAggregationCoarsening,
                               config::AMGConfig=AMGConfig();
                               backend=DEFAULT_BACKEND, block_size::Int=64,
-                              setup_workspace=nothing)
+                              setup_workspace=nothing,
+                              build_P_update_map::Bool=false)
     agg, n_coarse = coarsen(A, AggregationCoarsening(alg.θ), config; backend=backend, block_size=block_size, setup_workspace=setup_workspace)
     P_tent = build_prolongation(A, agg, n_coarse)
     # Smooth: P = (I - ω D⁻¹ A) P_tent
@@ -314,11 +362,11 @@ function _coarsen_and_build_P(A::CSRMatrix, alg::SmoothedAggregationCoarsening,
     if alg.filtering
         P = _filter_prolongation(P, alg.filter_tol)
     end
-    return P, n_coarse
+    return P, n_coarse, nothing
 end
 
 """
-    _coarsen_and_build_P(A, alg::AggressiveCoarsening, config)
+    _coarsen_and_build_P(A, alg::AggressiveCoarsening, config; build_P_update_map=false)
 
 Aggressive coarsening dispatch. When `base=:hmis` or `base=:pmis`, performs
 two-pass CF-splitting (HYPRE-style aggressive coarsening) and builds
@@ -329,28 +377,29 @@ aggressive coarsening.
 function _coarsen_and_build_P(A::CSRMatrix, alg::AggressiveCoarsening,
                               config::AMGConfig=AMGConfig();
                               backend=DEFAULT_BACKEND, block_size::Int=64,
-                              setup_workspace=nothing)
+                              setup_workspace=nothing,
+                              build_P_update_map::Bool=false)
     if alg.base == :hmis
         cf, coarse_map, n_coarse = coarsen_aggressive_cf(A, alg.θ, :hmis; config=config, backend=backend, block_size=block_size, setup_workspace=setup_workspace)
-        P = build_cf_prolongation(A, cf, coarse_map, n_coarse, alg.interpolation, alg.θ; backend=backend, block_size=block_size, setup_workspace=setup_workspace)
+        P, P_update_map = build_cf_prolongation(A, cf, coarse_map, n_coarse, alg.interpolation, alg.θ; backend=backend, block_size=block_size, setup_workspace=setup_workspace, build_update_map=build_P_update_map)
         tf = _get_trunc_factor(alg.interpolation)
         if tf > 0
             P = _truncate_interpolation(P, tf)
         end
-        return P, n_coarse
+        return P, n_coarse, P_update_map
     elseif alg.base == :pmis
         cf, coarse_map, n_coarse = coarsen_aggressive_cf(A, alg.θ, :pmis; config=config, backend=backend, block_size=block_size, setup_workspace=setup_workspace)
-        P = build_cf_prolongation(A, cf, coarse_map, n_coarse, alg.interpolation, alg.θ; backend=backend, block_size=block_size, setup_workspace=setup_workspace)
+        P, P_update_map = build_cf_prolongation(A, cf, coarse_map, n_coarse, alg.interpolation, alg.θ; backend=backend, block_size=block_size, setup_workspace=setup_workspace, build_update_map=build_P_update_map)
         tf = _get_trunc_factor(alg.interpolation)
         if tf > 0
             P = _truncate_interpolation(P, tf)
         end
-        return P, n_coarse
+        return P, n_coarse, P_update_map
     else
         # Legacy: aggregation-based aggressive coarsening
         agg, n_coarse = coarsen(A, alg, config; backend=backend, block_size=block_size, setup_workspace=setup_workspace)
         P = build_prolongation(A, agg, n_coarse)
-        return P, n_coarse
+        return P, n_coarse, nothing
     end
 end
 

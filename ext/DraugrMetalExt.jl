@@ -31,7 +31,7 @@ function Draugr.amg_setup(A::CSRMatrix{Tv, Ti, <:MtlVector, <:MtlVector, <:MtlVe
 end
 
 """
-    amg_resetup!(hierarchy, A_new::CSRMatrix{Tv, Ti, <:MtlVector, <:MtlVector, <:MtlVector}, config)
+    amg_resetup!(hierarchy, A_new::CSRMatrix{Tv, Ti, <:MtlVector, <:MtlVector, <:MtlVector}, config; partial=true, update_P=false)
 
 AMG resetup for a `CSRMatrix` backed by Metal `MtlVector` arrays.
 Converts to a CPU `CSRMatrix` and forwards to the main `CSRMatrix`-based resetup.
@@ -39,9 +39,10 @@ Converts to a CPU `CSRMatrix` and forwards to the main `CSRMatrix`-based resetup
 function Draugr.amg_resetup!(hierarchy::AMGHierarchy{Tv, Ti},
                                   A_new::CSRMatrix{Tv, Ti, <:MtlVector, <:MtlVector, <:MtlVector},
                                   config::AMGConfig=AMGConfig();
-                                  partial::Bool=true) where {Tv, Ti}
+                                  partial::Bool=true,
+                                  update_P::Bool=false) where {Tv, Ti}
     A_csr = Draugr.csr_to_cpu(A_new)
-    return Draugr.amg_resetup!(hierarchy, A_csr, config; partial=partial)
+    return Draugr.amg_resetup!(hierarchy, A_csr, config; partial=partial, update_P=update_P)
 end
 
 end # module

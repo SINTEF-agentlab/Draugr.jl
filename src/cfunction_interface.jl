@@ -258,8 +258,25 @@ Base.@ccallable function draugr_amg_setup(n::Int32, nnz_count::Int32,
             _set_last_error("Invalid config handle: $config_handle")
             return Int32(-1)
         end
-        hierarchy = amg_setup(A, config;
-                              allow_partial_resetup=(allow_partial_resetup != Int32(0)))
+        # Override allow_partial_resetup from config if specified in the C call
+        effective_config = AMGConfig(;
+            coarsening = config.coarsening,
+            smoother = config.smoother,
+            max_levels = config.max_levels,
+            max_coarse_size = config.max_coarse_size,
+            pre_smoothing_steps = config.pre_smoothing_steps,
+            post_smoothing_steps = config.post_smoothing_steps,
+            jacobi_omega = config.jacobi_omega,
+            verbose = config.verbose,
+            initial_coarsening = config.initial_coarsening,
+            initial_coarsening_levels = config.initial_coarsening_levels,
+            max_row_sum = config.max_row_sum,
+            cycle_type = config.cycle_type,
+            strength_type = config.strength_type,
+            coarse_solve_on_cpu = config.coarse_solve_on_cpu,
+            allow_partial_resetup = (allow_partial_resetup != Int32(0)),
+        )
+        hierarchy = amg_setup(A, effective_config)
         lock(_HANDLE_LOCK) do
             h = _new_handle()
             _HIERARCHY_HANDLES[h] = hierarchy
@@ -319,9 +336,26 @@ Base.@ccallable function draugr_amg_resetup(handle::Int32, n::Int32, nnz_count::
             _set_last_error("Invalid handle (hierarchy=$handle, config=$config_handle)")
             return Int32(-1)
         end
-        amg_resetup!(hierarchy, A_csr, config;
-                     partial=(partial != Int32(0)),
-                     allow_partial_resetup=(allow_partial_resetup != Int32(0)))
+        # Override allow_partial_resetup from config if doing full resetup
+        effective_config = AMGConfig(;
+            coarsening = config.coarsening,
+            smoother = config.smoother,
+            max_levels = config.max_levels,
+            max_coarse_size = config.max_coarse_size,
+            pre_smoothing_steps = config.pre_smoothing_steps,
+            post_smoothing_steps = config.post_smoothing_steps,
+            jacobi_omega = config.jacobi_omega,
+            verbose = config.verbose,
+            initial_coarsening = config.initial_coarsening,
+            initial_coarsening_levels = config.initial_coarsening_levels,
+            max_row_sum = config.max_row_sum,
+            cycle_type = config.cycle_type,
+            strength_type = config.strength_type,
+            coarse_solve_on_cpu = config.coarse_solve_on_cpu,
+            allow_partial_resetup = (allow_partial_resetup != Int32(0)),
+        )
+        amg_resetup!(hierarchy, A_csr, effective_config;
+                     partial=(partial != Int32(0)))
         return Int32(0)
     catch e
         msg = sprint(showerror, e)

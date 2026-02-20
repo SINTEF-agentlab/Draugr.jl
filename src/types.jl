@@ -430,6 +430,32 @@ struct RestrictionMap{Ti<:Integer, Vi<:AbstractVector{Ti}}
     triple_pj_idx::Vi     # P.nzval index for p_j weight (sorted by dest NZ)
 end
 
+"""
+    ProlongationUpdateMap{Ti, Vi}
+
+Stores the data needed to recompute prolongation operator values in-place
+during resetup with `update_P=true`. This enables fast resetup where the
+sparsity pattern of P is preserved but values are recomputed based on
+the new matrix coefficients.
+
+For CF-splitting based methods (PMIS, HMIS, RS), this stores:
+- `cf`: coarse-fine split array (cf[i]=1 for coarse, cf[i]=-1 for fine)
+- `coarse_map`: fine-to-coarse index mapping
+- `n_coarse`: number of coarse points
+- `θ`: strength threshold used during setup
+- `interp_type`: interpolation type (Direct, Standard, ExtendedI)
+
+This allows recomputing the interpolation weights without re-doing the
+expensive CF-splitting phase.
+"""
+struct ProlongationUpdateMap{Ti<:Integer}
+    cf::Vector{Int}              # coarse-fine split (CPU)
+    coarse_map::Vector{Int}      # fine-to-coarse mapping (CPU)
+    n_coarse::Int                # number of coarse points
+    θ::Float64                   # strength threshold
+    interp_type::InterpolationType  # interpolation type tag
+end
+
 # ── AMG Level ─────────────────────────────────────────────────────────────────
 """
     AMGLevel{Tv, Ti}
@@ -440,6 +466,10 @@ happens at the API boundary in `amg_setup` and `amg_resetup!`.
 
 Workspace vectors (`r`, `xc`, `bc`) are allocated on the same device as the
 matrix arrays to avoid host/device memory mixing in GPU kernels.
+
+When `allow_partial_resetup=true` and using CF-splitting based coarsening,
+the `P_update_map` field stores the coarse-fine split and mapping data
+needed for in-place P value update with `update_P=true`.
 """
 mutable struct AMGLevel{Tv, Ti<:Integer}
     A::CSRMatrix{Tv, Ti}
@@ -450,6 +480,7 @@ mutable struct AMGLevel{Tv, Ti<:Integer}
     r::AbstractVector{Tv}      # residual workspace
     xc::AbstractVector{Tv}     # coarse solution workspace
     bc::AbstractVector{Tv}     # coarse RHS workspace
+    P_update_map::Union{Nothing, ProlongationUpdateMap}  # for update_P=true resetup
 end
 
 # ── AMG Hierarchy ─────────────────────────────────────────────────────────────

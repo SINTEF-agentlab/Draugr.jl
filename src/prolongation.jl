@@ -1059,3 +1059,508 @@ end
         b_coarse[J] = acc
     end
 end
+
+# ══════════════════════════════════════════════════════════════════════════════
+# In-place prolongation value update for resetup
+# ══════════════════════════════════════════════════════════════════════════════
+
+"""
+    _update_prolongation_values!(level, A; backend, block_size)
+
+Update the prolongation operator values in-place based on new matrix A.
+The sparsity pattern of P is preserved (same rowptr, colval), but nzval
+is recomputed using the stored CF-split data in level.P_update_map.
+
+This is used during `amg_resetup!` with `update_P=true` to recompute
+interpolation weights without re-doing the CF-splitting phase.
+"""
+function _update_prolongation_values!(level::AMGLevel{Tv, Ti}, A::CSRMatrix{Tv, Ti};
+                                      backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
+    P_update_map = level.P_update_map
+    P_update_map === nothing && return level.P
+    
+    # Dispatch based on interpolation type
+    _update_P_values!(level.P, A, P_update_map; backend=backend, block_size=block_size)
+    
+    return level.P
+end
+
+"""
+    _update_P_values!(P, A, P_update_map; backend, block_size)
+
+Core function to update P.nzval in-place based on the interpolation type
+stored in P_update_map.
+"""
+function _update_P_values!(P::ProlongationOp{Ti, Tv}, A::CSRMatrix{Tv, Ti},
+                           P_update_map::ProlongationUpdateMap{Ti};
+                           backend=DEFAULT_BACKEND, block_size::Int=64) where {Ti, Tv}
+    return _update_P_values!(P, A, P_update_map, P_update_map.interp_type; backend=backend, block_size=block_size)
+end
+
+# ── Direct interpolation in-place update ─────────────────────────────────────
+
+"""
+    _update_P_values!(P, A, P_update_map, ::DirectInterpolation)
+
+In-place update of P values for direct interpolation.
+For each fine point i:
+  P[i, coarse_map[j]] = -A[i,j] / d_i
+where j is a strong coarse neighbor and d_i = A[i,i] + sum_weak_and_fine.
+"""
+function _update_P_values!(P::ProlongationOp{Ti, Tv}, A::CSRMatrix{Tv, Ti},
+                           P_update_map::ProlongationUpdateMap{Ti},
+                           ::DirectInterpolation;
+                           backend=DEFAULT_BACKEND, block_size::Int=64) where {Ti, Tv}
+    # Convert to CPU for scalar indexing operations (strength graph etc)
+    A_cpu = csr_to_cpu(A)
+    P_nzval = P.nzval isa Array ? P.nzval : Array(P.nzval)
+    
+    cf = P_update_map.cf
+    coarse_map = P_update_map.coarse_map
+    θ = P_update_map.θ
+    n_fine = size(A_cpu, 1)
+    
+    # Recompute strength graph
+    is_strong = strength_graph(A_cpu, θ; backend=CPU(), block_size=block_size)
+    is_strong_cpu = is_strong isa Array ? is_strong : Array(is_strong)
+    
+    cv = colvals(A_cpu)
+    nzv = nonzeros(A_cpu)
+    
+    @inbounds for i in 1:n_fine
+        pos = Int(P.rowptr[i])
+        row_end = Int(P.rowptr[i + 1]) - 1
+        
+        if cf[i] == 1
+            # Coarse point: identity mapping
+            P_nzval[pos] = one(Tv)
+        else
+            # Fine point: compute interpolation weights
+            a_ii = zero(Tv)
+            sum_nonC = zero(Tv)
+            diag_sign = zero(real(Tv))
+            
+            # First pass: find diagonal and compute d_i
+            for nz in nzrange(A_cpu, i)
+                j = cv[nz]
+                if j == i
+                    a_ii = nzv[nz]
+                    diag_sign = sign(real(a_ii))
+                end
+            end
+            
+            # Track which coarse columns get interpolated to
+            interp_count = 0
+            for nz in nzrange(A_cpu, i)
+                j = cv[nz]
+                j == i && continue
+                is_interp_coarse = is_strong_cpu[nz] && cf[j] == 1 &&
+                    (diag_sign == 0 || sign(real(nzv[nz])) != diag_sign)
+                if is_interp_coarse
+                    interp_count += 1
+                else
+                    sum_nonC += nzv[nz]
+                end
+            end
+            
+            d_i = a_ii + sum_nonC
+            
+            if interp_count == 0
+                # Fallback: already have an entry, set to 1
+                P_nzval[pos] = one(Tv)
+            else
+                # Fill P values for strong coarse neighbors
+                p_idx = pos
+                for nz in nzrange(A_cpu, i)
+                    j = cv[nz]
+                    j == i && continue
+                    is_interp_coarse = is_strong_cpu[nz] && cf[j] == 1 &&
+                        (diag_sign == 0 || sign(real(nzv[nz])) != diag_sign)
+                    if is_interp_coarse
+                        P_nzval[p_idx] = abs(d_i) > _safe_threshold(Tv, abs(d_i)) ? -nzv[nz] / d_i : zero(Tv)
+                        p_idx += 1
+                    end
+                end
+            end
+        end
+    end
+    
+    # Copy back to device if needed
+    if !(P.nzval isa Array)
+        copyto!(P.nzval, P_nzval)
+    end
+    
+    return P
+end
+
+# ── Standard interpolation in-place update ───────────────────────────────────
+
+"""
+    _update_P_values!(P, A, P_update_map, ::StandardInterpolation)
+
+In-place update of P values for standard (classical) interpolation.
+"""
+function _update_P_values!(P::ProlongationOp{Ti, Tv}, A::CSRMatrix{Tv, Ti},
+                           P_update_map::ProlongationUpdateMap{Ti},
+                           ::StandardInterpolation;
+                           backend=DEFAULT_BACKEND, block_size::Int=64) where {Ti, Tv}
+    A_cpu = csr_to_cpu(A)
+    P_nzval = P.nzval isa Array ? P.nzval : Array(P.nzval)
+    P_colval = P.colval isa Array ? P.colval : Array(P.colval)
+    
+    cf = P_update_map.cf
+    coarse_map = P_update_map.coarse_map
+    θ = P_update_map.θ
+    n_fine = size(A_cpu, 1)
+    
+    is_strong = strength_graph(A_cpu, θ; backend=CPU(), block_size=block_size)
+    is_strong_cpu = is_strong isa Array ? is_strong : Array(is_strong)
+    
+    cv = colvals(A_cpu)
+    nzv = nonzeros(A_cpu)
+    
+    @inbounds for i in 1:n_fine
+        pos = Int(P.rowptr[i])
+        row_end = Int(P.rowptr[i + 1]) - 1
+        
+        if cf[i] == 1
+            # Coarse point: identity mapping
+            P_nzval[pos] = one(Tv)
+            continue
+        end
+        
+        # Classify connections for fine point i
+        a_ii = zero(Tv)
+        sum_weak = zero(Tv)
+        strong_coarse = Dict{Int, Tv}()  # coarse_map[j] → a_{i,j}
+        strong_fine = Tuple{Int, Tv}[]   # (fine node k, a_{i,k})
+        
+        for nz in nzrange(A_cpu, i)
+            j = cv[nz]
+            if j == i
+                a_ii = nzv[nz]
+            elseif is_strong_cpu[nz] && cf[j] == 1
+                cm = coarse_map[j]
+                strong_coarse[cm] = get(strong_coarse, cm, zero(Tv)) + nzv[nz]
+            elseif is_strong_cpu[nz] && cf[j] == -1
+                push!(strong_fine, (j, nzv[nz]))
+            else
+                sum_weak += nzv[nz]
+            end
+        end
+        
+        d_i = a_ii + sum_weak
+        
+        # Add indirect contributions from strong fine neighbors
+        contributions = Dict{Int, Tv}()
+        for (cm, a_ij) in strong_coarse
+            contributions[cm] = a_ij
+        end
+        
+        for (k, a_ik) in strong_fine
+            diag_k = zero(Tv)
+            for nz2 in nzrange(A_cpu, k)
+                if cv[nz2] == k
+                    diag_k = nzv[nz2]
+                    break
+                end
+            end
+            sgn = real(diag_k) < 0 ? -1 : 1
+            sum_C_k = zero(Tv)
+            coarse_vals_k = Dict{Int, Tv}()
+            
+            for nz2 in nzrange(A_cpu, k)
+                j2 = cv[nz2]
+                j2 == k && continue
+                a_kj = nzv[nz2]
+                if cf[j2] == 1
+                    cm2 = coarse_map[j2]
+                    if haskey(strong_coarse, cm2) && sgn * real(a_kj) < 0
+                        coarse_vals_k[cm2] = get(coarse_vals_k, cm2, zero(Tv)) + a_kj
+                        sum_C_k += a_kj
+                    end
+                end
+                if j2 == i && sgn * real(a_kj) < 0
+                    sum_C_k += a_kj
+                end
+            end
+            
+            if abs(sum_C_k) > eps(real(Tv))
+                distribute = a_ik / sum_C_k
+                for (cm2, a_kj) in coarse_vals_k
+                    contributions[cm2] = get(contributions, cm2, zero(Tv)) + distribute * a_kj
+                end
+                for nz2 in nzrange(A_cpu, k)
+                    if cv[nz2] == i && sgn * real(nzv[nz2]) < 0
+                        d_i += distribute * nzv[nz2]
+                        break
+                    end
+                end
+            else
+                d_i += a_ik
+            end
+        end
+        
+        # Write values to P in the existing sparsity order
+        for p_idx in pos:row_end
+            coarse_col = Int(P_colval[p_idx])
+            if haskey(contributions, coarse_col)
+                val = contributions[coarse_col]
+                w = abs(d_i) > eps(real(Tv)) ? -val / d_i : zero(Tv)
+                P_nzval[p_idx] = w
+            else
+                P_nzval[p_idx] = one(Tv)  # fallback
+            end
+        end
+    end
+    
+    if !(P.nzval isa Array)
+        copyto!(P.nzval, P_nzval)
+    end
+    
+    return P
+end
+
+# ── Extended+i interpolation in-place update ─────────────────────────────────
+
+"""
+    _update_P_values!(P, A, P_update_map, interp::ExtendedIInterpolation)
+
+In-place update of P values for extended+i interpolation.
+"""
+function _update_P_values!(P::ProlongationOp{Ti, Tv}, A::CSRMatrix{Tv, Ti},
+                           P_update_map::ProlongationUpdateMap{Ti},
+                           interp::ExtendedIInterpolation;
+                           backend=DEFAULT_BACKEND, block_size::Int=64) where {Ti, Tv}
+    A_cpu = csr_to_cpu(A)
+    P_nzval = P.nzval isa Array ? P.nzval : Array(P.nzval)
+    P_colval = P.colval isa Array ? P.colval : Array(P.colval)
+    
+    cf = P_update_map.cf
+    coarse_map = P_update_map.coarse_map
+    θ = P_update_map.θ
+    n_fine = size(A_cpu, 1)
+    
+    is_strong = strength_graph(A_cpu, θ; backend=CPU(), block_size=block_size)
+    is_strong_cpu = is_strong isa Array ? is_strong : Array(is_strong)
+    
+    cv = colvals(A_cpu)
+    nzv = nonzeros(A_cpu)
+    
+    # Build strong neighbor structure
+    sn_offsets = Vector{Int}(undef, n_fine + 1)
+    sn_data = Int[]
+    
+    @inbounds begin
+        for i in 1:n_fine
+            cnt = 0
+            for nz in nzrange(A_cpu, i)
+                j = cv[nz]
+                if j != i && is_strong_cpu[nz]
+                    cnt += 1
+                end
+            end
+            sn_offsets[i] = cnt
+        end
+    end
+    
+    total_sn = 0
+    @inbounds for i in 1:n_fine
+        cnt = sn_offsets[i]
+        sn_offsets[i] = total_sn + 1
+        total_sn += cnt
+    end
+    sn_offsets[n_fine + 1] = total_sn + 1
+    resize!(sn_data, total_sn)
+    
+    @inbounds begin
+        pos = 0
+        for i in 1:n_fine
+            for nz in nzrange(A_cpu, i)
+                j = cv[nz]
+                if j != i && is_strong_cpu[nz]
+                    pos += 1
+                    sn_data[pos] = j
+                end
+            end
+        end
+    end
+    
+    # P_marker for tracking C-hat
+    P_marker = fill(-1, n_fine)
+    strong_f_marker = -2
+    
+    @inbounds for i in 1:n_fine
+        pos_start = Int(P.rowptr[i])
+        row_end = Int(P.rowptr[i + 1]) - 1
+        
+        if cf[i] == 1
+            P_nzval[pos_start] = one(Tv)
+            continue
+        end
+        
+        # Phase 1: Determine C-hat
+        chat_indices = Int[]
+        
+        for si in sn_offsets[i]:(sn_offsets[i + 1] - 1)
+            j = sn_data[si]
+            if cf[j] == 1
+                if P_marker[j] < 0
+                    P_marker[j] = length(chat_indices)
+                    push!(chat_indices, j)
+                end
+            elseif cf[j] == -1
+                P_marker[j] = strong_f_marker
+                for sj in sn_offsets[j]:(sn_offsets[j + 1] - 1)
+                    k = sn_data[sj]
+                    if cf[k] == 1 && P_marker[k] < 0
+                        P_marker[k] = length(chat_indices)
+                        push!(chat_indices, k)
+                    end
+                end
+            end
+        end
+        
+        n_chat = length(chat_indices)
+        
+        if n_chat == 0
+            # Fallback
+            for p_idx in pos_start:row_end
+                P_nzval[p_idx] = one(Tv)
+            end
+            for si in sn_offsets[i]:(sn_offsets[i + 1] - 1)
+                j = sn_data[si]
+                P_marker[j] = -1
+                if cf[j] == -1
+                    for sj in sn_offsets[j]:(sn_offsets[j + 1] - 1)
+                        P_marker[sn_data[sj]] = -1
+                    end
+                end
+            end
+            strong_f_marker -= 1
+            continue
+        end
+        
+        # Phase 2: Compute weights
+        P_data = zeros(Tv, n_chat)
+        diagonal = zero(Tv)
+        
+        for nz in nzrange(A_cpu, i)
+            j = cv[nz]
+            a_ij = nzv[nz]
+            
+            if j == i
+                diagonal += a_ij
+                continue
+            end
+            
+            p_idx = P_marker[j]
+            if p_idx >= 0
+                P_data[p_idx + 1] += a_ij
+            elseif p_idx == strong_f_marker
+                diag_j = zero(Tv)
+                for nz3 in nzrange(A_cpu, j)
+                    if cv[nz3] == j
+                        diag_j = nzv[nz3]
+                        break
+                    end
+                end
+                sgn = real(diag_j) < 0 ? -1 : 1
+                
+                sum_val = zero(Tv)
+                for nz2 in nzrange(A_cpu, j)
+                    m = cv[nz2]
+                    m == j && continue
+                    a_jm = nzv[nz2]
+                    if sgn * real(a_jm) < 0
+                        if P_marker[m] >= 0 || m == i
+                            sum_val += a_jm
+                        end
+                    end
+                end
+                
+                if abs(sum_val) > eps(real(Tv))
+                    distribute = a_ij / sum_val
+                    for nz2 in nzrange(A_cpu, j)
+                        m = cv[nz2]
+                        m == j && continue
+                        a_jm = nzv[nz2]
+                        if sgn * real(a_jm) < 0
+                            p_idx_m = P_marker[m]
+                            if p_idx_m >= 0
+                                P_data[p_idx_m + 1] += distribute * a_jm
+                            elseif m == i
+                                diagonal += distribute * a_jm
+                            end
+                        end
+                    end
+                else
+                    diagonal += a_ij
+                end
+            else
+                diagonal += a_ij
+            end
+        end
+        
+        # Phase 3: Finalize weights
+        if abs(diagonal) > eps(real(Tv))
+            for idx in 1:n_chat
+                P_data[idx] /= -diagonal
+            end
+        end
+        
+        # Apply trunc_scaling if present
+        row_scale = one(Tv)
+        if P.trunc_scaling !== nothing
+            # Use stored scaling factors
+            trunc_scaling = P.trunc_scaling isa Array ? P.trunc_scaling : Array(P.trunc_scaling)
+            for p_idx in pos_start:row_end
+                coarse_col = Int(P_colval[p_idx])
+                # Find which chat index this corresponds to
+                for idx in 1:n_chat
+                    if coarse_map[chat_indices[idx]] == coarse_col
+                        P_nzval[p_idx] = P_data[idx] * trunc_scaling[p_idx]
+                        break
+                    end
+                end
+            end
+        else
+            # Write values directly
+            for p_idx in pos_start:row_end
+                coarse_col = Int(P_colval[p_idx])
+                found = false
+                for idx in 1:n_chat
+                    if coarse_map[chat_indices[idx]] == coarse_col
+                        P_nzval[p_idx] = P_data[idx]
+                        found = true
+                        break
+                    end
+                end
+                if !found
+                    P_nzval[p_idx] = one(Tv)  # fallback
+                end
+            end
+        end
+        
+        # Reset markers
+        for j in chat_indices
+            P_marker[j] = -1
+        end
+        for si in sn_offsets[i]:(sn_offsets[i + 1] - 1)
+            j = sn_data[si]
+            P_marker[j] = -1
+            if cf[j] == -1
+                for sj in sn_offsets[j]:(sn_offsets[j + 1] - 1)
+                    P_marker[sn_data[sj]] = -1
+                end
+            end
+        end
+        strong_f_marker -= 1
+    end
+    
+    if !(P.nzval isa Array)
+        copyto!(P.nzval, P_nzval)
+    end
+    
+    return P
+end

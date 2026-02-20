@@ -1645,9 +1645,12 @@ function _update_P_extendedi!(P::ProlongationOp{Ti, Tv}, A::CSRMatrix{Tv, Ti},
             if cf[j] == 1
                 if P_marker[j] < 0
                     n_chat += 1
-                    if n_chat <= length(chat_indices_buf)
-                        chat_indices_buf[n_chat] = j
+                    # Resize buffer if needed
+                    if n_chat > length(chat_indices_buf)
+                        resize!(chat_indices_buf, max(n_chat, 2 * length(chat_indices_buf)))
+                        resize!(P_data_buf, length(chat_indices_buf))
                     end
+                    chat_indices_buf[n_chat] = j
                     P_marker[j] = n_chat - 1  # 0-based index into P_data
                 end
             elseif cf[j] == -1
@@ -1656,9 +1659,12 @@ function _update_P_extendedi!(P::ProlongationOp{Ti, Tv}, A::CSRMatrix{Tv, Ti},
                     k = sn_data[sj]
                     if cf[k] == 1 && P_marker[k] < 0
                         n_chat += 1
-                        if n_chat <= length(chat_indices_buf)
-                            chat_indices_buf[n_chat] = k
+                        # Resize buffer if needed
+                        if n_chat > length(chat_indices_buf)
+                            resize!(chat_indices_buf, max(n_chat, 2 * length(chat_indices_buf)))
+                            resize!(P_data_buf, length(chat_indices_buf))
                         end
+                        chat_indices_buf[n_chat] = k
                         P_marker[k] = n_chat - 1
                     end
                 end
@@ -1681,12 +1687,6 @@ function _update_P_extendedi!(P::ProlongationOp{Ti, Tv}, A::CSRMatrix{Tv, Ti},
             end
             strong_f_marker -= 1
             continue
-        end
-        
-        # Resize P_data_buf if needed (rare, only if buffer too small)
-        if n_chat > length(P_data_buf)
-            resize!(P_data_buf, n_chat)
-            resize!(chat_indices_buf, n_chat)
         end
         
         # Phase 2: Compute weights - zero out P_data workspace

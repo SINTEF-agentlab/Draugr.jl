@@ -10,8 +10,9 @@ The backend is inferred from the array type of A's data, so GPU arrays
 will use GPU kernels automatically.
 """
 function strength_graph(A::CSRMatrix{Tv, Ti}, θ::Real;
-                        backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
-    return strength_graph(A, θ, AbsoluteStrength(); backend=backend, block_size=block_size)
+                        backend=DEFAULT_BACKEND, block_size::Int=64,
+                        is_strong=nothing) where {Tv, Ti}
+    return strength_graph(A, θ, AbsoluteStrength(); backend=backend, block_size=block_size, is_strong=is_strong)
 end
 
 """
@@ -22,17 +23,24 @@ Uses a KA kernel for GPU compatibility. The result array type matches the
 backend (GPU arrays for GPU backends, CPU arrays for CPU backends).
 """
 function strength_graph(A::CSRMatrix{Tv, Ti}, θ::Real, ::AbsoluteStrength;
-                        backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
+                        backend=DEFAULT_BACKEND, block_size::Int=64,
+                        is_strong=nothing) where {Tv, Ti}
     n = size(A, 1)
     nzv = nonzeros(A)
     cv = colvals(A)
     rp = rowptr(A)
     be = _get_backend(nzv)
-    is_strong = KernelAbstractions.zeros(be, Bool, nnz(A))
+    if is_strong === nothing
+        is_strong_buf = KernelAbstractions.zeros(be, Bool, nnz(A))
+    else
+        _ws_resize!(is_strong, nnz(A))
+        fill!(is_strong, false)
+        is_strong_buf = is_strong
+    end
     kernel! = absolute_strength_kernel!(be, block_size)
-    kernel!(is_strong, nzv, cv, rp, Tv(θ); ndrange=n)
+    kernel!(is_strong_buf, nzv, cv, rp, Tv(θ); ndrange=n)
     _synchronize(be)
-    return is_strong
+    return is_strong_buf
 end
 
 @kernel function absolute_strength_kernel!(is_strong, @Const(nzval), @Const(colval),
@@ -76,17 +84,24 @@ falls back to absolute-value strength for that row.
 Uses a KA kernel for GPU compatibility.
 """
 function strength_graph(A::CSRMatrix{Tv, Ti}, θ::Real, ::SignedStrength;
-                        backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
+                        backend=DEFAULT_BACKEND, block_size::Int=64,
+                        is_strong=nothing) where {Tv, Ti}
     n = size(A, 1)
     nzv = nonzeros(A)
     cv = colvals(A)
     rp = rowptr(A)
     be = _get_backend(nzv)
-    is_strong = KernelAbstractions.zeros(be, Bool, nnz(A))
+    if is_strong === nothing
+        is_strong_buf = KernelAbstractions.zeros(be, Bool, nnz(A))
+    else
+        _ws_resize!(is_strong, nnz(A))
+        fill!(is_strong, false)
+        is_strong_buf = is_strong
+    end
     kernel! = signed_strength_kernel!(be, block_size)
-    kernel!(is_strong, nzv, cv, rp, Tv(θ); ndrange=n)
+    kernel!(is_strong_buf, nzv, cv, rp, Tv(θ); ndrange=n)
     _synchronize(be)
-    return is_strong
+    return is_strong_buf
 end
 
 @kernel function signed_strength_kernel!(is_strong, @Const(nzval), @Const(colval),
@@ -153,8 +168,9 @@ end
 Dispatch strength computation based on config's strength_type.
 """
 function strength_graph(A::CSRMatrix, θ::Real, config::AMGConfig;
-                        backend=DEFAULT_BACKEND, block_size::Int=64)
-    return strength_graph(A, θ, config.strength_type; backend=backend, block_size=block_size)
+                        backend=DEFAULT_BACKEND, block_size::Int=64,
+                        is_strong=nothing)
+    return strength_graph(A, θ, config.strength_type; backend=backend, block_size=block_size, is_strong=is_strong)
 end
 
 """

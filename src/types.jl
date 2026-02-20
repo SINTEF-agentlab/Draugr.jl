@@ -1,3 +1,16 @@
+# ── Grow-only resize for workspace arrays ─────────────────────────────────────
+"""
+    _ws_resize!(v::Vector, n::Integer) -> v
+
+Resize workspace vector `v` to at least `n` elements, but never shrink.
+This keeps arrays at their high-water mark across levels and resetup calls,
+trading memory for speed by avoiding repeated grow/shrink reallocations.
+"""
+@inline function _ws_resize!(v::Vector, n::Integer)
+    n > length(v) && resize!(v, n)
+    return v
+end
+
 # ── Interpolation type tags ───────────────────────────────────────────────────
 abstract type InterpolationType end
 
@@ -464,6 +477,58 @@ mutable struct AMGHierarchy{Tv, Ti<:Integer}
     backend::Any               # KernelAbstractions backend (CPU, CUDABackend, etc.)
     block_size::Int            # block size for KA kernel launches
     coarse_solve_on_cpu::Bool  # if true, coarse LU solve is always on CPU
+    galerkin_workspace::Any    # GalerkinWorkspace, reused across setup/resetup calls
+    setup_workspace::Any       # SetupWorkspace, reused across setup/resetup calls
+end
+
+"""
+    SetupWorkspace{Tv, Ti}
+
+Pre-allocated workspace for coarsening and prolongation building. Stored in the
+hierarchy and reused across setup/resetup calls to avoid repeated allocations in
+hot loops. Arrays are `resize!`'d as needed (they only grow, never shrink).
+"""
+mutable struct SetupWorkspace{Tv, Ti<:Integer}
+    # Coarsening workspace (size n per level)
+    cf::Vector{Int}
+    coarse_map::Vector{Int}
+    measure::Vector{Float64}
+    st_count::Vector{Int}
+    # _build_strong_transpose_adj workspace
+    counts::Vector{Int}
+    offsets::Vector{Int}
+    sources::Vector{Int}
+    pos::Vector{Int}
+    # Bucket sort workspace (RS / HMIS first pass)
+    bucket_head::Vector{Int}
+    bucket_next::Vector{Int}
+    bucket_prev::Vector{Int}
+    # COO accumulation workspace for prolongation building
+    I_p::Vector{Ti}
+    J_p::Vector{Ti}
+    V_p::Vector{Tv}
+    # Extended interpolation workspace
+    P_marker::Vector{Int}
+    strong_nbrs_offsets::Vector{Int}
+    strong_nbrs_data::Vector{Int}
+    # Strength graph buffer (reused across calls)
+    is_strong::Vector{Bool}
+    # Sort permutation buffer (reused as counting-sort position buffer)
+    sort_perm::Vector{Int}
+    # Old ProlongationOp reference for array reuse during resetup (set per-level in _build_levels!)
+    old_P::Any   # Union{Nothing, ProlongationOp}
+end
+
+function SetupWorkspace{Tv, Ti}() where {Tv, Ti}
+    SetupWorkspace{Tv, Ti}(
+        Int[], Int[], Float64[], Int[],
+        Int[], Int[], Int[], Int[],
+        Int[], Int[], Int[],
+        Ti[], Ti[], Tv[],
+        Int[], Int[], Int[],
+        Bool[], Int[],
+        nothing,
+    )
 end
 
 # ── AMG Configuration ─────────────────────────────────────────────────────────
@@ -493,6 +558,10 @@ Fields:
 - `coarse_solve_on_cpu`: If `true`, the coarsest-level LU factorization and direct
   solve are performed on CPU even when using a GPU backend. Required for backends
   that do not support `lu` on device (e.g., Apple Metal). Default: `false`.
+- `allow_partial_resetup`: If `true` (the default), restriction maps are built
+  during setup so that `amg_resetup!(…; partial=true)` can update values in-place
+  without re-coarsening. Set to `false` for a faster initial setup when only full
+  resetup will be used.
 """
 struct AMGConfig
     coarsening::CoarseningAlgorithm
@@ -509,6 +578,7 @@ struct AMGConfig
     cycle_type::Symbol
     strength_type::StrengthType
     coarse_solve_on_cpu::Bool
+    allow_partial_resetup::Bool
 end
 
 function AMGConfig(;
@@ -526,13 +596,15 @@ function AMGConfig(;
     cycle_type::Symbol = :V,
     strength_type::StrengthType = AbsoluteStrength(),
     coarse_solve_on_cpu::Bool = false,
+    allow_partial_resetup::Bool = true,
 )
     @assert cycle_type in (:V, :W) "cycle_type must be :V or :W"
     verbose_int = verbose isa Bool ? Int(verbose) : verbose
     return AMGConfig(coarsening, smoother, max_levels, max_coarse_size,
                      pre_smoothing_steps, post_smoothing_steps, jacobi_omega, verbose_int,
                      initial_coarsening, initial_coarsening_levels,
-                     max_row_sum, cycle_type, strength_type, coarse_solve_on_cpu)
+                     max_row_sum, cycle_type, strength_type, coarse_solve_on_cpu,
+                     allow_partial_resetup)
 end
 
 """

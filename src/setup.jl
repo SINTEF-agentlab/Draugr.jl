@@ -43,11 +43,29 @@ end
 
 Copy a ProlongationUpdateMap to the same device as `ref`'s arrays.
 """
-function _prolongation_update_map_to_device(ref::CSRMatrix, p_map::ProlongationUpdateMap)
+function _prolongation_update_map_to_device(ref::CSRMatrix, p_map::ProlongationUpdateMap{Ti}) where Ti
+    # For Standard/Extended+i, the graph data stays on CPU (is_strong, cf, coarse_map are needed as-is)
+    # Only the entry_type, numer_idx, denom arrays may need device conversion for Direct interp
+    entry_type = _to_device(ref, p_map.entry_type)
     numer_idx = _to_device(ref, p_map.numer_idx)
     denom_offsets = _to_device(ref, p_map.denom_offsets)
     denom_entries = _to_device(ref, p_map.denom_entries)
-    return ProlongationUpdateMap(numer_idx, denom_offsets, denom_entries)
+    
+    # Graph structure stays on CPU for Standard/Extended+i recomputation
+    return ProlongationUpdateMap{Ti}(
+        p_map.interp_type,
+        p_map.is_strong,      # stays on CPU
+        p_map.cf,             # stays on CPU
+        p_map.coarse_map,     # stays on CPU
+        p_map.diag_nz_idx,    # stays on CPU (used by CPU update functions)
+        entry_type,
+        numer_idx,
+        denom_offsets,
+        denom_entries,
+        p_map.strong_nbrs_offsets,  # stays on CPU
+        p_map.strong_nbrs_cols,     # stays on CPU
+        p_map.strong_nbrs_nz        # stays on CPU
+    )
 end
 
 """

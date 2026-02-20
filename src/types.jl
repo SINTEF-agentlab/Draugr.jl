@@ -431,29 +431,51 @@ struct RestrictionMap{Ti<:Integer, Vi<:AbstractVector{Ti}}
 end
 
 """
-    ProlongationUpdateMap{Ti, Vi}
+    ProlongationUpdateMap
 
-Stores precomputed index mappings for GPU-compatible in-place update of
-prolongation operator values during resetup with `update_P=true`.
+Stores precomputed index mappings for efficient in-place update of prolongation
+operator values during resetup with `update_P=true`. All graph structure
+decisions (strength, CF-split, etc.) are fixed at setup time.
 
-For **Direct interpolation**, each P entry k has:
-- `numer_idx[k]`: index into A.nzval for the numerator A[i,j], or 0 for coarse points
-- `denom_offsets[k]:denom_offsets[k+1]-1`: range of indices into `denom_entries`
-- `denom_entries[...]`: indices into A.nzval that sum to form denominator d_i
+## Design Philosophy
 
-The update formula is:
-- Coarse points (numer_idx[k] == 0): P.nzval[k] = 1
-- Fine points: P.nzval[k] = -A.nzval[numer_idx[k]] / d_i
-  where d_i = Σ A.nzval[denom_entries[j]] for j in denom range
+For Direct interpolation: P[i,c] = -A[i,c] / d_i where d_i = diagonal + weak sum
+- Simple linear formula with fixed coefficient 1.0 on numerator A entry
 
-This stores all classification decisions (strength graph, CF-split) from the
-original setup, so the update only reads new A values at stored indices.
+For Standard/Extended+i interpolation: The formula involves indirect contributions
+where weights themselves depend on A values. These use a more complex structure
+that stores the full graph connectivity to enable recomputation.
+
+## Fields
+
+- `interp_type`: 1=Direct, 2=Standard, 3=Extended+i
+- `is_strong`: Boolean array marking strong connections in A
+- `cf`: Coarse/fine split (cf[i]=1 for coarse, -1 for fine)
+- `coarse_map`: Maps fine indices to coarse indices for coarse points
+- `P_rowptr`: CSR rowptr for P structure
+- `P_coarse_col`: For each P entry, which coarse column it maps to
+
+For Direct interpolation only (simple update):
+- `entry_type`: 0=coarse (P=1), 1=fine with formula
+- `numer_idx`: A.nzval index for numerator term (0 for coarse)
+- `denom_offsets`, `denom_entries`: A.nzval indices for denominator sum
 """
-struct ProlongationUpdateMap{Ti<:Integer, Vi<:AbstractVector{Ti}}
-    # For each P.nzval entry k:
-    numer_idx::Vi         # A.nzval index for numerator, or 0 for coarse points
-    denom_offsets::Vi     # offset array: nnz_P + 1 entries
-    denom_entries::Vi     # A.nzval indices for denominator terms
+struct ProlongationUpdateMap{Ti<:Integer}
+    interp_type::Int                    # 1=Direct, 2=Standard, 3=Extended+i
+    is_strong::Vector{Bool}             # strong connection mask (nnz_A)
+    cf::Vector{Int}                     # coarse/fine split (n_fine)
+    coarse_map::Vector{Int}             # fine-to-coarse mapping (n_fine)
+    diag_nz_idx::Vector{Ti}             # diagonal A.nzval index for each row
+    # For Direct interpolation (entry_type[k]==1):
+    entry_type::Vector{Ti}              # 0=coarse, 1=direct formula
+    numer_idx::Vector{Ti}               # A.nzval index for numerator
+    denom_offsets::Vector{Ti}           # offset array for denominator
+    denom_entries::Vector{Ti}           # A.nzval indices for denominator
+    # For Standard/Extended+i: store extra connectivity info
+    # Strong neighbors per row (for computing distribution weights)
+    strong_nbrs_offsets::Vector{Ti}     # offset array (n_fine + 1)
+    strong_nbrs_cols::Vector{Ti}        # column indices of strong neighbors
+    strong_nbrs_nz::Vector{Ti}          # A.nzval indices of strong neighbors
 end
 
 # ── AMG Level ─────────────────────────────────────────────────────────────────

@@ -1177,7 +1177,8 @@ function _update_P_values!(P::ProlongationOp{Ti, Tv}, A::CSRMatrix{Tv, Ti},
                     is_interp_coarse = is_strong_cpu[nz] && cf[j] == 1 &&
                         (diag_sign == 0 || sign(real(nzv[nz])) != diag_sign)
                     if is_interp_coarse
-                        P_nzval[p_idx] = abs(d_i) > _safe_threshold(Tv, abs(d_i)) ? -nzv[nz] / d_i : zero(Tv)
+                        abs_d_i = abs(d_i)
+                        P_nzval[p_idx] = abs_d_i > _safe_threshold(Tv, abs_d_i) ? -nzv[nz] / d_i : zero(Tv)
                         p_idx += 1
                     end
                 end

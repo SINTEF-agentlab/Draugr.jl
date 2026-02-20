@@ -534,7 +534,7 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
         sn_offsets = Vector{Int}(undef, n_fine + 1)
         sn_data = Int[]
     end
-    resize!(sn_offsets, n_fine + 1)
+    _ws_resize!(sn_offsets, n_fine + 1)
     # Count strong neighbors per row
     @inbounds begin
         for i in 1:n_fine
@@ -556,7 +556,7 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
         total_sn += cnt
     end
     sn_offsets[n_fine + 1] = total_sn + 1
-    resize!(sn_data, total_sn)
+    _ws_resize!(sn_data, total_sn)
     # Fill data
     @inbounds begin
         pos = 0
@@ -573,7 +573,7 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
 
     # P_marker tracks which coarse points are in C-hat for current row
     if setup_workspace !== nothing
-        P_marker = resize!(setup_workspace.P_marker, n_fine)
+        P_marker = _ws_resize!(setup_workspace.P_marker, n_fine)
         fill!(P_marker, -1)
     else
         P_marker = fill(-1, n_fine)
@@ -930,7 +930,7 @@ function _coo_to_prolongation(I_p::Vector{Ti}, J_p::Vector{Ti}, V_p::Vector{Tv},
 
     # 3. Counting sort: distribute COO entries into CSR positions
     if sort_perm !== nothing
-        resize!(sort_perm, n_fine)
+        _ws_resize!(sort_perm, n_fine)
         pos = sort_perm
     else
         pos = Vector{Int}(undef, n_fine)

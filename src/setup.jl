@@ -67,7 +67,7 @@ function amg_setup(A_csr::CSRMatrix{Tv, Ti}, config::AMGConfig=AMGConfig();
     t_setup = time()
     levels = AMGLevel{Tv, Ti}[]
     n_finest = size(A_csr, 1)
-    galerkin_ws = GalerkinWorkspace{Ti}()
+    galerkin_ws = GalerkinWorkspace{Tv, Ti}()
     setup_ws = SetupWorkspace{Tv, Ti}()
     A_coarsest = _build_levels!(levels, A_csr, config;
                                 backend=backend, block_size=block_size,
@@ -128,7 +128,7 @@ function _build_levels!(levels::Vector{AMGLevel{Tv, Ti}},
                         A_input::CSRMatrix{Tv, Ti},
                         config::AMGConfig;
                         backend=DEFAULT_BACKEND, block_size::Int=64,
-                        galerkin_workspace::GalerkinWorkspace{Ti}=GalerkinWorkspace{Ti}(),
+                        galerkin_workspace::GalerkinWorkspace{Tv, Ti}=GalerkinWorkspace{Tv, Ti}(),
                         setup_workspace::SetupWorkspace{Tv, Ti}=SetupWorkspace{Tv, Ti}(),
                         device_ref::Union{Nothing, CSRMatrix}=nothing) where {Tv, Ti}
     A_ref = device_ref === nothing ? A_input : device_ref
@@ -162,8 +162,10 @@ function _build_levels!(levels::Vector{AMGLevel{Tv, Ti}},
                 old_A_coarse = old_A_c
             end
         end
-        A_coarse, r_map = compute_coarse_sparsity(A_cpu, P, n_coarse; build_restriction_map=allow_partial_resetup, workspace=galerkin_workspace, old_A_coarse=old_A_coarse)
+        # Build transpose map first — needed by compute_coarse_sparsity to
+        # iterate by coarse row (P^T structure)
         Pt_map = build_transpose_map(P)
+        A_coarse, r_map = compute_coarse_sparsity(A_cpu, P, Pt_map, n_coarse; build_restriction_map=allow_partial_resetup, workspace=galerkin_workspace, old_A_coarse=old_A_coarse)
         if is_gpu
             A_dev = _csr_to_device(A_ref, A_cpu)
             P_dev = _prolongation_to_device(A_ref, P)

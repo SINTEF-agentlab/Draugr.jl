@@ -233,7 +233,7 @@ function _compute_strong_transpose_count(A::CSRMatrix{Tv, Ti}, is_strong::Abstra
     n = size(A, 1)
     cv = colvals(A)
     if setup_workspace !== nothing
-        st_count = resize!(setup_workspace.st_count, n)
+        st_count = _ws_resize!(setup_workspace.st_count, n)
         fill!(st_count, 0)
     else
         st_count = zeros(Int, n)
@@ -274,7 +274,7 @@ function coarsen_pmis(A_in::CSRMatrix{Tv, Ti}, θ::Real;
     # Use column-based measure: how many nodes strongly depend on i
     st_count = _compute_strong_transpose_count(A, is_strong; setup_workspace=setup_workspace)
     if setup_workspace !== nothing
-        measure = resize!(setup_workspace.measure, n)
+        measure = _ws_resize!(setup_workspace.measure, n)
     else
         measure = zeros(Float64, n)
     end
@@ -283,7 +283,7 @@ function coarsen_pmis(A_in::CSRMatrix{Tv, Ti}, θ::Real;
     end
     # Mark isolated nodes (no strong connections at all) immediately as coarse
     if setup_workspace !== nothing
-        cf = resize!(setup_workspace.cf, n)
+        cf = _ws_resize!(setup_workspace.cf, n)
         fill!(cf, 0)
     else
         cf = zeros(Int, n)
@@ -342,7 +342,7 @@ function coarsen_pmis(A_in::CSRMatrix{Tv, Ti}, θ::Real;
     # Build coarse map
     n_coarse = 0
     if setup_workspace !== nothing
-        coarse_map = resize!(setup_workspace.coarse_map, n)
+        coarse_map = _ws_resize!(setup_workspace.coarse_map, n)
         fill!(coarse_map, 0)
     else
         coarse_map = zeros(Int, n)
@@ -422,7 +422,7 @@ function coarsen_hmis(A_in::CSRMatrix{Tv, Ti}, θ::Real;
     # ── Phase 2: PMIS on remaining undecided points ──
     st_count_pmis = _compute_strong_transpose_count(A, is_strong; setup_workspace=setup_workspace)
     if setup_workspace !== nothing
-        pmis_measure = resize!(setup_workspace.measure, n)
+        pmis_measure = _ws_resize!(setup_workspace.measure, n)
     else
         pmis_measure = zeros(Float64, n)
     end
@@ -454,7 +454,7 @@ function coarsen_hmis(A_in::CSRMatrix{Tv, Ti}, θ::Real;
 
     n_coarse = 0
     if setup_workspace !== nothing
-        coarse_map = resize!(setup_workspace.coarse_map, n)
+        coarse_map = _ws_resize!(setup_workspace.coarse_map, n)
         fill!(coarse_map, 0)
     else
         coarse_map = zeros(Int, n)
@@ -489,7 +489,7 @@ function _rs_first_pass!(A::CSRMatrix{Tv, Ti}, is_strong::AbstractVector{Bool};
     st_offsets, st_sources = _build_strong_transpose_adj(A, is_strong; setup_workspace=setup_workspace)
 
     if setup_workspace !== nothing
-        cf = resize!(setup_workspace.cf, n)
+        cf = _ws_resize!(setup_workspace.cf, n)
         fill!(cf, 0)
     else
         cf = zeros(Int, n)
@@ -534,11 +534,11 @@ function _rs_first_pass!(A::CSRMatrix{Tv, Ti}, is_strong::AbstractVector{Bool};
         max_λ_val = max(max_λ_val, λ[i])
     end
     if setup_workspace !== nothing
-        bucket_head = resize!(setup_workspace.bucket_head, max(max_λ_val + 1, 1))
+        bucket_head = _ws_resize!(setup_workspace.bucket_head, max(max_λ_val + 1, 1))
         fill!(bucket_head, 0)
-        bucket_next = resize!(setup_workspace.bucket_next, n)
+        bucket_next = _ws_resize!(setup_workspace.bucket_next, n)
         fill!(bucket_next, 0)
-        bucket_prev = resize!(setup_workspace.bucket_prev, n)
+        bucket_prev = _ws_resize!(setup_workspace.bucket_prev, n)
         fill!(bucket_prev, 0)
     else
         bucket_head = fill(0, max(max_λ_val + 1, 1))
@@ -739,7 +739,7 @@ function coarsen_rs(A_in::CSRMatrix{Tv, Ti}, θ::Real;
     st_offsets, st_sources = _build_strong_transpose_adj(A, is_strong; setup_workspace=setup_workspace)
     # CF splitting
     if setup_workspace !== nothing
-        cf = resize!(setup_workspace.cf, n)
+        cf = _ws_resize!(setup_workspace.cf, n)
         fill!(cf, 0)
     else
         cf = zeros(Int, n)
@@ -766,11 +766,11 @@ function coarsen_rs(A_in::CSRMatrix{Tv, Ti}, θ::Real;
     # (shift by 1 so λ==0 maps to index 1)
     # Pre-allocate to n to avoid resizing during λ increments
     if setup_workspace !== nothing
-        bucket_head = resize!(setup_workspace.bucket_head, max(max_λ_val + 1, n))
+        bucket_head = _ws_resize!(setup_workspace.bucket_head, max(max_λ_val + 1, n))
         fill!(bucket_head, 0)
-        bucket_next = resize!(setup_workspace.bucket_next, n)
+        bucket_next = _ws_resize!(setup_workspace.bucket_next, n)
         fill!(bucket_next, 0)
-        bucket_prev = resize!(setup_workspace.bucket_prev, n)
+        bucket_prev = _ws_resize!(setup_workspace.bucket_prev, n)
         fill!(bucket_prev, 0)
     else
         bucket_head = fill(0, max(max_λ_val + 1, n))
@@ -833,7 +833,7 @@ function coarsen_rs(A_in::CSRMatrix{Tv, Ti}, θ::Real;
     # Build coarse map
     n_coarse = 0
     if setup_workspace !== nothing
-        coarse_map = resize!(setup_workspace.coarse_map, n)
+        coarse_map = _ws_resize!(setup_workspace.coarse_map, n)
         fill!(coarse_map, 0)
     else
         coarse_map = zeros(Int, n)
@@ -860,7 +860,7 @@ function _build_strong_transpose_adj(A::CSRMatrix{Tv, Ti}, is_strong::AbstractVe
     cv = colvals(A)
     # Count: how many nodes strongly depend on each j
     if setup_workspace !== nothing
-        counts = resize!(setup_workspace.counts, n)
+        counts = _ws_resize!(setup_workspace.counts, n)
         fill!(counts, 0)
     else
         counts = zeros(Int, n)
@@ -875,7 +875,7 @@ function _build_strong_transpose_adj(A::CSRMatrix{Tv, Ti}, is_strong::AbstractVe
     end
     # Build offsets (CSR-style)
     if setup_workspace !== nothing
-        offsets = resize!(setup_workspace.offsets, n + 1)
+        offsets = _ws_resize!(setup_workspace.offsets, n + 1)
     else
         offsets = Vector{Int}(undef, n + 1)
     end
@@ -885,13 +885,13 @@ function _build_strong_transpose_adj(A::CSRMatrix{Tv, Ti}, is_strong::AbstractVe
     end
     total = offsets[n + 1] - 1
     if setup_workspace !== nothing
-        sources = resize!(setup_workspace.sources, total)
+        sources = _ws_resize!(setup_workspace.sources, total)
     else
         sources = Vector{Int}(undef, total)
     end
     # Fill sources
     if setup_workspace !== nothing
-        pos = resize!(setup_workspace.pos, n)
+        pos = _ws_resize!(setup_workspace.pos, n)
         copyto!(pos, 1, offsets, 1, n)
     else
         pos = copy(offsets[1:n])

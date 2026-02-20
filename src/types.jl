@@ -1,3 +1,16 @@
+# ── Grow-only resize for workspace arrays ─────────────────────────────────────
+"""
+    _ws_resize!(v::Vector, n::Integer) -> v
+
+Resize workspace vector `v` to at least `n` elements, but never shrink.
+This keeps arrays at their high-water mark across levels and resetup calls,
+trading memory for speed by avoiding repeated grow/shrink reallocations.
+"""
+@inline function _ws_resize!(v::Vector, n::Integer)
+    n > length(v) && resize!(v, n)
+    return v
+end
+
 # ── Interpolation type tags ───────────────────────────────────────────────────
 abstract type InterpolationType end
 

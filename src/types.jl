@@ -463,8 +463,13 @@ Strong neighbor structure (for Standard/Extended+i row recomputation):
 - `strong_nbrs_offsets`: CSR offset array (n_fine + 1)
 - `strong_nbrs_cols`: column indices of strong neighbors
 - `strong_nbrs_nz`: A.nzval indices of strong neighbors
+
+Workspace for Standard/Extended+i (to avoid allocations during resetup):
+- `P_marker`: Scratch array for tracking visited nodes
+- `chat_indices`: Reusable buffer for C-hat indices
+- `P_data`: Reusable buffer for P values
 """
-struct ProlongationUpdateMap{Ti<:Integer}
+mutable struct ProlongationUpdateMap{Ti<:Integer, Tv<:Number}
     interp_type::Int                    # 1=Direct, 2=Standard, 3=Extended+i
     is_strong::Vector{Bool}             # strong connection mask (nnz_A)
     cf::Vector{Int}                     # coarse/fine split (n_fine)
@@ -479,6 +484,10 @@ struct ProlongationUpdateMap{Ti<:Integer}
     strong_nbrs_offsets::Vector{Ti}     # offset array (n_fine + 1)
     strong_nbrs_cols::Vector{Ti}        # column indices of strong neighbors
     strong_nbrs_nz::Vector{Ti}          # A.nzval indices of strong neighbors
+    # Workspace for Standard/Extended+i (to avoid allocations during resetup)
+    P_marker::Vector{Int}               # marker array for C-hat tracking
+    chat_indices::Vector{Int}           # reusable buffer for C-hat indices
+    P_data::Vector{Tv}                  # reusable buffer for P values
 end
 
 # ── AMG Level ─────────────────────────────────────────────────────────────────

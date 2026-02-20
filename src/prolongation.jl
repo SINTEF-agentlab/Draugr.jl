@@ -417,7 +417,8 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
         denom_entries = Vector{Ti}(denom_entries_list)
         strong_nbrs_cols = Vector{Ti}(strong_nbrs_cols_list)
         strong_nbrs_nz = Vector{Ti}(strong_nbrs_nz_list)
-        P_update_map = ProlongationUpdateMap{Ti}(
+        # Direct interpolation doesn't need workspace, but we include empty buffers
+        P_update_map = ProlongationUpdateMap{Ti, Tv}(
             1,  # interp_type = Direct
             copy(is_strong),
             copy(cf),
@@ -429,7 +430,10 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
             denom_entries,
             strong_nbrs_offsets,
             strong_nbrs_cols,
-            strong_nbrs_nz
+            strong_nbrs_nz,
+            Int[],  # P_marker (not used for Direct)
+            Int[],  # chat_indices (not used for Direct)
+            Tv[]    # P_data (not used for Direct)
         )
     end
 
@@ -674,7 +678,15 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
         strong_nbrs_cols = Vector{Ti}(strong_nbrs_cols_list)
         strong_nbrs_nz = Vector{Ti}(strong_nbrs_nz_list)
         
-        P_update_map = ProlongationUpdateMap{Ti}(
+        # Allocate workspace for Standard interpolation update
+        # Estimate max P entries per row as max strong neighbors
+        max_strong = 0
+        for i in 1:n_fine
+            num_strong = Int(strong_nbrs_offsets[i+1] - strong_nbrs_offsets[i])
+            max_strong = max(max_strong, num_strong)
+        end
+        
+        P_update_map = ProlongationUpdateMap{Ti, Tv}(
             2,  # interp_type = Standard
             copy(is_strong),
             copy(cf),
@@ -686,7 +698,10 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
             denom_entries,
             strong_nbrs_offsets,
             strong_nbrs_cols,
-            strong_nbrs_nz
+            strong_nbrs_nz,
+            fill(-1, n_fine),         # P_marker
+            Vector{Int}(undef, max_strong + 1),  # chat_indices buffer
+            Vector{Tv}(undef, max_strong + 1)    # P_data buffer
         )
     end
     
@@ -1044,7 +1059,31 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
         strong_nbrs_nz = Vector{Ti}(strong_nbrs_nz_list)
         strong_nbrs_offsets = Vector{Ti}(sn_offsets)
         
-        P_update_map = ProlongationUpdateMap{Ti}(
+        # Allocate workspace for Extended+i interpolation update
+        # Estimate max P entries per row (including distance-2 coarse)
+        max_chat = 0
+        for i in 1:n_fine
+            if cf[i] == -1
+                # Count distance-1 coarse + distance-2 through fine
+                count = 0
+                for si in sn_offsets[i]:(sn_offsets[i+1]-1)
+                    j = sn_data[si]
+                    if cf[j] == 1
+                        count += 1
+                    elseif cf[j] == -1
+                        for sj in sn_offsets[j]:(sn_offsets[j+1]-1)
+                            if cf[sn_data[sj]] == 1
+                                count += 1
+                            end
+                        end
+                    end
+                end
+                max_chat = max(max_chat, count)
+            end
+        end
+        max_chat = max(max_chat, 1)  # at least 1
+        
+        P_update_map = ProlongationUpdateMap{Ti, Tv}(
             3,  # interp_type = Extended+i
             copy(is_strong),
             copy(cf),
@@ -1056,7 +1095,10 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
             denom_entries,
             strong_nbrs_offsets,
             strong_nbrs_cols,
-            strong_nbrs_nz
+            strong_nbrs_nz,
+            fill(-1, n_fine),              # P_marker
+            Vector{Int}(undef, max_chat),  # chat_indices buffer
+            Vector{Tv}(undef, max_chat)    # P_data buffer
         )
     end
     
@@ -1427,7 +1469,7 @@ CPU-based Standard interpolation P value update.
 Uses stored graph structure to recompute interpolation weights.
 """
 function _update_P_standard!(P::ProlongationOp{Ti, Tv}, A::CSRMatrix{Tv, Ti},
-                             P_update_map::ProlongationUpdateMap{Ti}) where {Tv, Ti}
+                             P_update_map::ProlongationUpdateMap{Ti, Tv2}) where {Tv, Ti, Tv2}
     A_cpu = csr_to_cpu(A)
     P_nzval = P.nzval isa Array ? P.nzval : Array(P.nzval)
     P_rowptr = P.rowptr isa Array ? P.rowptr : Array(P.rowptr)
@@ -1557,9 +1599,10 @@ end
 
 CPU-based Extended+i interpolation P value update.
 Uses stored graph structure to recompute interpolation weights.
+Uses workspace buffers from P_update_map to avoid per-row allocations.
 """
 function _update_P_extendedi!(P::ProlongationOp{Ti, Tv}, A::CSRMatrix{Tv, Ti},
-                              P_update_map::ProlongationUpdateMap{Ti}) where {Tv, Ti}
+                              P_update_map::ProlongationUpdateMap{Ti, Tv2}) where {Tv, Ti, Tv2}
     A_cpu = csr_to_cpu(A)
     P_nzval = P.nzval isa Array ? P.nzval : Array(P.nzval)
     P_rowptr = P.rowptr isa Array ? P.rowptr : Array(P.rowptr)
@@ -1575,8 +1618,13 @@ function _update_P_extendedi!(P::ProlongationOp{Ti, Tv}, A::CSRMatrix{Tv, Ti},
     cv = colvals(A_cpu)
     nzv = nonzeros(A_cpu)
     
-    # P_marker for tracking C-hat
-    P_marker = fill(-1, n_fine)
+    # Use workspace from P_update_map to avoid allocations
+    P_marker = P_update_map.P_marker
+    chat_indices_buf = P_update_map.chat_indices
+    P_data_buf = P_update_map.P_data
+    
+    # Reset P_marker to -1 at start
+    fill!(P_marker, -1)
     strong_f_marker = -2
     
     @inbounds for i in 1:n_fine
@@ -1590,28 +1638,33 @@ function _update_P_extendedi!(P::ProlongationOp{Ti, Tv}, A::CSRMatrix{Tv, Ti},
             continue
         end
         
-        # Phase 1: Determine C-hat
-        chat_indices = Int[]
+        # Phase 1: Determine C-hat using workspace buffer
+        n_chat = 0
         for si in sn_offsets[i]:(sn_offsets[i+1]-1)
             j = sn_data[si]
             if cf[j] == 1
                 if P_marker[j] < 0
-                    P_marker[j] = length(chat_indices)
-                    push!(chat_indices, j)
+                    n_chat += 1
+                    if n_chat <= length(chat_indices_buf)
+                        chat_indices_buf[n_chat] = j
+                    end
+                    P_marker[j] = n_chat - 1  # 0-based index into P_data
                 end
             elseif cf[j] == -1
                 P_marker[j] = strong_f_marker
                 for sj in sn_offsets[j]:(sn_offsets[j+1]-1)
                     k = sn_data[sj]
                     if cf[k] == 1 && P_marker[k] < 0
-                        P_marker[k] = length(chat_indices)
-                        push!(chat_indices, k)
+                        n_chat += 1
+                        if n_chat <= length(chat_indices_buf)
+                            chat_indices_buf[n_chat] = k
+                        end
+                        P_marker[k] = n_chat - 1
                     end
                 end
             end
         end
         
-        n_chat = length(chat_indices)
         if n_chat == 0
             for p_nz in p_start:p_end
                 P_nzval[p_nz] = one(Tv)
@@ -1630,8 +1683,16 @@ function _update_P_extendedi!(P::ProlongationOp{Ti, Tv}, A::CSRMatrix{Tv, Ti},
             continue
         end
         
-        # Phase 2: Compute weights
-        P_data = zeros(Tv, n_chat)
+        # Resize P_data_buf if needed (rare, only if buffer too small)
+        if n_chat > length(P_data_buf)
+            resize!(P_data_buf, n_chat)
+            resize!(chat_indices_buf, n_chat)
+        end
+        
+        # Phase 2: Compute weights - zero out P_data workspace
+        for idx in 1:n_chat
+            P_data_buf[idx] = zero(Tv)
+        end
         diagonal = zero(Tv)
         
         for nz in nzrange(A_cpu, i)
@@ -1645,7 +1706,7 @@ function _update_P_extendedi!(P::ProlongationOp{Ti, Tv}, A::CSRMatrix{Tv, Ti},
             
             p_idx = P_marker[j]
             if p_idx >= 0
-                P_data[p_idx + 1] += a_ij
+                P_data_buf[p_idx + 1] += a_ij
             elseif p_idx == strong_f_marker
                 diag_j = zero(Tv)
                 for nz3 in nzrange(A_cpu, j)
@@ -1677,7 +1738,7 @@ function _update_P_extendedi!(P::ProlongationOp{Ti, Tv}, A::CSRMatrix{Tv, Ti},
                         if sgn * real(a_jm) < 0
                             p_idx_m = P_marker[m]
                             if p_idx_m >= 0
-                                P_data[p_idx_m + 1] += distribute * a_jm
+                                P_data_buf[p_idx_m + 1] += distribute * a_jm
                             elseif m == i
                                 diagonal += distribute * a_jm
                             end
@@ -1694,7 +1755,7 @@ function _update_P_extendedi!(P::ProlongationOp{Ti, Tv}, A::CSRMatrix{Tv, Ti},
         # Phase 3: Finalize weights
         if abs(diagonal) > eps(real(Tv))
             for idx in 1:n_chat
-                P_data[idx] /= -diagonal
+                P_data_buf[idx] /= -diagonal
             end
         end
         
@@ -1703,8 +1764,8 @@ function _update_P_extendedi!(P::ProlongationOp{Ti, Tv}, A::CSRMatrix{Tv, Ti},
             coarse_col = Int(P_colval[p_nz])
             found = false
             for idx in 1:n_chat
-                if coarse_map[chat_indices[idx]] == coarse_col
-                    P_nzval[p_nz] = P_data[idx]
+                if coarse_map[chat_indices_buf[idx]] == coarse_col
+                    P_nzval[p_nz] = P_data_buf[idx]
                     found = true
                     break
                 end
@@ -1714,9 +1775,9 @@ function _update_P_extendedi!(P::ProlongationOp{Ti, Tv}, A::CSRMatrix{Tv, Ti},
             end
         end
         
-        # Reset markers
-        for j in chat_indices
-            P_marker[j] = -1
+        # Reset markers for this row's C-hat
+        for idx in 1:n_chat
+            P_marker[chat_indices_buf[idx]] = -1
         end
         for si in sn_offsets[i]:(sn_offsets[i+1]-1)
             j = sn_data[si]

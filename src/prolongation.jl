@@ -417,12 +417,19 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
         denom_entries = Vector{Ti}(denom_entries_list)
         strong_nbrs_cols = Vector{Ti}(strong_nbrs_cols_list)
         strong_nbrs_nz = Vector{Ti}(strong_nbrs_nz_list)
+        # IMPORTANT: Copy only valid portions of workspace arrays to avoid
+        # out-of-bounds access during P update (workspace arrays may be larger
+        # than needed for this level due to grow-only resizing)
+        nnz_A = nnz(A)
+        is_strong_copy = is_strong[1:nnz_A]
+        cf_copy = cf[1:n_fine]
+        coarse_map_copy = coarse_map[1:n_fine]
         # Direct interpolation doesn't need workspace, but we include empty buffers
         P_update_map = ProlongationUpdateMap{Ti, Tv}(
             1,  # interp_type = Direct
-            copy(is_strong),
-            copy(cf),
-            copy(coarse_map),
+            is_strong_copy,
+            cf_copy,
+            coarse_map_copy,
             diag_nz_idx,
             entry_type,
             numer_idx,
@@ -686,11 +693,19 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
             max_strong = max(max_strong, num_strong)
         end
         
+        # IMPORTANT: Copy only valid portions of workspace arrays to avoid
+        # out-of-bounds access during P update (workspace arrays may be larger
+        # than needed for this level due to grow-only resizing)
+        nnz_A = nnz(A)
+        is_strong_copy = is_strong[1:nnz_A]
+        cf_copy = cf[1:n_fine]
+        coarse_map_copy = coarse_map[1:n_fine]
+        
         P_update_map = ProlongationUpdateMap{Ti, Tv}(
             2,  # interp_type = Standard
-            copy(is_strong),
-            copy(cf),
-            copy(coarse_map),
+            is_strong_copy,
+            cf_copy,
+            coarse_map_copy,
             diag_nz_idx,
             entry_type,
             numer_idx,
@@ -1055,24 +1070,32 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
             denom_offsets[k] = Ti(1)
         end
         
-        strong_nbrs_cols = Vector{Ti}(sn_data)
+        # IMPORTANT: Copy only valid portions of workspace arrays to avoid
+        # out-of-bounds access during P update (workspace arrays may be larger
+        # than needed for this level due to grow-only resizing)
+        total_strong_nbrs = sn_offsets[n_fine + 1] - 1
+        strong_nbrs_offsets = Vector{Ti}(sn_offsets[1:n_fine+1])
+        strong_nbrs_cols = Vector{Ti}(sn_data[1:total_strong_nbrs])
         strong_nbrs_nz = Vector{Ti}(strong_nbrs_nz_list)
-        strong_nbrs_offsets = Vector{Ti}(sn_offsets)
+        nnz_A = nnz(A)
+        is_strong_copy = is_strong[1:nnz_A]
+        cf_copy = cf[1:n_fine]
+        coarse_map_copy = coarse_map[1:n_fine]
         
         # Allocate workspace for Extended+i interpolation update
         # Estimate max P entries per row (including distance-2 coarse)
         max_chat = 0
         for i in 1:n_fine
-            if cf[i] == -1
+            if cf_copy[i] == -1
                 # Count distance-1 coarse + distance-2 through fine
                 count = 0
-                for si in sn_offsets[i]:(sn_offsets[i+1]-1)
-                    j = sn_data[si]
-                    if cf[j] == 1
+                for si in strong_nbrs_offsets[i]:(strong_nbrs_offsets[i+1]-1)
+                    j = strong_nbrs_cols[si]
+                    if cf_copy[j] == 1
                         count += 1
-                    elseif cf[j] == -1
-                        for sj in sn_offsets[j]:(sn_offsets[j+1]-1)
-                            if cf[sn_data[sj]] == 1
+                    elseif cf_copy[j] == -1
+                        for sj in strong_nbrs_offsets[j]:(strong_nbrs_offsets[j+1]-1)
+                            if cf_copy[strong_nbrs_cols[sj]] == 1
                                 count += 1
                             end
                         end
@@ -1085,9 +1108,9 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
         
         P_update_map = ProlongationUpdateMap{Ti, Tv}(
             3,  # interp_type = Extended+i
-            copy(is_strong),
-            copy(cf),
-            copy(coarse_map),
+            is_strong_copy,
+            cf_copy,
+            coarse_map_copy,
             diag_nz_idx,
             entry_type,
             numer_idx,

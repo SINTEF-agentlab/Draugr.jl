@@ -34,7 +34,7 @@ function Draugr.amg_setup(A::CuSparseMatrixCSR{Tv, Ti},
 end
 
 """
-    amg_resetup!(hierarchy, A_new::CuSparseMatrixCSR, config)
+    amg_resetup!(hierarchy, A_new::CuSparseMatrixCSR, config; partial=true, update_P=false)
 
 AMG resetup accepting a CUDA sparse CSR matrix. Converts to a CPU
 `CSRMatrix` and forwards to the main `CSRMatrix`-based resetup.
@@ -42,9 +42,10 @@ AMG resetup accepting a CUDA sparse CSR matrix. Converts to a CPU
 function Draugr.amg_resetup!(hierarchy::AMGHierarchy{Tv, Ti},
                                   A_new::CuSparseMatrixCSR{Tv, Ti},
                                   config::AMGConfig=AMGConfig();
-                                  partial::Bool=true) where {Tv, Ti}
+                                  partial::Bool=true,
+                                  update_P::Bool=false) where {Tv, Ti}
     A_csr = Draugr.csr_to_cpu(Draugr.csr_from_gpu(A_new))
-    return Draugr.amg_resetup!(hierarchy, A_csr, config; partial=partial)
+    return Draugr.amg_resetup!(hierarchy, A_csr, config; partial=partial, update_P=update_P)
 end
 
 end # module

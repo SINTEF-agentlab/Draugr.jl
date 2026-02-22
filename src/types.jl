@@ -475,7 +475,7 @@ mutable struct ProlongationUpdateMap{Ti<:Integer, Tv<:Number}
     cf::Vector{Int}                     # coarse/fine split (n_fine)
     coarse_map::Vector{Int}             # fine-to-coarse mapping (n_fine)
     diag_nz_idx::Vector{Ti}             # diagonal A.nzval index for each row
-    # Per-entry formula data
+    # Per-entry formula data (used by Direct interpolation kernel)
     entry_type::Vector{Ti}              # 0=coarse (P=1), 1+=compute formula
     numer_idx::Vector{Ti}               # A.nzval index for numerator
     denom_offsets::Vector{Ti}           # offset array for denominator
@@ -488,6 +488,68 @@ mutable struct ProlongationUpdateMap{Ti<:Integer, Tv<:Number}
     P_marker::Vector{Int}               # marker array for C-hat tracking
     chat_indices::Vector{Int}           # reusable buffer for C-hat indices
     P_data::Vector{Tv}                  # reusable buffer for P values
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # GPU kernel data for Standard interpolation (interp_type == 2)
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Per P entry k, the formula is:
+    #   P[k] = -(direct_contrib + Σ indirect_contribs) / d_i
+    # 
+    # Direct contribution: A[direct_numer_idx[k]] (or 0 if no direct connection)
+    # Indirect contributions through fine neighbors:
+    #   Each fine neighbor contributes: A[a_ik] * A[a_kJ] / sum_C_k
+    #   where sum_C_k = Σ A[sum_indices] (with sign check based on diag_k sign)
+    # Denominator d_i = Σ A[d_base_indices] + Σ (A[a_ik] * A[a_ki] / sum_C_k)
+    #
+    # Data layout (CSR-like):
+    # - std_direct_numer_idx[k]: A.nzval index for direct a_{i,J} (0=none)
+    # - std_fine_offsets[k]: offset into fine neighbor data
+    # - For each fine neighbor j (from std_fine_offsets[k] to std_fine_offsets[k+1]-1):
+    #   - std_a_ik[j]: A.nzval index for a_{i,fine_j}
+    #   - std_a_kJ[j]: A.nzval index for a_{fine_j, coarse_J}
+    #   - std_diag_k[j]: A.nzval index for diagonal of fine neighbor
+    #   - std_a_ki[j]: A.nzval index for a_{fine_j, i} (for d_i contrib, 0=none)
+    #   - std_sum_offsets[j]: offset into sum_C_k indices
+    #   - std_sum_indices[...]: A.nzval indices for computing sum_C_k
+    # - std_d_base_offsets[k]: offset into base denominator indices
+    # - std_d_base_entries[...]: A.nzval indices for a_{i,i} + weak neighbors
+    std_direct_numer_idx::Vector{Ti}
+    std_fine_offsets::Vector{Ti}
+    std_a_ik::Vector{Ti}
+    std_a_kJ::Vector{Ti}
+    std_diag_k::Vector{Ti}
+    std_a_ki::Vector{Ti}
+    std_sum_offsets::Vector{Ti}
+    std_sum_indices::Vector{Ti}
+    std_d_base_offsets::Vector{Ti}
+    std_d_base_entries::Vector{Ti}
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # GPU kernel data for Extended+i interpolation (interp_type == 3)
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Similar structure but C-hat includes distance-2 coarse points.
+    # For each P entry k at row i to coarse column J:
+    # - extd_entry_row[k]: row index i (needed for C-hat computation)
+    # - extd_p_col[k]: P column index J (what we're interpolating to)
+    # - For each C-hat point contributing to this P entry:
+    #   - extd_chat_offsets[k]: offset into C-hat data
+    #   - extd_chat_cols[...]: fine node indices c where coarse_map[c] = J
+    # - For fine neighbors (contribute indirectly):
+    #   - extd_fine_offsets[k]: offset into fine neighbor contribution data
+    #   - extd_fine_data[...]: (similar structure to Standard)
+    extd_entry_row::Vector{Ti}
+    extd_p_col::Vector{Ti}
+    extd_direct_a_idx::Vector{Ti}       # A.nzval index for direct contribution
+    extd_fine_offsets::Vector{Ti}
+    extd_a_ik::Vector{Ti}
+    extd_diag_k::Vector{Ti}
+    extd_sum_offsets::Vector{Ti}
+    extd_sum_indices::Vector{Ti}
+    extd_contrib_offsets::Vector{Ti}
+    extd_contrib_a_idx::Vector{Ti}      # A.nzval indices that contribute to P entry
+    extd_contrib_p_col::Vector{Ti}      # P column for each contribution
+    extd_d_base_offsets::Vector{Ti}
+    extd_d_base_entries::Vector{Ti}
 end
 
 # ── AMG Level ─────────────────────────────────────────────────────────────────

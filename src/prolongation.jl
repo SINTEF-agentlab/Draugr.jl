@@ -506,10 +506,14 @@ function _direct_interp_compute_values!(P_nzval::AbstractVector{Tv}, A_nzval::Ab
     if P_on_gpu
         # P is on GPU: convert update map arrays to GPU and use GPU kernel
         be = _get_backend(P_nzval)
-        A_nzval_gpu = A_on_gpu ? A_nzval : similar(P_nzval, eltype(A_nzval), length(A_nzval))
-        if !A_on_gpu
+        # Convert A values to GPU if needed
+        if A_on_gpu
+            A_nzval_gpu = A_nzval
+        else
+            A_nzval_gpu = similar(P_nzval, eltype(A_nzval), length(A_nzval))
             copyto!(A_nzval_gpu, A_nzval)
         end
+        # Convert update map arrays to GPU
         entry_type_gpu = similar(P_nzval, Ti, length(entry_type))
         numer_idx_gpu = similar(P_nzval, Ti, length(numer_idx))
         denom_offsets_gpu = similar(P_nzval, Ti, length(denom_offsets))
@@ -524,9 +528,9 @@ function _direct_interp_compute_values!(P_nzval::AbstractVector{Tv}, A_nzval::Ab
         _synchronize(be)
     else
         # P is on CPU: use CPU computation
-        # If A is on GPU, convert to CPU
-        A_nzval_cpu = A_on_gpu ? Array(A_nzval) : A_nzval
         be = _get_backend(P_nzval)
+        # Convert A values to CPU if needed
+        A_nzval_cpu = A_on_gpu ? Array(A_nzval) : A_nzval
         kernel! = _p_direct_update_kernel!(be, block_size)
         kernel!(P_nzval, A_nzval_cpu, entry_type, numer_idx, denom_offsets, denom_entries; ndrange=nnz_P)
         _synchronize(be)

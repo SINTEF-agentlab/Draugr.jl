@@ -1337,6 +1337,217 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
         end
         max_chat = max(max_chat, 1)
         
+        # ══════════════════════════════════════════════════════════════════════
+        # Build GPU kernel data for Extended+i interpolation
+        # ══════════════════════════════════════════════════════════════════════
+        # For each P entry k (row i, P column J), we pre-compute:
+        # - extd_p_col[k]: target P column J
+        # - extd_direct_a_idx[k]: A.nzval index for direct contribution
+        # - Fine neighbor contributions (extd_fine_offsets, extd_a_ik, etc.)
+        # - Base d_i entries (diagonal + weak connections)
+        
+        extd_entry_row_list = Ti[]
+        extd_p_col_list = Ti[]
+        extd_direct_a_idx_list = Ti[]
+        extd_fine_offsets_list = Ti[]      # NO initial value
+        extd_a_ik_list = Ti[]
+        extd_diag_k_list = Ti[]
+        extd_sum_offsets_list = Ti[]       # NO initial value
+        extd_sum_indices_list = Ti[]
+        extd_contrib_offsets_list = Ti[]   # NO initial value
+        extd_contrib_a_idx_list = Ti[]
+        extd_contrib_p_col_list = Ti[]  # 0 = contributes to d_i, otherwise = P column
+        extd_d_base_offsets_list = Ti[]    # NO initial value
+        extd_d_base_entries_list = Ti[]
+        
+        # Size hints
+        sizehint!(extd_entry_row_list, nnz_P; shrink=false)
+        sizehint!(extd_p_col_list, nnz_P; shrink=false)
+        sizehint!(extd_direct_a_idx_list, nnz_P; shrink=false)
+        sizehint!(extd_a_ik_list, nnz_P * 2; shrink=false)
+        sizehint!(extd_diag_k_list, nnz_P * 2; shrink=false)
+        sizehint!(extd_sum_indices_list, nnz_P * 4; shrink=false)
+        sizehint!(extd_contrib_a_idx_list, nnz_P * 4; shrink=false)
+        sizehint!(extd_contrib_p_col_list, nnz_P * 4; shrink=false)
+        sizehint!(extd_d_base_entries_list, nnz_P * 4; shrink=false)
+        
+        # P_marker2: tracks which coarse points are in current row's C-hat
+        P_marker2 = fill(-1, n_fine)
+        strong_f_marker2 = -2
+        
+        # Build lookup: for each row i, map from coarse column to A.nzval index (if direct neighbor)
+        # and also build P column to P.nzval index mapping
+        P_rowptr = P.rowptr isa Array ? P.rowptr : Array(P.rowptr)
+        P_colval = P.colval isa Array ? P.colval : Array(P.colval)
+        
+        @inbounds for i in 1:n_fine
+            p_start = Int(P_rowptr[i])
+            p_end = Int(P_rowptr[i+1]) - 1
+            
+            if cf_copy[i] == 1
+                # Coarse point: P entry = 1, entry_type = 0 (already set)
+                for p_nz in p_start:p_end
+                    push!(extd_entry_row_list, Ti(i))
+                    push!(extd_p_col_list, Ti(P_colval[p_nz]))
+                    push!(extd_direct_a_idx_list, Ti(0))
+                    push!(extd_fine_offsets_list, Ti(length(extd_a_ik_list) + 1))
+                    push!(extd_d_base_offsets_list, Ti(length(extd_d_base_entries_list) + 1))
+                end
+                continue
+            end
+            
+            # Fine point: determine C-hat and build GPU kernel data
+            # Step 1: Determine C-hat (extended coarse interpolation set)
+            empty!(chat_indices)  # reuse allocation from sparsity pattern building
+            
+            for si in strong_nbrs_offsets[i]:(strong_nbrs_offsets[i+1]-1)
+                j = strong_nbrs_cols[si]
+                if cf_copy[j] == 1
+                    if P_marker2[j] < 0
+                        P_marker2[j] = length(chat_indices)
+                        push!(chat_indices, j)
+                    end
+                elseif cf_copy[j] == -1
+                    P_marker2[j] = strong_f_marker2
+                    for sj in strong_nbrs_offsets[j]:(strong_nbrs_offsets[j+1]-1)
+                        k = strong_nbrs_cols[sj]
+                        if cf_copy[k] == 1 && P_marker2[k] < 0
+                            P_marker2[k] = length(chat_indices)
+                            push!(chat_indices, k)
+                        end
+                    end
+                end
+            end
+            
+            n_chat = length(chat_indices)
+            
+            if n_chat == 0
+                # No C-hat: fallback entry
+                for p_nz in p_start:p_end
+                    push!(extd_entry_row_list, Ti(i))
+                    push!(extd_p_col_list, Ti(P_colval[p_nz]))
+                    push!(extd_direct_a_idx_list, Ti(0))
+                    push!(extd_fine_offsets_list, Ti(length(extd_a_ik_list) + 1))
+                    push!(extd_d_base_offsets_list, Ti(length(extd_d_base_entries_list) + 1))
+                    entry_type[p_nz] = Ti(0)  # treat as fallback
+                end
+                # Reset markers
+                for si in strong_nbrs_offsets[i]:(strong_nbrs_offsets[i+1]-1)
+                    j = strong_nbrs_cols[si]
+                    P_marker2[j] = -1
+                    if cf_copy[j] == -1
+                        for sj in strong_nbrs_offsets[j]:(strong_nbrs_offsets[j+1]-1)
+                            P_marker2[strong_nbrs_cols[sj]] = -1
+                        end
+                    end
+                end
+                strong_f_marker2 -= 1
+                continue
+            end
+            
+            # Step 2: For each P entry in this row, build GPU kernel data
+            for p_nz in p_start:p_end
+                target_col = Int(P_colval[p_nz])  # coarse column J
+                push!(extd_entry_row_list, Ti(i))
+                push!(extd_p_col_list, Ti(target_col))
+                
+                # Find direct contribution: coarse neighbor c where coarse_map[c] == target_col
+                direct_idx = Ti(0)
+                for nz in nzrange(A, i)
+                    j = cv[nz]
+                    if j != i && cf_copy[j] == 1 && coarse_map_copy[j] == target_col
+                        direct_idx = Ti(nz)
+                        break
+                    end
+                end
+                push!(extd_direct_a_idx_list, direct_idx)
+                
+                # Base d_i: push offset BEFORE adding entries
+                push!(extd_d_base_offsets_list, Ti(length(extd_d_base_entries_list) + 1))
+                # Add diagonal
+                if diag_nz_idx[i] > 0
+                    push!(extd_d_base_entries_list, diag_nz_idx[i])
+                end
+                # Add weak connections (not strong, not in C-hat)
+                for nz in nzrange(A, i)
+                    j = cv[nz]
+                    if j != i && !is_strong_copy[nz]
+                        push!(extd_d_base_entries_list, Ti(nz))
+                    end
+                end
+                
+                # Fine neighbor contributions: push offset BEFORE adding entries
+                push!(extd_fine_offsets_list, Ti(length(extd_a_ik_list) + 1))
+                
+                for nz in nzrange(A, i)
+                    k = cv[nz]
+                    if k != i && cf_copy[k] == -1 && P_marker2[k] == strong_f_marker2
+                        # k is a strong fine neighbor
+                        # Find A[i,k] (which is nz)
+                        nz_ik = nz
+                        
+                        # Find diag(k)
+                        diag_k_nz = diag_nz_idx[k]
+                        
+                        push!(extd_a_ik_list, Ti(nz_ik))
+                        push!(extd_diag_k_list, diag_k_nz)
+                        
+                        # sum_C_k and contrib: push offset BEFORE adding entries
+                        push!(extd_sum_offsets_list, Ti(length(extd_sum_indices_list) + 1))
+                        push!(extd_contrib_offsets_list, Ti(length(extd_contrib_a_idx_list) + 1))
+                        
+                        # Compute sum_C_k indices: A[k,m] where m in C-hat OR m == i
+                        for nz2 in nzrange(A, k)
+                            m = cv[nz2]
+                            if m != k && (P_marker2[m] >= 0 || m == i)
+                                push!(extd_sum_indices_list, Ti(nz2))
+                            end
+                        end
+                        
+                        # Contribution data: A[k,m] where m in C-hat OR m == i
+                        for nz2 in nzrange(A, k)
+                            m = cv[nz2]
+                            if m != k
+                                p_col_contrib = Ti(0)  # default = contributes to d_i if m == i
+                                if P_marker2[m] >= 0
+                                    # m is a coarse point in C-hat
+                                    p_col_contrib = Ti(coarse_map_copy[m])
+                                elseif m == i
+                                    p_col_contrib = Ti(0)  # contribution to d_i
+                                else
+                                    continue  # not in C-hat and not i, skip
+                                end
+                                push!(extd_contrib_a_idx_list, Ti(nz2))
+                                push!(extd_contrib_p_col_list, p_col_contrib)
+                            end
+                        end
+                    end
+                end
+            end
+            
+            # Reset markers for this row
+            for c in chat_indices
+                P_marker2[c] = -1
+            end
+            for si in strong_nbrs_offsets[i]:(strong_nbrs_offsets[i+1]-1)
+                j = strong_nbrs_cols[si]
+                P_marker2[j] = -1
+                if cf_copy[j] == -1
+                    for sj in strong_nbrs_offsets[j]:(strong_nbrs_offsets[j+1]-1)
+                        P_marker2[strong_nbrs_cols[sj]] = -1
+                    end
+                end
+            end
+            strong_f_marker2 -= 1
+        end
+        
+        # Finalize offset arrays: add terminators
+        # Each offset array needs a final entry pointing past the last data element
+        push!(extd_fine_offsets_list, Ti(length(extd_a_ik_list) + 1))
+        push!(extd_sum_offsets_list, Ti(length(extd_sum_indices_list) + 1))
+        push!(extd_contrib_offsets_list, Ti(length(extd_contrib_a_idx_list) + 1))
+        push!(extd_d_base_offsets_list, Ti(length(extd_d_base_entries_list) + 1))
+        
         P_update_map = ProlongationUpdateMap{Ti, Tv}(
             3,  # interp_type = Extended+i
             is_strong_copy,
@@ -1355,8 +1566,20 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
             Vector{Tv}(undef, max_chat),   # P_data buffer
             # GPU kernel data for Standard (10 fields, empty for Extended+i)
             Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[],
-            # GPU kernel data for Extended+i (13 fields, TODO: fill in when implementing GPU kernel)
-            Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[]
+            # GPU kernel data for Extended+i (13 fields)
+            Vector{Ti}(extd_entry_row_list),
+            Vector{Ti}(extd_p_col_list),
+            Vector{Ti}(extd_direct_a_idx_list),
+            Vector{Ti}(extd_fine_offsets_list),
+            Vector{Ti}(extd_a_ik_list),
+            Vector{Ti}(extd_diag_k_list),
+            Vector{Ti}(extd_sum_offsets_list),
+            Vector{Ti}(extd_sum_indices_list),
+            Vector{Ti}(extd_contrib_offsets_list),
+            Vector{Ti}(extd_contrib_a_idx_list),
+            Vector{Ti}(extd_contrib_p_col_list),
+            Vector{Ti}(extd_d_base_offsets_list),
+            Vector{Ti}(extd_d_base_entries_list)
         )
         
         # ══════════════════════════════════════════════════════════════════════
@@ -1365,7 +1588,7 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
         # This uses the SAME code path as update_P=true resetup,
         # ensuring initial setup and resetup produce identical results.
         
-        _update_P_extendedi!(P, A_in, P_update_map)
+        _update_P_extendedi!(P, A_in, P_update_map; backend=backend, block_size=block_size)
     end
     
     return P, P_update_map
@@ -1666,10 +1889,10 @@ function _update_prolongation_values!(level::AMGLevel{Tv, Ti}, A::CSRMatrix{Tv, 
         _update_P_direct_kernel!(level.P, A, P_update_map; backend=backend, block_size=block_size)
     elseif interp_type == 2
         # Standard interpolation: full row recomputation
-        _update_P_standard!(level.P, A, P_update_map)
+        _update_P_standard!(level.P, A, P_update_map; backend=backend, block_size=block_size)
     elseif interp_type == 3
         # Extended+i interpolation: full row recomputation
-        _update_P_extendedi!(level.P, A, P_update_map)
+        _update_P_extendedi!(level.P, A, P_update_map; backend=backend, block_size=block_size)
     end
     
     return level.P
@@ -1882,6 +2105,180 @@ function _standard_interp_compute_values!(P_nzval::AbstractVector{Tv}, A_nzval::
     return true  # Success
 end
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Extended+i Interpolation GPU Kernel
+# ══════════════════════════════════════════════════════════════════════════════
+
+"""
+Extended+i interpolation GPU kernel. Computes P values for Extended+i interpolation
+using pre-computed index maps. The structure is similar to Standard but includes
+distance-2 coarse points in the interpolation stencil.
+
+For each P entry k:
+- entry_type[k] == 0: Coarse point, P = 1
+- entry_type[k] == 3: Fine point, compute full formula
+
+The formula is: P[k] = -numerator / d_i where:
+- numerator = direct_contrib + sum of indirect contributions through fine neighbors
+- d_i = diagonal + weak + redistributed fine neighbor contributions to diagonal
+"""
+@kernel function _p_extendedi_update_kernel!(P_nzval, @Const(A_nzval), @Const(entry_type),
+                                             @Const(extd_direct_a_idx), @Const(extd_fine_offsets),
+                                             @Const(extd_a_ik), @Const(extd_diag_k),
+                                             @Const(extd_sum_offsets), @Const(extd_sum_indices),
+                                             @Const(extd_contrib_offsets), @Const(extd_contrib_a_idx),
+                                             @Const(extd_contrib_p_col), @Const(target_p_col),
+                                             @Const(extd_d_base_offsets), @Const(extd_d_base_entries))
+    k = @index(Global)
+    @inbounds begin
+        if entry_type[k] == 0
+            # Coarse point: P value = 1
+            P_nzval[k] = one(eltype(P_nzval))
+        else
+            # Fine point: compute numerator and denominator
+            numerator = zero(eltype(A_nzval))
+            target_col = target_p_col[k]  # The coarse column this P entry interpolates to
+            
+            # Direct contribution: A[i,J] if J is a direct strong coarse neighbor
+            direct_idx = extd_direct_a_idx[k]
+            if direct_idx > 0
+                numerator += A_nzval[direct_idx]
+            end
+            
+            # Compute base denominator (diagonal + weak connections)
+            d_i = zero(eltype(A_nzval))
+            for j in extd_d_base_offsets[k]:(extd_d_base_offsets[k+1]-1)
+                d_i += A_nzval[extd_d_base_entries[j]]
+            end
+            
+            # Indirect contributions through fine neighbors
+            for fnbr_idx in extd_fine_offsets[k]:(extd_fine_offsets[k+1]-1)
+                # Get A[i,k] value
+                a_ik_idx = extd_a_ik[fnbr_idx]
+                a_ik_val = A_nzval[a_ik_idx]
+                
+                # Get diagonal of fine neighbor k (for sign determination in sum_C_k)
+                diag_k_idx = extd_diag_k[fnbr_idx]
+                diag_k_val = diag_k_idx > 0 ? A_nzval[diag_k_idx] : zero(eltype(A_nzval))
+                
+                # Compute sum_C_k (sum of connections from k to C-hat ∪ {i})
+                sum_C_k = zero(eltype(A_nzval))
+                for j in extd_sum_offsets[fnbr_idx]:(extd_sum_offsets[fnbr_idx+1]-1)
+                    sum_C_k += A_nzval[extd_sum_indices[j]]
+                end
+                
+                if abs(sum_C_k) > eps(real(eltype(A_nzval)))
+                    distribute = a_ik_val / sum_C_k
+                    
+                    # Distribute contributions to C-hat and diagonal
+                    for contrib_idx in extd_contrib_offsets[fnbr_idx]:(extd_contrib_offsets[fnbr_idx+1]-1)
+                        a_km_idx = extd_contrib_a_idx[contrib_idx]
+                        contrib_col = extd_contrib_p_col[contrib_idx]
+                        a_km_val = A_nzval[a_km_idx]
+                        
+                        if contrib_col == target_col
+                            # Contribution to this P entry's numerator
+                            numerator += distribute * a_km_val
+                        elseif contrib_col == 0
+                            # Contribution to diagonal (contrib_col == 0 means this is A[k,i])
+                            d_i += distribute * a_km_val
+                        end
+                        # Note: contributions to other P columns are handled by their respective P entries
+                    end
+                else
+                    # If sum_C_k is too small, add A[i,k] to d_i
+                    d_i += a_ik_val
+                end
+            end
+            
+            # Final P value: P = -numerator / d_i
+            abs_d_i = abs(d_i)
+            threshold = eps(real(eltype(A_nzval))) * max(one(real(eltype(A_nzval))), abs_d_i)
+            if abs_d_i > threshold
+                P_nzval[k] = -numerator / d_i
+            else
+                P_nzval[k] = zero(eltype(P_nzval))
+            end
+        end
+    end
+end
+
+"""
+Compute Extended+i interpolation P values using GPU kernel.
+Returns true if GPU kernel was used successfully, false to fall back to CPU.
+"""
+function _extendedi_interp_compute_values!(P_nzval::AbstractVector{Tv}, A_nzval::AbstractVector{Tv},
+                                           P_update_map::ProlongationUpdateMap{Ti, Tv2};
+                                           backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti, Tv2}
+    nnz_P = length(P_nzval)
+    nnz_P == 0 && return true  # Empty P is considered success
+    
+    # Get GPU kernel data
+    entry_type = P_update_map.entry_type
+    extd_direct_a_idx = P_update_map.extd_direct_a_idx
+    extd_fine_offsets = P_update_map.extd_fine_offsets
+    extd_a_ik = P_update_map.extd_a_ik
+    extd_diag_k = P_update_map.extd_diag_k
+    extd_sum_offsets = P_update_map.extd_sum_offsets
+    extd_sum_indices = P_update_map.extd_sum_indices
+    extd_contrib_offsets = P_update_map.extd_contrib_offsets
+    extd_contrib_a_idx = P_update_map.extd_contrib_a_idx
+    extd_contrib_p_col = P_update_map.extd_contrib_p_col
+    extd_p_col = P_update_map.extd_p_col  # target P column for each entry
+    extd_d_base_offsets = P_update_map.extd_d_base_offsets
+    extd_d_base_entries = P_update_map.extd_d_base_entries
+    
+    # Check if GPU kernel data is available
+    if isempty(extd_direct_a_idx) || isempty(extd_p_col)
+        return false  # Fall back to CPU implementation
+    end
+    
+    P_on_gpu = !(P_nzval isa Array)
+    A_on_gpu = !(A_nzval isa Array)
+    
+    if P_on_gpu
+        # P is on GPU: convert update map arrays to GPU and use GPU kernel
+        be = _get_backend(P_nzval)
+        # Convert A values to GPU if needed
+        A_nzval_gpu = A_on_gpu ? A_nzval : begin
+            tmp = similar(P_nzval, eltype(A_nzval), length(A_nzval))
+            copyto!(tmp, A_nzval)
+            tmp
+        end
+        # Helper to convert array to GPU
+        _copy_to_gpu(arr) = begin
+            tmp = similar(P_nzval, eltype(arr), length(arr))
+            copyto!(tmp, arr)
+            tmp
+        end
+        
+        kernel! = _p_extendedi_update_kernel!(be, block_size)
+        kernel!(P_nzval, A_nzval_gpu, _copy_to_gpu(entry_type),
+                _copy_to_gpu(extd_direct_a_idx), _copy_to_gpu(extd_fine_offsets),
+                _copy_to_gpu(extd_a_ik), _copy_to_gpu(extd_diag_k),
+                _copy_to_gpu(extd_sum_offsets), _copy_to_gpu(extd_sum_indices),
+                _copy_to_gpu(extd_contrib_offsets), _copy_to_gpu(extd_contrib_a_idx),
+                _copy_to_gpu(extd_contrib_p_col), _copy_to_gpu(extd_p_col),
+                _copy_to_gpu(extd_d_base_offsets), _copy_to_gpu(extd_d_base_entries); ndrange=nnz_P)
+        _synchronize(be)
+    else
+        # P is on CPU: use CPU kernel
+        be = _get_backend(P_nzval)
+        A_nzval_cpu = A_on_gpu ? Array(A_nzval) : A_nzval
+        kernel! = _p_extendedi_update_kernel!(be, block_size)
+        kernel!(P_nzval, A_nzval_cpu, entry_type,
+                extd_direct_a_idx, extd_fine_offsets,
+                extd_a_ik, extd_diag_k,
+                extd_sum_offsets, extd_sum_indices,
+                extd_contrib_offsets, extd_contrib_a_idx,
+                extd_contrib_p_col, extd_p_col,
+                extd_d_base_offsets, extd_d_base_entries; ndrange=nnz_P)
+        _synchronize(be)
+    end
+    
+    return true  # Success
+end
+
 """
     _update_P_standard!(P, A, P_update_map; backend, block_size)
 
@@ -2026,14 +2423,25 @@ function _update_P_standard!(P::ProlongationOp{Ti, Tv}, A::CSRMatrix{Tv, Ti},
 end
 
 """
-    _update_P_extendedi!(P, A, P_update_map)
+    _update_P_extendedi!(P, A, P_update_map; backend, block_size)
 
-CPU-based Extended+i interpolation P value update.
-Uses stored graph structure to recompute interpolation weights.
+Extended+i interpolation P value update.
+Uses GPU kernel when available, falls back to CPU implementation.
 Uses workspace buffers from P_update_map to avoid per-row allocations.
 """
 function _update_P_extendedi!(P::ProlongationOp{Ti, Tv}, A::CSRMatrix{Tv, Ti},
-                              P_update_map::ProlongationUpdateMap{Ti, Tv2}) where {Tv, Ti, Tv2}
+                              P_update_map::ProlongationUpdateMap{Ti, Tv2};
+                              backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti, Tv2}
+    # Try GPU kernel first if data is available
+    if !isempty(P_update_map.extd_direct_a_idx)
+        success = _extendedi_interp_compute_values!(P.nzval, nonzeros(A), P_update_map;
+                                                     backend=backend, block_size=block_size)
+        if success
+            return P
+        end
+    end
+    
+    # Fall back to CPU implementation
     A_cpu = csr_to_cpu(A)
     P_nzval = P.nzval isa Array ? P.nzval : Array(P.nzval)
     P_rowptr = P.rowptr isa Array ? P.rowptr : Array(P.rowptr)

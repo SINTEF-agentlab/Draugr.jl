@@ -1819,7 +1819,7 @@ function _standard_interp_compute_values!(P_nzval::AbstractVector{Tv}, A_nzval::
                                           P_update_map::ProlongationUpdateMap{Ti, Tv2};
                                           backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti, Tv2}
     nnz_P = length(P_nzval)
-    nnz_P == 0 && return P_nzval
+    nnz_P == 0 && return true  # Empty P is considered success
     
     # Get GPU kernel data
     entry_type = P_update_map.entry_type
@@ -1837,7 +1837,7 @@ function _standard_interp_compute_values!(P_nzval::AbstractVector{Tv}, A_nzval::
     # Check if GPU kernel data is available
     if isempty(std_direct_numer_idx)
         # Fall back to CPU implementation
-        return nothing
+        return false
     end
     
     P_on_gpu = !(P_nzval isa Array)
@@ -1852,19 +1852,19 @@ function _standard_interp_compute_values!(P_nzval::AbstractVector{Tv}, A_nzval::
             copyto!(tmp, A_nzval)
             tmp
         end
-        # Convert update map arrays to GPU
-        _to_gpu(arr) = begin
+        # Helper to convert array to GPU
+        _copy_to_gpu(arr) = begin
             tmp = similar(P_nzval, eltype(arr), length(arr))
             copyto!(tmp, arr)
             tmp
         end
         
         kernel! = _p_standard_update_kernel!(be, block_size)
-        kernel!(P_nzval, A_nzval_gpu, _to_gpu(entry_type),
-                _to_gpu(std_direct_numer_idx), _to_gpu(std_fine_offsets),
-                _to_gpu(std_a_ik), _to_gpu(std_a_kJ), _to_gpu(std_diag_k),
-                _to_gpu(std_a_ki), _to_gpu(std_sum_offsets), _to_gpu(std_sum_indices),
-                _to_gpu(std_d_base_offsets), _to_gpu(std_d_base_entries); ndrange=nnz_P)
+        kernel!(P_nzval, A_nzval_gpu, _copy_to_gpu(entry_type),
+                _copy_to_gpu(std_direct_numer_idx), _copy_to_gpu(std_fine_offsets),
+                _copy_to_gpu(std_a_ik), _copy_to_gpu(std_a_kJ), _copy_to_gpu(std_diag_k),
+                _copy_to_gpu(std_a_ki), _copy_to_gpu(std_sum_offsets), _copy_to_gpu(std_sum_indices),
+                _copy_to_gpu(std_d_base_offsets), _copy_to_gpu(std_d_base_entries); ndrange=nnz_P)
         _synchronize(be)
     else
         # P is on CPU: use CPU kernel
@@ -1879,7 +1879,7 @@ function _standard_interp_compute_values!(P_nzval::AbstractVector{Tv}, A_nzval::
         _synchronize(be)
     end
     
-    return P_nzval
+    return true  # Success
 end
 
 """
@@ -1893,9 +1893,9 @@ function _update_P_standard!(P::ProlongationOp{Ti, Tv}, A::CSRMatrix{Tv, Ti},
                              backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti, Tv2}
     # Try GPU kernel first if data is available
     if !isempty(P_update_map.std_direct_numer_idx)
-        result = _standard_interp_compute_values!(P.nzval, nonzeros(A), P_update_map;
-                                                   backend=backend, block_size=block_size)
-        if result !== nothing
+        success = _standard_interp_compute_values!(P.nzval, nonzeros(A), P_update_map;
+                                                    backend=backend, block_size=block_size)
+        if success
             return P
         end
     end

@@ -325,6 +325,20 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
         sizehint!(strong_nbrs_nz_list, nnz(A); shrink=false)
     end
 
+    # Pre-allocate workspace buffers for inner loop (avoid per-row allocations)
+    # Estimate max row size from A's max row length
+    max_row_nnz = 0
+    for i in 1:n_fine
+        row_nnz = Int(rowptr(A)[i+1] - rowptr(A)[i])
+        max_row_nnz = max(max_row_nnz, row_nnz)
+    end
+    strong_coarse_cols = Ti[]
+    strong_coarse_nz_idx = Ti[]
+    denom_nz_idx = Ti[]
+    sizehint!(strong_coarse_cols, max_row_nnz; shrink=false)
+    sizehint!(strong_coarse_nz_idx, max_row_nnz; shrink=false)
+    sizehint!(denom_nz_idx, max_row_nnz; shrink=false)
+
     # Second pass: fill sparsity pattern (colval) and build index mappings
     # NOTE: We do NOT compute nzv_p values here - Phase 2 will do that
     @inbounds for i in 1:n_fine
@@ -350,10 +364,10 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
             denom_offsets[pos] = Ti(length(denom_entries_list) + 1)
         else
             diag_sign = diag_positive[i] ? 1 : -1
-            # Collect strong coarse columns and denominator entries
-            strong_coarse_cols = Ti[]
-            strong_coarse_nz_idx = Ti[]  # A.nzval indices for numerators
-            denom_nz_idx = Ti[]          # A.nzval indices for denominator
+            # Clear workspace buffers (reuse allocations)
+            empty!(strong_coarse_cols)
+            empty!(strong_coarse_nz_idx)
+            empty!(denom_nz_idx)
             
             for nz in nzrange(A, i)
                 j = cv[nz]
@@ -588,6 +602,17 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
     sizehint!(numer_idx_list, nnz_hint; shrink=false)
     sizehint!(denom_entries_list, nnz_hint * 4; shrink=false)
 
+    # Pre-allocate workspace buffers for inner loop (avoid per-row allocations)
+    max_row_nnz = 0
+    for i in 1:n_fine
+        row_nnz = Int(rowptr(A)[i+1] - rowptr(A)[i])
+        max_row_nnz = max(max_row_nnz, row_nnz)
+    end
+    weak_nz_indices = Ti[]
+    strong_fine = Tuple{Int, Tv, Ti}[]
+    sizehint!(weak_nz_indices, max_row_nnz; shrink=false)
+    sizehint!(strong_fine, max_row_nnz; shrink=false)
+
     # Determine sparsity pattern by computing which coarse columns contribute
     # NOTE: We still compute values here for sparsity determination, but
     # Phase 2 will recompute using the same function as resetup
@@ -608,10 +633,10 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
             a_ii = nzv[diag_nz]
         end
         sum_weak = zero(Tv)
-        weak_nz_indices = Ti[]
+        empty!(weak_nz_indices)  # reuse allocation
         strong_coarse = Dict{Int, Tv}()       # coarse_map[j] → a_{i,j}
         strong_coarse_nz = Dict{Int, Ti}()    # coarse_map[j] → A.nzval index
-        strong_fine = Tuple{Int, Tv, Ti}[]    # (fine node k, a_{i,k}, nz index)
+        empty!(strong_fine)  # reuse allocation
         
         for nz in nzrange(A, i)
             j = cv[nz]
@@ -866,6 +891,19 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
         sizehint!(S_p, nnz_hint; shrink=false)
     end
 
+    # Pre-allocate workspace for C-hat indices (avoid per-row allocations)
+    # Estimate max C-hat size from max strong neighbors * 2 (distance-2)
+    max_chat_est = 0
+    for i in 1:n_fine
+        if cf[i] == -1
+            count = Int(sn_offsets[i + 1] - sn_offsets[i]) * 2
+            max_chat_est = max(max_chat_est, count)
+        end
+    end
+    max_chat_est = max(max_chat_est, 1)
+    chat_indices = Int[]
+    sizehint!(chat_indices, max_chat_est; shrink=false)
+
     # Build sparsity pattern and compute initial values
     @inbounds for i in 1:n_fine
         if cf[i] == 1
@@ -875,7 +913,7 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
         end
 
         # Determine C-hat (extended coarse interpolation set)
-        chat_indices = Int[]  # fine node indices in C-hat
+        empty!(chat_indices)  # reuse allocation
 
         for si in sn_offsets[i]:(sn_offsets[i + 1] - 1)
             j = sn_data[si]

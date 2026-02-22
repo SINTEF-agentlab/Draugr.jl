@@ -430,6 +430,128 @@ struct RestrictionMap{Ti<:Integer, Vi<:AbstractVector{Ti}}
     triple_pj_idx::Vi     # P.nzval index for p_j weight (sorted by dest NZ)
 end
 
+"""
+    ProlongationUpdateMap
+
+Stores precomputed index mappings for efficient in-place update of prolongation
+operator values during resetup with `update_P=true`. All graph structure
+decisions (strength, CF-split, etc.) are fixed at setup time.
+
+## Design Philosophy
+
+For Direct interpolation: P[i,c] = -A[i,c] / d_i where d_i = diagonal + weak sum
+- Simple linear formula with fixed coefficient 1.0 on numerator A entry
+
+For Standard/Extended+i interpolation: The formula involves indirect contributions
+where weights themselves depend on A values. These use a more complex structure
+that stores the full graph connectivity to enable recomputation.
+
+## Fields
+
+- `interp_type`: 1=Direct, 2=Standard, 3=Extended+i
+- `is_strong`: Boolean array marking strong connections in A
+- `cf`: Coarse/fine split (cf[i]=1 for coarse, -1 for fine)
+- `coarse_map`: Maps fine indices to coarse indices for coarse points
+- `diag_nz_idx`: Diagonal A.nzval index for each row
+
+Per-entry formula data:
+- `entry_type`: 0=coarse point (P=1), 1=Direct formula, 2=Standard, 3=Extended+i
+- `numer_idx`: A.nzval index for numerator term (0 for coarse)
+- `denom_offsets`, `denom_entries`: A.nzval indices for denominator sum
+
+Strong neighbor structure (for Standard/Extended+i row recomputation):
+- `strong_nbrs_offsets`: CSR offset array (n_fine + 1)
+- `strong_nbrs_cols`: column indices of strong neighbors
+- `strong_nbrs_nz`: A.nzval indices of strong neighbors
+
+Workspace for Standard/Extended+i (to avoid allocations during resetup):
+- `P_marker`: Scratch array for tracking visited nodes
+- `chat_indices`: Reusable buffer for C-hat indices
+- `P_data`: Reusable buffer for P values
+"""
+mutable struct ProlongationUpdateMap{Ti<:Integer, Tv<:Number}
+    interp_type::Int                    # 1=Direct, 2=Standard, 3=Extended+i
+    is_strong::Vector{Bool}             # strong connection mask (nnz_A)
+    cf::Vector{Int}                     # coarse/fine split (n_fine)
+    coarse_map::Vector{Int}             # fine-to-coarse mapping (n_fine)
+    diag_nz_idx::Vector{Ti}             # diagonal A.nzval index for each row
+    # Per-entry formula data (used by Direct interpolation kernel)
+    entry_type::Vector{Ti}              # 0=coarse (P=1), 1+=compute formula
+    numer_idx::Vector{Ti}               # A.nzval index for numerator
+    denom_offsets::Vector{Ti}           # offset array for denominator
+    denom_entries::Vector{Ti}           # A.nzval indices for denominator
+    # Strong neighbor structure for Standard/Extended+i row recomputation
+    strong_nbrs_offsets::Vector{Ti}     # offset array (n_fine + 1)
+    strong_nbrs_cols::Vector{Ti}        # column indices of strong neighbors
+    strong_nbrs_nz::Vector{Ti}          # A.nzval indices of strong neighbors
+    # Workspace for Standard/Extended+i (to avoid allocations during resetup)
+    P_marker::Vector{Int}               # marker array for C-hat tracking
+    chat_indices::Vector{Int}           # reusable buffer for C-hat indices
+    P_data::Vector{Tv}                  # reusable buffer for P values
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # GPU kernel data for Standard interpolation (interp_type == 2)
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Per P entry k, the formula is:
+    #   P[k] = -(direct_contrib + Σ indirect_contribs) / d_i
+    # 
+    # Direct contribution: A[direct_numer_idx[k]] (or 0 if no direct connection)
+    # Indirect contributions through fine neighbors:
+    #   Each fine neighbor contributes: A[a_ik] * A[a_kJ] / sum_C_k
+    #   where sum_C_k = Σ A[sum_indices] (with sign check based on diag_k sign)
+    # Denominator d_i = Σ A[d_base_indices] + Σ (A[a_ik] * A[a_ki] / sum_C_k)
+    #
+    # Data layout (CSR-like):
+    # - std_direct_numer_idx[k]: A.nzval index for direct a_{i,J} (0=none)
+    # - std_fine_offsets[k]: offset into fine neighbor data
+    # - For each fine neighbor j (from std_fine_offsets[k] to std_fine_offsets[k+1]-1):
+    #   - std_a_ik[j]: A.nzval index for a_{i,fine_j}
+    #   - std_a_kJ[j]: A.nzval index for a_{fine_j, coarse_J}
+    #   - std_diag_k[j]: A.nzval index for diagonal of fine neighbor
+    #   - std_a_ki[j]: A.nzval index for a_{fine_j, i} (for d_i contrib, 0=none)
+    #   - std_sum_offsets[j]: offset into sum_C_k indices
+    #   - std_sum_indices[...]: A.nzval indices for computing sum_C_k
+    # - std_d_base_offsets[k]: offset into base denominator indices
+    # - std_d_base_entries[...]: A.nzval indices for a_{i,i} + weak neighbors
+    std_direct_numer_idx::Vector{Ti}
+    std_fine_offsets::Vector{Ti}
+    std_a_ik::Vector{Ti}
+    std_a_kJ::Vector{Ti}
+    std_diag_k::Vector{Ti}
+    std_a_ki::Vector{Ti}
+    std_sum_offsets::Vector{Ti}
+    std_sum_indices::Vector{Ti}
+    std_d_base_offsets::Vector{Ti}
+    std_d_base_entries::Vector{Ti}
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # GPU kernel data for Extended+i interpolation (interp_type == 3)
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Similar structure but C-hat includes distance-2 coarse points.
+    # For each P entry k at row i to coarse column J:
+    # - extd_entry_row[k]: row index i (needed for C-hat computation)
+    # - extd_p_col[k]: P column index J (what we're interpolating to)
+    # - For each C-hat point contributing to this P entry:
+    #   - extd_chat_offsets[k]: offset into C-hat data
+    #   - extd_chat_cols[...]: fine node indices c where coarse_map[c] = J
+    # - For fine neighbors (contribute indirectly):
+    #   - extd_fine_offsets[k]: offset into fine neighbor contribution data
+    #   - extd_fine_data[...]: (similar structure to Standard)
+    extd_entry_row::Vector{Ti}
+    extd_p_col::Vector{Ti}
+    extd_direct_a_idx::Vector{Ti}       # A.nzval index for direct contribution
+    extd_fine_offsets::Vector{Ti}
+    extd_a_ik::Vector{Ti}
+    extd_diag_k::Vector{Ti}
+    extd_sum_offsets::Vector{Ti}
+    extd_sum_indices::Vector{Ti}
+    extd_contrib_offsets::Vector{Ti}
+    extd_contrib_a_idx::Vector{Ti}      # A.nzval indices that contribute to P entry
+    extd_contrib_p_col::Vector{Ti}      # P column for each contribution
+    extd_d_base_offsets::Vector{Ti}
+    extd_d_base_entries::Vector{Ti}
+end
+
 # ── AMG Level ─────────────────────────────────────────────────────────────────
 """
     AMGLevel{Tv, Ti}
@@ -440,6 +562,10 @@ happens at the API boundary in `amg_setup` and `amg_resetup!`.
 
 Workspace vectors (`r`, `xc`, `bc`) are allocated on the same device as the
 matrix arrays to avoid host/device memory mixing in GPU kernels.
+
+When `allow_partial_resetup=true` and using CF-splitting based coarsening,
+the `P_update_map` field stores the coarse-fine split and mapping data
+needed for in-place P value update with `update_P=true`.
 """
 mutable struct AMGLevel{Tv, Ti<:Integer}
     A::CSRMatrix{Tv, Ti}
@@ -450,6 +576,7 @@ mutable struct AMGLevel{Tv, Ti<:Integer}
     r::AbstractVector{Tv}      # residual workspace
     xc::AbstractVector{Tv}     # coarse solution workspace
     bc::AbstractVector{Tv}     # coarse RHS workspace
+    P_update_map::Union{Nothing, ProlongationUpdateMap}  # for update_P=true resetup
 end
 
 # ── AMG Hierarchy ─────────────────────────────────────────────────────────────

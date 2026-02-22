@@ -907,7 +907,12 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
     end
 
     # P_marker tracks which coarse points are in C-hat for current row
-    P_marker = fill(-1, n_fine)
+    if setup_workspace !== nothing
+        P_marker = _ws_resize!(setup_workspace.P_marker, n_fine)
+        fill!(P_marker, -1)
+    else
+        P_marker = fill(-1, n_fine)
+    end
     strong_f_marker = -2
 
     nnz_hint = nnz(A)

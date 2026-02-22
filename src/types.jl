@@ -644,6 +644,8 @@ mutable struct SetupWorkspace{Tv, Ti<:Integer}
     sort_perm::Vector{Int}
     # Old ProlongationOp reference for array reuse during resetup (set per-level in _build_levels!)
     old_P::Any   # Union{Nothing, ProlongationOp}
+    # Old ProlongationUpdateMap reference for extd array reuse during resetup (set per-level in _build_levels!)
+    old_P_update_map::Any   # Union{Nothing, ProlongationUpdateMap}
 end
 
 function SetupWorkspace{Tv, Ti}() where {Tv, Ti}
@@ -654,6 +656,7 @@ function SetupWorkspace{Tv, Ti}() where {Tv, Ti}
         Ti[], Ti[], Tv[],
         Int[], Int[], Int[],
         Bool[], Int[],
+        nothing,
         nothing,
     )
 end

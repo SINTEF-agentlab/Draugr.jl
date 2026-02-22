@@ -207,6 +207,12 @@ function _build_levels!(levels::Vector{AMGLevel{Tv, Ti}},
             else
                 setup_workspace.old_P = nothing
             end
+            # Set old_P_update_map for extd array reuse during prolongation building (CPU only)
+            if old_lvl !== nothing && !is_gpu && old_lvl.P_update_map !== nothing
+                setup_workspace.old_P_update_map = old_lvl.P_update_map
+            else
+                setup_workspace.old_P_update_map = nothing
+            end
         end
         # Build P_update_map only for CF-splitting methods when allow_partial_resetup is enabled
         build_P_update_map = allow_partial_resetup && uses_cf_splitting(coarsening_alg)
@@ -216,16 +222,22 @@ function _build_levels!(levels::Vector{AMGLevel{Tv, Ti}},
         A_cpu = csr_to_cpu(A_current)
         # Get old A_coarse for array reuse (stored as next level's A, CPU only)
         old_A_coarse = nothing
+        old_r_map = nothing
         if !is_gpu && lvl + 1 <= length(old_levels)
             old_A_c = old_levels[lvl + 1].A
             if old_A_c.nzval isa Vector
                 old_A_coarse = old_A_c
             end
         end
+        # Get old R_map for array reuse (nz_offsets, map_pi, map_ai, map_pj; CPU only)
+        if !is_gpu && old_lvl !== nothing && old_lvl.R_map !== nothing &&
+                old_lvl.R_map.nz_offsets isa Vector
+            old_r_map = old_lvl.R_map
+        end
         # Build transpose map first — needed by compute_coarse_sparsity to
         # iterate by coarse row (P^T structure)
         Pt_map = build_transpose_map(P)
-        A_coarse, r_map = compute_coarse_sparsity(A_cpu, P, Pt_map, n_coarse; build_restriction_map=allow_partial_resetup, workspace=galerkin_workspace, old_A_coarse=old_A_coarse)
+        A_coarse, r_map = compute_coarse_sparsity(A_cpu, P, Pt_map, n_coarse; build_restriction_map=allow_partial_resetup, workspace=galerkin_workspace, old_A_coarse=old_A_coarse, old_r_map=old_r_map)
         # P_update_map is now returned directly from _coarsen_with_fallback
         if is_gpu
             A_dev = _csr_to_device(A_ref, A_cpu)

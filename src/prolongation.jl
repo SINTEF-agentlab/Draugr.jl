@@ -1346,19 +1346,38 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
         # - Fine neighbor contributions (extd_fine_offsets, extd_a_ik, etc.)
         # - Base d_i entries (diagonal + weak connections)
         
-        extd_entry_row_list = Ti[]
-        extd_p_col_list = Ti[]
-        extd_direct_a_idx_list = Ti[]
-        extd_fine_offsets_list = Ti[]      # NO initial value
-        extd_a_ik_list = Ti[]
-        extd_diag_k_list = Ti[]
-        extd_sum_offsets_list = Ti[]       # NO initial value
-        extd_sum_indices_list = Ti[]
-        extd_contrib_offsets_list = Ti[]   # NO initial value
-        extd_contrib_a_idx_list = Ti[]
-        extd_contrib_p_col_list = Ti[]  # 0 = contributes to d_i, otherwise = P column
-        extd_d_base_offsets_list = Ti[]    # NO initial value
-        extd_d_base_entries_list = Ti[]
+        # Reuse extd arrays from old P_update_map (set per-level in _build_levels!)
+        # to avoid allocating fresh arrays on every resetup call.
+        _old_pmap = setup_workspace !== nothing ? setup_workspace.old_P_update_map : nothing
+        if _old_pmap !== nothing
+            extd_entry_row_list = _old_pmap.extd_entry_row;   empty!(extd_entry_row_list)
+            extd_p_col_list = _old_pmap.extd_p_col;           empty!(extd_p_col_list)
+            extd_direct_a_idx_list = _old_pmap.extd_direct_a_idx; empty!(extd_direct_a_idx_list)
+            extd_fine_offsets_list = _old_pmap.extd_fine_offsets; empty!(extd_fine_offsets_list)
+            extd_a_ik_list = _old_pmap.extd_a_ik;             empty!(extd_a_ik_list)
+            extd_diag_k_list = _old_pmap.extd_diag_k;         empty!(extd_diag_k_list)
+            extd_sum_offsets_list = _old_pmap.extd_sum_offsets; empty!(extd_sum_offsets_list)
+            extd_sum_indices_list = _old_pmap.extd_sum_indices; empty!(extd_sum_indices_list)
+            extd_contrib_offsets_list = _old_pmap.extd_contrib_offsets; empty!(extd_contrib_offsets_list)
+            extd_contrib_a_idx_list = _old_pmap.extd_contrib_a_idx; empty!(extd_contrib_a_idx_list)
+            extd_contrib_p_col_list = _old_pmap.extd_contrib_p_col; empty!(extd_contrib_p_col_list)
+            extd_d_base_offsets_list = _old_pmap.extd_d_base_offsets; empty!(extd_d_base_offsets_list)
+            extd_d_base_entries_list = _old_pmap.extd_d_base_entries; empty!(extd_d_base_entries_list)
+        else
+            extd_entry_row_list = Ti[]
+            extd_p_col_list = Ti[]
+            extd_direct_a_idx_list = Ti[]
+            extd_fine_offsets_list = Ti[]      # NO initial value
+            extd_a_ik_list = Ti[]
+            extd_diag_k_list = Ti[]
+            extd_sum_offsets_list = Ti[]       # NO initial value
+            extd_sum_indices_list = Ti[]
+            extd_contrib_offsets_list = Ti[]   # NO initial value
+            extd_contrib_a_idx_list = Ti[]
+            extd_contrib_p_col_list = Ti[]  # 0 = contributes to d_i, otherwise = P column
+            extd_d_base_offsets_list = Ti[]    # NO initial value
+            extd_d_base_entries_list = Ti[]
+        end
         
         # Size hints
         sizehint!(extd_entry_row_list, nnz_P; shrink=false)
@@ -1566,21 +1585,27 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
             Vector{Tv}(undef, max_chat),   # P_data buffer
             # GPU kernel data for Standard (10 fields, empty for Extended+i)
             Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[],
-            # GPU kernel data for Extended+i (13 fields)
-            Vector{Ti}(extd_entry_row_list),
-            Vector{Ti}(extd_p_col_list),
-            Vector{Ti}(extd_direct_a_idx_list),
-            Vector{Ti}(extd_fine_offsets_list),
-            Vector{Ti}(extd_a_ik_list),
-            Vector{Ti}(extd_diag_k_list),
-            Vector{Ti}(extd_sum_offsets_list),
-            Vector{Ti}(extd_sum_indices_list),
-            Vector{Ti}(extd_contrib_offsets_list),
-            Vector{Ti}(extd_contrib_a_idx_list),
-            Vector{Ti}(extd_contrib_p_col_list),
-            Vector{Ti}(extd_d_base_offsets_list),
-            Vector{Ti}(extd_d_base_entries_list)
+            # GPU kernel data for Extended+i (13 fields) — reused arrays, no copy needed
+            extd_entry_row_list,
+            extd_p_col_list,
+            extd_direct_a_idx_list,
+            extd_fine_offsets_list,
+            extd_a_ik_list,
+            extd_diag_k_list,
+            extd_sum_offsets_list,
+            extd_sum_indices_list,
+            extd_contrib_offsets_list,
+            extd_contrib_a_idx_list,
+            extd_contrib_p_col_list,
+            extd_d_base_offsets_list,
+            extd_d_base_entries_list
         )
+        if setup_workspace !== nothing
+            # Clear the reference — the extd arrays now live in P_update_map.
+            # On the next level, _build_levels! will set old_P_update_map from the
+            # new level before this function is called again (same pattern as old_P).
+            setup_workspace.old_P_update_map = nothing
+        end
         
         # ══════════════════════════════════════════════════════════════════════
         # PHASE 2: Recompute P values using the update function

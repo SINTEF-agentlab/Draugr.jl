@@ -67,7 +67,32 @@ function _prolongation_update_map_to_device(ref::CSRMatrix{Tv, Ti}, p_map::Prolo
         p_map.strong_nbrs_nz,       # stays on CPU
         p_map.P_marker,             # stays on CPU
         p_map.chat_indices,         # stays on CPU
-        p_map.P_data                # stays on CPU
+        p_map.P_data,               # stays on CPU
+        # GPU kernel data for Standard (stays on CPU, converted at kernel launch time)
+        p_map.std_direct_numer_idx,
+        p_map.std_fine_offsets,
+        p_map.std_a_ik,
+        p_map.std_a_kJ,
+        p_map.std_diag_k,
+        p_map.std_a_ki,
+        p_map.std_sum_offsets,
+        p_map.std_sum_indices,
+        p_map.std_d_base_offsets,
+        p_map.std_d_base_entries,
+        # GPU kernel data for Extended+i (stays on CPU)
+        p_map.extd_entry_row,
+        p_map.extd_p_col,
+        p_map.extd_direct_a_idx,
+        p_map.extd_fine_offsets,
+        p_map.extd_a_ik,
+        p_map.extd_diag_k,
+        p_map.extd_sum_offsets,
+        p_map.extd_sum_indices,
+        p_map.extd_contrib_offsets,
+        p_map.extd_contrib_a_idx,
+        p_map.extd_contrib_p_col,
+        p_map.extd_d_base_offsets,
+        p_map.extd_d_base_entries
     )
 end
 

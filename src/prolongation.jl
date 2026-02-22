@@ -479,7 +479,11 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
             strong_nbrs_nz,
             Int[],  # P_marker (not used for Direct)
             Int[],  # chat_indices (not used for Direct)
-            Tv[]    # P_data (not used for Direct)
+            Tv[],   # P_data (not used for Direct)
+            # GPU kernel data for Standard (10 fields, empty for Direct)
+            Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[],
+            # GPU kernel data for Extended+i (13 fields, empty for Direct)
+            Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[]
         )
     end
     
@@ -634,6 +638,28 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
     sizehint!(numer_idx_list, nnz_hint; shrink=false)
     sizehint!(denom_entries_list, nnz_hint * 4; shrink=false)
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # GPU kernel data for Standard interpolation
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Per P entry: direct contribution index, fine neighbor contributions
+    std_direct_numer_idx_list = Ti[]
+    std_fine_offsets_list = Ti[1]
+    std_a_ik_list = Ti[]
+    std_a_kJ_list = Ti[]
+    std_diag_k_list = Ti[]
+    std_a_ki_list = Ti[]
+    std_sum_offsets_list = Ti[1]
+    std_sum_indices_list = Ti[]
+    std_d_base_offsets_list = Ti[1]
+    std_d_base_entries_list = Ti[]
+    sizehint!(std_direct_numer_idx_list, nnz_hint; shrink=false)
+    sizehint!(std_a_ik_list, nnz_hint * 2; shrink=false)
+    sizehint!(std_a_kJ_list, nnz_hint * 2; shrink=false)
+    sizehint!(std_diag_k_list, nnz_hint * 2; shrink=false)
+    sizehint!(std_a_ki_list, nnz_hint * 2; shrink=false)
+    sizehint!(std_sum_indices_list, nnz_hint * 4; shrink=false)
+    sizehint!(std_d_base_entries_list, nnz_hint * 4; shrink=false)
+
     # Pre-allocate workspace buffers for inner loop (avoid per-row allocations)
     max_row_nnz = 0
     for i in 1:n_fine
@@ -644,6 +670,11 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
     strong_fine = Tuple{Int, Tv, Ti}[]
     sizehint!(weak_nz_indices, max_row_nnz; shrink=false)
     sizehint!(strong_fine, max_row_nnz; shrink=false)
+    
+    # Additional workspace for GPU kernel data building
+    # For each fine neighbor, store: (fine_idx, a_ik_idx, diag_k_idx, a_ki_idx, sum_C_k_indices)
+    fine_nbr_info = Tuple{Int, Ti, Ti, Ti, Vector{Ti}}[]
+    sizehint!(fine_nbr_info, max_row_nnz; shrink=false)
 
     # Determine sparsity pattern by computing which coarse columns contribute
     # NOTE: We still compute values here for sparsity determination, but
@@ -655,6 +686,10 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
             push!(entry_types_list, Ti(0))  # coarse = P=1
             push!(numer_idx_list, Ti(0))
             push!(denom_offsets_list, Ti(length(denom_entries_list) + 1))
+            # GPU kernel data: coarse point has entry_type=0, so no fine contributions
+            push!(std_direct_numer_idx_list, Ti(0))
+            push!(std_fine_offsets_list, Ti(length(std_a_ik_list) + 1))
+            push!(std_d_base_offsets_list, Ti(length(std_d_base_entries_list) + 1))
             continue
         end
         
@@ -689,22 +724,48 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
         end
         d_i = a_ii + sum_weak
         
-        # Add indirect contributions from strong fine neighbors
+        # ═══════════════════════════════════════════════════════════════════════
+        # Build GPU kernel data: process fine neighbors and collect index info
+        # ═══════════════════════════════════════════════════════════════════════
+        # For each fine neighbor, we need to record:
+        # - Which coarse columns it contributes to (via a_{k,c} where c is in strong_coarse)
+        # - The A.nzval indices for a_{i,k}, a_{k,c}, diag_k, a_{k,i}, and sum_C_k
+        
+        empty!(fine_nbr_info)
         contributions = Dict{Int, Tv}()
+        # Maps: coarse_map -> list of (fine_nbr_idx_in_fine_nbr_info, a_kJ_idx) 
+        fine_contribs_per_cm = Dict{Int, Vector{Tuple{Int, Ti}}}()
+        
         for (cm, a_ij) in strong_coarse
             contributions[cm] = a_ij
         end
+        
         for (k, a_ik, nz_ik) in strong_fine
-            diag_k = zero(Tv)
+            # Find diagonal of k
+            diag_k_nz = Ti(0)
             for nz2 in nzrange(A, k)
                 if cv[nz2] == k
-                    diag_k = nzv[nz2]
+                    diag_k_nz = Ti(nz2)
                     break
                 end
             end
-            sgn = real(diag_k) < 0 ? -1 : 1
+            diag_k_val = diag_k_nz > 0 ? nzv[diag_k_nz] : zero(Tv)
+            sgn = real(diag_k_val) < 0 ? -1 : 1
+            
+            # Find a_{k,i} index
+            a_ki_nz = Ti(0)
+            for nz2 in nzrange(A, k)
+                if cv[nz2] == i && sgn * real(nzv[nz2]) < 0
+                    a_ki_nz = Ti(nz2)
+                    break
+                end
+            end
+            
+            # Build sum_C_k indices and collect coarse contributions
+            sum_C_k_indices = Ti[]
             sum_C_k = zero(Tv)
-            coarse_vals_k = Dict{Int, Tv}()
+            coarse_vals_k = Dict{Int, Tuple{Tv, Ti}}()  # cm -> (a_kc, nz_idx)
+            
             for nz2 in nzrange(A, k)
                 j2 = cv[nz2]
                 j2 == k && continue
@@ -712,24 +773,38 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                 if cf[j2] == 1
                     cm2 = coarse_map[j2]
                     if haskey(strong_coarse, cm2) && sgn * real(a_kj) < 0
-                        coarse_vals_k[cm2] = get(coarse_vals_k, cm2, zero(Tv)) + a_kj
+                        old = get(coarse_vals_k, cm2, (zero(Tv), Ti(0)))
+                        coarse_vals_k[cm2] = (old[1] + a_kj, Ti(nz2))
                         sum_C_k += a_kj
+                        push!(sum_C_k_indices, Ti(nz2))
                     end
                 end
                 if j2 == i && sgn * real(a_kj) < 0
                     sum_C_k += a_kj
+                    push!(sum_C_k_indices, Ti(nz2))
                 end
             end
+            
+            # Store fine neighbor info for GPU kernel
+            fine_nbr_idx = length(fine_nbr_info) + 1
+            push!(fine_nbr_info, (k, nz_ik, diag_k_nz, a_ki_nz, sum_C_k_indices))
+            
+            # Record which coarse columns this fine neighbor contributes to
+            for (cm2, (a_kj, nz_idx)) in coarse_vals_k
+                if !haskey(fine_contribs_per_cm, cm2)
+                    fine_contribs_per_cm[cm2] = Tuple{Int, Ti}[]
+                end
+                push!(fine_contribs_per_cm[cm2], (fine_nbr_idx, nz_idx))
+            end
+            
+            # Update contributions (keep original logic for value computation)
             if abs(sum_C_k) > eps(real(Tv))
                 distribute = a_ik / sum_C_k
-                for (cm2, a_kj) in coarse_vals_k
+                for (cm2, (a_kj, _)) in coarse_vals_k
                     contributions[cm2] = get(contributions, cm2, zero(Tv)) + distribute * a_kj
                 end
-                for nz2 in nzrange(A, k)
-                    if cv[nz2] == i && sgn * real(nzv[nz2]) < 0
-                        d_i += distribute * nzv[nz2]
-                        break
-                    end
+                if a_ki_nz > 0
+                    d_i += distribute * nzv[a_ki_nz]
                 end
             else
                 d_i += a_ik
@@ -743,6 +818,10 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
             push!(entry_types_list, Ti(0))  # fallback = P=1
             push!(numer_idx_list, Ti(0))
             push!(denom_offsets_list, Ti(length(denom_entries_list) + 1))
+            # GPU kernel data: fallback has entry_type=0
+            push!(std_direct_numer_idx_list, Ti(0))
+            push!(std_fine_offsets_list, Ti(length(std_a_ik_list) + 1))
+            push!(std_d_base_offsets_list, Ti(length(std_d_base_entries_list) + 1))
         else
             # Add entries for all contributing coarse columns
             for (cm, val) in contributions
@@ -757,6 +836,34 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                     push!(denom_entries_list, diag_nz)
                 end
                 append!(denom_entries_list, weak_nz_indices)
+                
+                # ═══════════════════════════════════════════════════════════════
+                # Build GPU kernel data for this P entry (row i, coarse column cm)
+                # ═══════════════════════════════════════════════════════════════
+                
+                # Direct contribution (if any)
+                direct_idx = get(strong_coarse_nz, cm, Ti(0))
+                push!(std_direct_numer_idx_list, direct_idx)
+                
+                # Fine neighbor contributions to this coarse column
+                fine_contribs = get(fine_contribs_per_cm, cm, Tuple{Int, Ti}[])
+                push!(std_fine_offsets_list, Ti(length(std_a_ik_list) + 1))
+                for (fnbr_idx, a_kJ_idx) in fine_contribs
+                    (_, nz_ik, diag_k_nz, a_ki_nz, sum_C_k_indices) = fine_nbr_info[fnbr_idx]
+                    push!(std_a_ik_list, nz_ik)
+                    push!(std_a_kJ_list, a_kJ_idx)
+                    push!(std_diag_k_list, diag_k_nz)
+                    push!(std_a_ki_list, a_ki_nz)
+                    push!(std_sum_offsets_list, Ti(length(std_sum_indices_list) + 1))
+                    append!(std_sum_indices_list, sum_C_k_indices)
+                end
+                
+                # Base d_i indices (diagonal + weak)
+                push!(std_d_base_offsets_list, Ti(length(std_d_base_entries_list) + 1))
+                if diag_nz > 0
+                    push!(std_d_base_entries_list, diag_nz)
+                end
+                append!(std_d_base_entries_list, weak_nz_indices)
             end
         end
     end
@@ -777,6 +884,18 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
     denom_entries = Vector{Ti}(denom_entries_list)
     strong_nbrs_cols = Vector{Ti}(strong_nbrs_cols_list)
     strong_nbrs_nz = Vector{Ti}(strong_nbrs_nz_list)
+    
+    # Build GPU kernel data arrays
+    std_direct_numer_idx = Vector{Ti}(std_direct_numer_idx_list)
+    std_fine_offsets = Vector{Ti}(std_fine_offsets_list)
+    std_a_ik = Vector{Ti}(std_a_ik_list)
+    std_a_kJ = Vector{Ti}(std_a_kJ_list)
+    std_diag_k = Vector{Ti}(std_diag_k_list)
+    std_a_ki = Vector{Ti}(std_a_ki_list)
+    std_sum_offsets = Vector{Ti}(std_sum_offsets_list)
+    std_sum_indices = Vector{Ti}(std_sum_indices_list)
+    std_d_base_offsets = Vector{Ti}(std_d_base_offsets_list)
+    std_d_base_entries = Vector{Ti}(std_d_base_entries_list)
     
     # Allocate workspace for Standard interpolation update
     max_strong = 0
@@ -806,7 +925,20 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
         strong_nbrs_nz,
         fill(-1, n_fine),         # P_marker
         Vector{Int}(undef, max_strong + 1),  # chat_indices buffer
-        Vector{Tv}(undef, max_strong + 1)    # P_data buffer
+        Vector{Tv}(undef, max_strong + 1),   # P_data buffer
+        # GPU kernel data for Standard (10 fields)
+        std_direct_numer_idx,
+        std_fine_offsets,
+        std_a_ik,
+        std_a_kJ,
+        std_diag_k,
+        std_a_ki,
+        std_sum_offsets,
+        std_sum_indices,
+        std_d_base_offsets,
+        std_d_base_entries,
+        # GPU kernel data for Extended+i (13 fields, empty for Standard)
+        Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[]
     )
     
     # ══════════════════════════════════════════════════════════════════════════
@@ -1220,7 +1352,11 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
             strong_nbrs_nz,
             fill(-1, n_fine),              # P_marker
             Vector{Int}(undef, max_chat),  # chat_indices buffer
-            Vector{Tv}(undef, max_chat)    # P_data buffer
+            Vector{Tv}(undef, max_chat),   # P_data buffer
+            # GPU kernel data for Standard (10 fields, empty for Extended+i)
+            Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[],
+            # GPU kernel data for Extended+i (13 fields, TODO: fill in when implementing GPU kernel)
+            Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[]
         )
         
         # ══════════════════════════════════════════════════════════════════════
@@ -1592,13 +1728,179 @@ end
 end
 
 """
-    _update_P_standard!(P, A, P_update_map)
+Standard interpolation GPU kernel.
 
-CPU-based Standard interpolation P value update.
-Uses stored graph structure to recompute interpolation weights.
+For each P entry k, computes:
+  P[k] = -(direct_contrib + Σ indirect_contribs) / d_i
+
+where:
+- direct_contrib = A[std_direct_numer_idx[k]] (if non-zero)
+- indirect_contrib = A[a_ik] * A[a_kJ] / sum_C_k
+- d_i = Σ A[d_base_entries] + Σ (A[a_ik] * A[a_ki] / sum_C_k, if a_ki contributes)
+"""
+@kernel function _p_standard_update_kernel!(P_nzval, @Const(A_nzval), @Const(entry_type),
+                                             @Const(std_direct_numer_idx), @Const(std_fine_offsets),
+                                             @Const(std_a_ik), @Const(std_a_kJ), @Const(std_diag_k),
+                                             @Const(std_a_ki), @Const(std_sum_offsets), @Const(std_sum_indices),
+                                             @Const(std_d_base_offsets), @Const(std_d_base_entries))
+    k = @index(Global)
+    @inbounds begin
+        if entry_type[k] == 0
+            # Coarse point or fallback: P value = 1
+            P_nzval[k] = one(eltype(P_nzval))
+        else
+            # Compute numerator (direct + indirect contributions)
+            numerator = zero(eltype(A_nzval))
+            
+            # Direct contribution
+            direct_idx = std_direct_numer_idx[k]
+            if direct_idx > 0
+                numerator += A_nzval[direct_idx]
+            end
+            
+            # Compute base denominator (diagonal + weak)
+            d_i = zero(eltype(A_nzval))
+            for j in std_d_base_offsets[k]:(std_d_base_offsets[k+1]-1)
+                d_i += A_nzval[std_d_base_entries[j]]
+            end
+            
+            # Indirect contributions from fine neighbors
+            for fnbr_idx in std_fine_offsets[k]:(std_fine_offsets[k+1]-1)
+                # Get a_{i,k} value
+                a_ik_idx = std_a_ik[fnbr_idx]
+                a_ik_val = A_nzval[a_ik_idx]
+                
+                # Get diagonal of fine neighbor (for sign determination)
+                diag_k_idx = std_diag_k[fnbr_idx]
+                diag_k_val = diag_k_idx > 0 ? A_nzval[diag_k_idx] : zero(eltype(A_nzval))
+                
+                # Compute sum_C_k
+                sum_C_k = zero(eltype(A_nzval))
+                for j in std_sum_offsets[fnbr_idx]:(std_sum_offsets[fnbr_idx+1]-1)
+                    sum_C_k += A_nzval[std_sum_indices[j]]
+                end
+                
+                if abs(sum_C_k) > eps(real(eltype(A_nzval)))
+                    distribute = a_ik_val / sum_C_k
+                    
+                    # Indirect contribution to numerator
+                    a_kJ_idx = std_a_kJ[fnbr_idx]
+                    if a_kJ_idx > 0
+                        numerator += distribute * A_nzval[a_kJ_idx]
+                    end
+                    
+                    # Contribution to d_i from a_{k,i}
+                    a_ki_idx = std_a_ki[fnbr_idx]
+                    if a_ki_idx > 0
+                        d_i += distribute * A_nzval[a_ki_idx]
+                    end
+                else
+                    # If sum_C_k is too small, add a_{i,k} to d_i
+                    d_i += a_ik_val
+                end
+            end
+            
+            # Final P value
+            abs_d_i = abs(d_i)
+            threshold = eps(real(eltype(A_nzval))) * max(one(real(eltype(A_nzval))), abs_d_i)
+            if abs_d_i > threshold
+                P_nzval[k] = -numerator / d_i
+            else
+                P_nzval[k] = zero(eltype(P_nzval))
+            end
+        end
+    end
+end
+
+"""
+Compute Standard interpolation P values using GPU kernel.
+"""
+function _standard_interp_compute_values!(P_nzval::AbstractVector{Tv}, A_nzval::AbstractVector{Tv},
+                                          P_update_map::ProlongationUpdateMap{Ti, Tv2};
+                                          backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti, Tv2}
+    nnz_P = length(P_nzval)
+    nnz_P == 0 && return P_nzval
+    
+    # Get GPU kernel data
+    entry_type = P_update_map.entry_type
+    std_direct_numer_idx = P_update_map.std_direct_numer_idx
+    std_fine_offsets = P_update_map.std_fine_offsets
+    std_a_ik = P_update_map.std_a_ik
+    std_a_kJ = P_update_map.std_a_kJ
+    std_diag_k = P_update_map.std_diag_k
+    std_a_ki = P_update_map.std_a_ki
+    std_sum_offsets = P_update_map.std_sum_offsets
+    std_sum_indices = P_update_map.std_sum_indices
+    std_d_base_offsets = P_update_map.std_d_base_offsets
+    std_d_base_entries = P_update_map.std_d_base_entries
+    
+    # Check if GPU kernel data is available
+    if isempty(std_direct_numer_idx)
+        # Fall back to CPU implementation
+        return nothing
+    end
+    
+    P_on_gpu = !(P_nzval isa Array)
+    A_on_gpu = !(A_nzval isa Array)
+    
+    if P_on_gpu
+        # P is on GPU: convert update map arrays to GPU and use GPU kernel
+        be = _get_backend(P_nzval)
+        # Convert A values to GPU if needed
+        A_nzval_gpu = A_on_gpu ? A_nzval : begin
+            tmp = similar(P_nzval, eltype(A_nzval), length(A_nzval))
+            copyto!(tmp, A_nzval)
+            tmp
+        end
+        # Convert update map arrays to GPU
+        _to_gpu(arr) = begin
+            tmp = similar(P_nzval, eltype(arr), length(arr))
+            copyto!(tmp, arr)
+            tmp
+        end
+        
+        kernel! = _p_standard_update_kernel!(be, block_size)
+        kernel!(P_nzval, A_nzval_gpu, _to_gpu(entry_type),
+                _to_gpu(std_direct_numer_idx), _to_gpu(std_fine_offsets),
+                _to_gpu(std_a_ik), _to_gpu(std_a_kJ), _to_gpu(std_diag_k),
+                _to_gpu(std_a_ki), _to_gpu(std_sum_offsets), _to_gpu(std_sum_indices),
+                _to_gpu(std_d_base_offsets), _to_gpu(std_d_base_entries); ndrange=nnz_P)
+        _synchronize(be)
+    else
+        # P is on CPU: use CPU kernel
+        be = _get_backend(P_nzval)
+        A_nzval_cpu = A_on_gpu ? Array(A_nzval) : A_nzval
+        kernel! = _p_standard_update_kernel!(be, block_size)
+        kernel!(P_nzval, A_nzval_cpu, entry_type,
+                std_direct_numer_idx, std_fine_offsets,
+                std_a_ik, std_a_kJ, std_diag_k,
+                std_a_ki, std_sum_offsets, std_sum_indices,
+                std_d_base_offsets, std_d_base_entries; ndrange=nnz_P)
+        _synchronize(be)
+    end
+    
+    return P_nzval
+end
+
+"""
+    _update_P_standard!(P, A, P_update_map; backend, block_size)
+
+Standard interpolation P value update.
+Uses GPU kernel when available, falls back to CPU implementation.
 """
 function _update_P_standard!(P::ProlongationOp{Ti, Tv}, A::CSRMatrix{Tv, Ti},
-                             P_update_map::ProlongationUpdateMap{Ti, Tv2}) where {Tv, Ti, Tv2}
+                             P_update_map::ProlongationUpdateMap{Ti, Tv2};
+                             backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti, Tv2}
+    # Try GPU kernel first if data is available
+    if !isempty(P_update_map.std_direct_numer_idx)
+        result = _standard_interp_compute_values!(P.nzval, nonzeros(A), P_update_map;
+                                                   backend=backend, block_size=block_size)
+        if result !== nothing
+            return P
+        end
+    end
+    
+    # Fall back to CPU implementation
     A_cpu = csr_to_cpu(A)
     P_nzval = P.nzval isa Array ? P.nzval : Array(P.nzval)
     P_rowptr = P.rowptr isa Array ? P.rowptr : Array(P.rowptr)

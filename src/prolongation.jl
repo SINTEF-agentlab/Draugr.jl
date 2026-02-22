@@ -496,13 +496,41 @@ function _direct_interp_compute_values!(P_nzval::AbstractVector{Tv}, A_nzval::Ab
                                         entry_type::AbstractVector{Ti}, numer_idx::AbstractVector{Ti},
                                         denom_offsets::AbstractVector{Ti}, denom_entries::AbstractVector{Ti};
                                         backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
-    be = _get_backend(P_nzval)
     nnz_P = length(P_nzval)
     nnz_P == 0 && return P_nzval
     
-    kernel! = _p_direct_update_kernel!(be, block_size)
-    kernel!(P_nzval, A_nzval, entry_type, numer_idx, denom_offsets, denom_entries; ndrange=nnz_P)
-    _synchronize(be)
+    # Determine if we're doing GPU computation (P.nzval on GPU)
+    P_on_gpu = !(P_nzval isa Array)
+    A_on_gpu = !(A_nzval isa Array)
+    
+    if P_on_gpu
+        # P is on GPU: convert update map arrays to GPU and use GPU kernel
+        be = _get_backend(P_nzval)
+        A_nzval_gpu = A_on_gpu ? A_nzval : similar(P_nzval, eltype(A_nzval), length(A_nzval))
+        if !A_on_gpu
+            copyto!(A_nzval_gpu, A_nzval)
+        end
+        entry_type_gpu = similar(P_nzval, Ti, length(entry_type))
+        numer_idx_gpu = similar(P_nzval, Ti, length(numer_idx))
+        denom_offsets_gpu = similar(P_nzval, Ti, length(denom_offsets))
+        denom_entries_gpu = similar(P_nzval, Ti, length(denom_entries))
+        copyto!(entry_type_gpu, entry_type)
+        copyto!(numer_idx_gpu, numer_idx)
+        copyto!(denom_offsets_gpu, denom_offsets)
+        copyto!(denom_entries_gpu, denom_entries)
+        
+        kernel! = _p_direct_update_kernel!(be, block_size)
+        kernel!(P_nzval, A_nzval_gpu, entry_type_gpu, numer_idx_gpu, denom_offsets_gpu, denom_entries_gpu; ndrange=nnz_P)
+        _synchronize(be)
+    else
+        # P is on CPU: use CPU computation
+        # If A is on GPU, convert to CPU
+        A_nzval_cpu = A_on_gpu ? Array(A_nzval) : A_nzval
+        be = _get_backend(P_nzval)
+        kernel! = _p_direct_update_kernel!(be, block_size)
+        kernel!(P_nzval, A_nzval_cpu, entry_type, numer_idx, denom_offsets, denom_entries; ndrange=nnz_P)
+        _synchronize(be)
+    end
     
     return P_nzval
 end
@@ -1514,18 +1542,17 @@ For each P entry k:
 function _update_P_direct_kernel!(P::ProlongationOp, A::CSRMatrix{Tv, Ti},
                                   P_update_map::ProlongationUpdateMap;
                                   backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
-    be = _get_backend(P.nzval)
     A_nzval = nonzeros(A)
     P_nzval = P.nzval
     entry_type = P_update_map.entry_type
     numer_idx = P_update_map.numer_idx
     denom_offsets = P_update_map.denom_offsets
     denom_entries = P_update_map.denom_entries
-    nnz_P = length(P_nzval)
     
-    kernel! = _p_direct_update_kernel!(be, block_size)
-    kernel!(P_nzval, A_nzval, entry_type, numer_idx, denom_offsets, denom_entries; ndrange=nnz_P)
-    _synchronize(be)
+    # Use the same function that handles GPU/CPU mixing
+    _direct_interp_compute_values!(P_nzval, A_nzval, entry_type, numer_idx, 
+                                   denom_offsets, denom_entries;
+                                   backend=backend, block_size=block_size)
     
     return P
 end

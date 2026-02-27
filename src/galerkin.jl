@@ -37,7 +37,8 @@ function compute_coarse_sparsity(A_fine::CSRMatrix{Tv, Ti},
                                  n_coarse::Int;
                                  build_restriction_map::Bool=true,
                                  workspace::Union{Nothing, GalerkinWorkspace{Tv, Ti}}=nothing,
-                                 old_A_coarse::Union{Nothing, CSRMatrix}=nothing) where {Tv, Ti}
+                                 old_A_coarse::Union{Nothing, CSRMatrix}=nothing,
+                                 old_r_map::Union{Nothing, RestrictionMap}=nothing) where {Tv, Ti}
     n_fine = size(A_fine, 1)
     cv_a = colvals(A_fine)
     nzv_a = nonzeros(A_fine)
@@ -169,7 +170,12 @@ function compute_coarse_sparsity(A_fine::CSRMatrix{Tv, Ti},
 
     # Phase 3: Build RestrictionMap by filling triple arrays.
     # Build offset array from nz_counts.
-    nz_offsets = Vector{Ti}(undef, Int(nnz_c) + 1)
+    if old_r_map !== nothing && old_r_map.nz_offsets isa Vector
+        nz_offsets = old_r_map.nz_offsets
+        resize!(nz_offsets, Int(nnz_c) + 1)
+    else
+        nz_offsets = Vector{Ti}(undef, Int(nnz_c) + 1)
+    end
     cumsum_val = one(Ti)
     for k in 1:Int(nnz_c)
         nz_offsets[k] = cumsum_val
@@ -178,10 +184,19 @@ function compute_coarse_sparsity(A_fine::CSRMatrix{Tv, Ti},
     nz_offsets[Int(nnz_c) + 1] = cumsum_val
     ntriples = Int(cumsum_val) - 1
 
-    # Allocate triple arrays
-    map_pi = Vector{Ti}(undef, ntriples)
-    map_ai = Vector{Ti}(undef, ntriples)
-    map_pj = Vector{Ti}(undef, ntriples)
+    # Allocate/reuse triple arrays
+    if old_r_map !== nothing && old_r_map.triple_pi_idx isa Vector
+        map_pi = old_r_map.triple_pi_idx
+        map_ai = old_r_map.triple_anz_idx
+        map_pj = old_r_map.triple_pj_idx
+        resize!(map_pi, ntriples)
+        resize!(map_ai, ntriples)
+        resize!(map_pj, ntriples)
+    else
+        map_pi = Vector{Ti}(undef, ntriples)
+        map_ai = Vector{Ti}(undef, ntriples)
+        map_pj = Vector{Ti}(undef, ntriples)
+    end
 
     # Fill position counters (reuse nz_counts or workspace)
     if workspace !== nothing

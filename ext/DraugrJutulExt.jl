@@ -132,6 +132,42 @@ function Draugr.smooth!(x::AbstractVector, A::StaticSparsityMatrixCSR, b::Abstra
     return Draugr.smooth!(x, A_csr, b, smoother; steps=steps, backend=backend, block_size=block_size)
 end
 
+# ── Shared helpers ────────────────────────────────────────────────────────────
+
+"""
+    _smart_amg_resetup!(hierarchy, A, config)
+
+Select the most efficient in-place resetup strategy based on what data is
+available in the hierarchy:
+
+1. `partial=true, update_P=true`  — when the first level has a `P_update_map`
+   (CF-splitting coarsening with `allow_partial_resetup=true`). Recomputes
+   interpolation weights from the new matrix values before updating the Galerkin
+   products, giving the best quality with minimal cost.
+
+2. `partial=true, update_P=false` — when only a `R_map` (restriction map) is
+   available. Updates smoother weights and Galerkin products without recomputing
+   the prolongation.
+
+3. `partial=false` — full hierarchy rebuild when neither map is available.
+"""
+function _smart_amg_resetup!(hierarchy::AMGHierarchy, A, config::AMGConfig)
+    if isempty(hierarchy.levels)
+        # Trivial / coarsest-only hierarchy: just update the direct solver
+        Draugr.amg_resetup!(hierarchy, A, config; partial=true)
+        return hierarchy
+    end
+    lvl1 = hierarchy.levels[1]
+    if lvl1.P_update_map !== nothing && lvl1.R_map !== nothing
+        Draugr.amg_resetup!(hierarchy, A, config; partial=true, update_P=true)
+    elseif lvl1.R_map !== nothing
+        Draugr.amg_resetup!(hierarchy, A, config; partial=true, update_P=false)
+    else
+        Draugr.amg_resetup!(hierarchy, A, config; partial=false)
+    end
+    return hierarchy
+end
+
 # ── Jutul Preconditioner ─────────────────────────────────────────────────────
 
 """
@@ -139,6 +175,12 @@ end
 
 AMG preconditioner implementing the Jutul preconditioner interface.
 Can be used as a preconditioner in Jutul's linear solvers.
+
+On first call, performs a full AMG setup. On subsequent calls, uses the smartest
+available in-place resetup strategy:
+- `partial=true, update_P=true` when a `P_update_map` is present (best quality).
+- `partial=true` when only a restriction map is present.
+- `partial=false` (full rebuild) otherwise.
 """
 mutable struct DraugrPreconditionerJutul <: Jutul.JutulPreconditioner
     config::AMGConfig
@@ -156,7 +198,7 @@ function Jutul.update_preconditioner!(prec::DraugrPreconditionerJutul,
     if isnothing(prec.hierarchy)
         prec.hierarchy = Draugr.amg_setup(A, prec.config)
     else
-        Draugr.amg_resetup!(prec.hierarchy, A, prec.config)
+        _smart_amg_resetup!(prec.hierarchy, A, prec.config)
     end
     prec.dim = size(A)
     return prec
@@ -175,6 +217,67 @@ function Jutul.apply!(x, prec::DraugrPreconditionerJutul, y)
 end
 
 function Jutul.operator_nrows(prec::DraugrPreconditionerJutul)
+    if isnothing(prec.dim)
+        return 0
+    end
+    return prec.dim[1]
+end
+
+# ── Jutul Partial Update Preconditioner ──────────────────────────────────────
+
+"""
+    DraugrPreconditionerJutulPartial <: Jutul.JutulPreconditioner
+
+Variant of `DraugrPreconditionerJutul` designed for repeated solves where the
+matrix sparsity pattern is fixed but values change (e.g. nonlinear simulations).
+
+On first call, performs a full AMG setup with `allow_partial_resetup=true` so that
+restriction maps (and, for CF-splitting coarsening, prolongation update maps) are
+precomputed.  On subsequent calls, the cheapest available resetup is used:
+
+- `update_P=true`  when the prolongation update map is available — recomputes
+  interpolation weights without rebuilding the coarsening.
+- `partial=true`   when only restriction maps are available — recomputes
+  smoother and Galerkin products but keeps the prolongation fixed.
+- `partial=false`  (full rebuild) when no maps are available.
+
+Create via `DraugrPreconditioner(solver=:jutul_partial; kwargs...)`.
+"""
+mutable struct DraugrPreconditionerJutulPartial <: Jutul.JutulPreconditioner
+    config::AMGConfig
+    hierarchy::Union{Nothing, AMGHierarchy}
+    dim::Union{Nothing, Tuple{Int,Int}}
+end
+
+function Draugr.setup_specific_preconditioner(::Val{:jutul_partial}; kwargs...)
+    config = AMGConfig(; kwargs...)
+    return DraugrPreconditionerJutulPartial(config, nothing, nothing)
+end
+
+function Jutul.update_preconditioner!(prec::DraugrPreconditionerJutulPartial,
+                                      A::StaticSparsityMatrixCSR, b, context, executor)
+    if isnothing(prec.hierarchy)
+        prec.hierarchy = Draugr.amg_setup(A, prec.config)
+    else
+        _smart_amg_resetup!(prec.hierarchy, A, prec.config)
+    end
+    prec.dim = size(A)
+    return prec
+end
+
+function Jutul.update_preconditioner!(prec::DraugrPreconditionerJutulPartial,
+                                      A, b, context, executor)
+    A_csr = Draugr.static_csr_from_csc(A)
+    return Jutul.update_preconditioner!(prec, A_csr, b, context, executor)
+end
+
+function Jutul.apply!(x, prec::DraugrPreconditionerJutulPartial, y)
+    fill!(x, zero(eltype(x)))
+    Draugr.amg_cycle!(x, y, prec.hierarchy, prec.config)
+    return x
+end
+
+function Jutul.operator_nrows(prec::DraugrPreconditionerJutulPartial)
     if isnothing(prec.dim)
         return 0
     end

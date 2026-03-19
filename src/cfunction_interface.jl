@@ -369,8 +369,8 @@ end
     draugr_amg_resetup(handle, n, nnz, rowptr, colval, nzval, config_handle,
                        index_base, partial, allow_partial_resetup) -> Int32
 
-Update the AMG hierarchy with new matrix data. Thin wrapper around
-`amg_resetup!(hierarchy, A, config; partial, allow_partial_resetup)`.
+Update the AMG hierarchy with new matrix data. Calls `amg_resetup!` with the
+provided config, overriding `allow_partial_resetup` from the C-level argument.
 
 When `partial=1`, only matrix values, Galerkin products, smoothers and the
 coarse solver are recomputed — the coarsening structure is kept.  This is

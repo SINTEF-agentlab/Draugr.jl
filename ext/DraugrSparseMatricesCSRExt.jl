@@ -49,15 +49,13 @@ AMG setup accepting a `SparseMatrixCSR` from SparseMatricesCSR.jl.
 Converts to the internal `CSRMatrix` format and forwards to the standard setup.
 """
 function Draugr.amg_setup(A::SparseMatrixCSR{Bi, Tv, Ti}, config::AMGConfig=AMGConfig();
-                               backend=Draugr.DEFAULT_BACKEND, block_size::Int=64,
-                               allow_partial_resetup::Bool=true) where {Bi, Tv, Ti}
+                               backend=Draugr.DEFAULT_BACKEND, block_size::Int=64) where {Bi, Tv, Ti}
     A_csr = csr_from_sparse_csr(A)
-    return Draugr.amg_setup(A_csr, config; backend=backend, block_size=block_size,
-                            allow_partial_resetup=allow_partial_resetup)
+    return Draugr.amg_setup(A_csr, config; backend=backend, block_size=block_size)
 end
 
 """
-    amg_resetup!(hierarchy, A_new::SparseMatrixCSR, config)
+    amg_resetup!(hierarchy, A_new::SparseMatrixCSR, config; partial=true, update_P=false)
 
 AMG resetup accepting a `SparseMatrixCSR` from SparseMatricesCSR.jl.
 Converts to the internal `CSRMatrix` and forwards to the main resetup.
@@ -66,10 +64,9 @@ function Draugr.amg_resetup!(hierarchy::AMGHierarchy{Tv, Ti},
                                   A_new::SparseMatrixCSR{Bi, Tv, Ti},
                                   config::AMGConfig=AMGConfig();
                                   partial::Bool=true,
-                                  allow_partial_resetup::Bool=true) where {Bi, Tv, Ti}
+                                  update_P::Bool=false) where {Bi, Tv, Ti}
     A_csr = csr_from_sparse_csr(A_new)
-    return Draugr.amg_resetup!(hierarchy, A_csr, config; partial=partial,
-                               allow_partial_resetup=allow_partial_resetup)
+    return Draugr.amg_resetup!(hierarchy, A_csr, config; partial=partial, update_P=update_P)
 end
 
 # ── Smoother wrappers for SparseMatrixCSR ────────────────────────────────────

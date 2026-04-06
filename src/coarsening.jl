@@ -1,3 +1,55 @@
+# ── Bucket sort helpers (standalone functions to avoid closure boxing) ─────────
+
+"""Remove node `i` from its bucket in the linked-list bucket structure."""
+@inline function _bucket_remove_node!(i::Int, λ::Vector{Int},
+                                      bucket_head::Vector{Int},
+                                      bucket_next::Vector{Int},
+                                      bucket_prev::Vector{Int})
+    @inbounds begin
+        k = λ[i] + 1
+        p = bucket_prev[i]
+        nx = bucket_next[i]
+        if p != 0
+            bucket_next[p] = nx
+        else
+            bucket_head[k] = nx
+        end
+        if nx != 0
+            bucket_prev[nx] = p
+        end
+        bucket_next[i] = 0
+        bucket_prev[i] = 0
+    end
+    return nothing
+end
+
+"""Remove node `i` from its old bucket and insert into bucket for `new_λ`."""
+@inline function _bucket_update_node!(i::Int, new_λ::Int, λ::Vector{Int},
+                                      bucket_head::Vector{Int},
+                                      bucket_next::Vector{Int},
+                                      bucket_prev::Vector{Int})
+    @inbounds begin
+        _bucket_remove_node!(i, λ, bucket_head, bucket_next, bucket_prev)
+        λ[i] = new_λ
+        k = new_λ + 1
+        old_len = length(bucket_head)
+        if k > old_len
+            resize!(bucket_head, k)
+            for idx in (old_len + 1):k
+                bucket_head[idx] = 0
+            end
+        end
+        old_head = bucket_head[k]
+        bucket_head[k] = i
+        bucket_next[i] = old_head
+        bucket_prev[i] = 0
+        if old_head != 0
+            bucket_prev[old_head] = i
+        end
+    end
+    return nothing
+end
+
 # ── Aggregation coarsening ────────────────────────────────────────────────────
 
 """
@@ -176,10 +228,16 @@ Compute for each node i the number of nodes j that strongly depend on i,
 i.e., the number of strong connections in the TRANSPOSE graph. This is the
 column-based measure used by hypre for better PMIS coarsening.
 """
-function _compute_strong_transpose_count(A::CSRMatrix{Tv, Ti}, is_strong::AbstractVector{Bool}) where {Tv, Ti}
+function _compute_strong_transpose_count(A::CSRMatrix{Tv, Ti}, is_strong::AbstractVector{Bool};
+                                         setup_workspace=nothing) where {Tv, Ti}
     n = size(A, 1)
     cv = colvals(A)
-    st_count = zeros(Int, n)
+    if setup_workspace !== nothing
+        st_count = _ws_resize!(setup_workspace.st_count, n)
+        fill!(st_count, 0)
+    else
+        st_count = zeros(Int, n)
+    end
     @inbounds for i in 1:n
         for nz in nzrange(A, i)
             j = cv[nz]
@@ -201,24 +259,35 @@ for fine points, `coarse_map::Vector{Int}`, and `n_coarse`.
 """
 function coarsen_pmis(A_in::CSRMatrix{Tv, Ti}, θ::Real;
                       rng=Random.default_rng(),
-                      backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
+                      backend=DEFAULT_BACKEND, block_size::Int=64,
+                      setup_workspace=nothing) where {Tv, Ti}
     n = size(A_in, 1)
     if n <= 1
         return ones(Int, n), collect(1:n), n
     end
     # Compute strength on GPU if available, then convert to CPU for graph algorithms
-    is_strong_raw = strength_graph(A_in, θ; backend=backend, block_size=block_size)
+    is_strong_raw = strength_graph(A_in, θ; backend=backend, block_size=block_size,
+        is_strong=setup_workspace !== nothing ? setup_workspace.is_strong : nothing)
     is_strong = is_strong_raw isa Array ? is_strong_raw : Array(is_strong_raw)
     A = csr_to_cpu(A_in)
     cv = colvals(A)
     # Use column-based measure: how many nodes strongly depend on i
-    st_count = _compute_strong_transpose_count(A, is_strong)
-    measure = zeros(Float64, n)
+    st_count = _compute_strong_transpose_count(A, is_strong; setup_workspace=setup_workspace)
+    if setup_workspace !== nothing
+        measure = _ws_resize!(setup_workspace.measure, n)
+    else
+        measure = zeros(Float64, n)
+    end
     @inbounds for i in 1:n
         measure[i] = Float64(st_count[i]) + rand(rng)
     end
     # Mark isolated nodes (no strong connections at all) immediately as coarse
-    cf = zeros(Int, n)
+    if setup_workspace !== nothing
+        cf = _ws_resize!(setup_workspace.cf, n)
+        fill!(cf, 0)
+    else
+        cf = zeros(Int, n)
+    end
     @inbounds for i in 1:n
         has_strong = false
         for nz in nzrange(A, i)
@@ -272,7 +341,12 @@ function coarsen_pmis(A_in::CSRMatrix{Tv, Ti}, θ::Real;
     end
     # Build coarse map
     n_coarse = 0
-    coarse_map = zeros(Int, n)
+    if setup_workspace !== nothing
+        coarse_map = _ws_resize!(setup_workspace.coarse_map, n)
+        fill!(coarse_map, 0)
+    else
+        coarse_map = zeros(Int, n)
+    end
     @inbounds for i in 1:n
         if cf[i] == 1
             n_coarse += 1
@@ -329,33 +403,29 @@ with f_pnt=Z_PT) followed by `hypre_BoomerAMGCoarsenPMIS(S, A, 1, ...)`.
 """
 function coarsen_hmis(A_in::CSRMatrix{Tv, Ti}, θ::Real;
                       rng=Random.default_rng(),
-                      backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
+                      backend=DEFAULT_BACKEND, block_size::Int=64,
+                      setup_workspace=nothing) where {Tv, Ti}
     n = size(A_in, 1)
     if n <= 1
         return ones(Int, n), collect(1:n), n
     end
     # Compute strength on GPU if available, then convert to CPU for graph algorithms
-    is_strong_raw = strength_graph(A_in, θ; backend=backend, block_size=block_size)
+    is_strong_raw = strength_graph(A_in, θ; backend=backend, block_size=block_size,
+        is_strong=setup_workspace !== nothing ? setup_workspace.is_strong : nothing)
     is_strong = is_strong_raw isa Array ? is_strong_raw : Array(is_strong_raw)
     A = csr_to_cpu(A_in)
     cv = colvals(A)
 
     # ── Phase 1: RS first pass (greedy bucket-based coarsening) ──
-    # This matches hypre's CoarsenRuge with coarsen_type=10 (first pass only).
-    # In hypre, coarsen_type=10 sets f_pnt=Z_PT=-2 and uses coarsen_type=11
-    # (returns after first pass, no second pass).
-    # Zero-measure nodes during initialization get Z_PT=-2 (tentative fine).
-    # Nodes marked fine in the main RS loop get F_PT=-1 (permanent fine).
-    # C-points are permanent.
-    cf = _rs_first_pass!(A, is_strong; use_zpt=true)
+    cf = _rs_first_pass!(A, is_strong; use_zpt=true, setup_workspace=setup_workspace)
 
     # ── Phase 2: PMIS on remaining undecided points ──
-    # This matches hypre's CF_init=1 path in CoarsenPMIS.
-    # C-points (1) from RS stay as C. F-points (-1) from RS stay as F.
-    # Z_PT (-2) points get re-evaluated: those with measure >= 1 or strong
-    # connections become undecided (0) for PMIS; others become F.
-    st_count_pmis = _compute_strong_transpose_count(A, is_strong)
-    pmis_measure = zeros(Float64, n)
+    st_count_pmis = _compute_strong_transpose_count(A, is_strong; setup_workspace=setup_workspace)
+    if setup_workspace !== nothing
+        pmis_measure = _ws_resize!(setup_workspace.measure, n)
+    else
+        pmis_measure = zeros(Float64, n)
+    end
     @inbounds for i in 1:n
         pmis_measure[i] = Float64(st_count_pmis[i]) + rand(rng)
     end
@@ -383,7 +453,12 @@ function coarsen_hmis(A_in::CSRMatrix{Tv, Ti}, θ::Real;
     _pmis_on_undecided!(cf, A, is_strong, pmis_measure)
 
     n_coarse = 0
-    coarse_map = zeros(Int, n)
+    if setup_workspace !== nothing
+        coarse_map = _ws_resize!(setup_workspace.coarse_map, n)
+        fill!(coarse_map, 0)
+    else
+        coarse_map = zeros(Int, n)
+    end
     @inbounds for i in 1:n
         if cf[i] == 1
             n_coarse += 1
@@ -404,15 +479,21 @@ Nodes marked fine in the main RS greedy loop are always marked as F_PT=-1.
 Returns the cf array with states: 0=undecided (shouldn't remain), 1=C, -1=F, -2=Z_PT.
 """
 function _rs_first_pass!(A::CSRMatrix{Tv, Ti}, is_strong::AbstractVector{Bool};
-                          use_zpt::Bool=false) where {Tv, Ti}
+                          use_zpt::Bool=false,
+                          setup_workspace=nothing) where {Tv, Ti}
     n = size(A, 1)
     cv = colvals(A)
     f_pnt = use_zpt ? -2 : -1  # Z_PT or F_PT for zero-measure initialization
 
-    λ = _compute_strong_transpose_count(A, is_strong)
-    st_offsets, st_sources = _build_strong_transpose_adj(A, is_strong)
+    λ = _compute_strong_transpose_count(A, is_strong; setup_workspace=setup_workspace)
+    st_offsets, st_sources = _build_strong_transpose_adj(A, is_strong; setup_workspace=setup_workspace)
 
-    cf = zeros(Int, n)
+    if setup_workspace !== nothing
+        cf = _ws_resize!(setup_workspace.cf, n)
+        fill!(cf, 0)
+    else
+        cf = zeros(Int, n)
+    end
     # Mark isolated nodes (no strong connections at all)
     @inbounds for i in 1:n
         has_strong = false
@@ -452,9 +533,18 @@ function _rs_first_pass!(A::CSRMatrix{Tv, Ti}, is_strong::AbstractVector{Bool};
         cf[i] != 0 && continue
         max_λ_val = max(max_λ_val, λ[i])
     end
-    bucket_head = fill(0, max(max_λ_val + 1, 1))
-    bucket_next = zeros(Int, n)
-    bucket_prev = zeros(Int, n)
+    if setup_workspace !== nothing
+        bucket_head = _ws_resize!(setup_workspace.bucket_head, max(max_λ_val + 1, 1))
+        fill!(bucket_head, 0)
+        bucket_next = _ws_resize!(setup_workspace.bucket_next, n)
+        fill!(bucket_next, 0)
+        bucket_prev = _ws_resize!(setup_workspace.bucket_prev, n)
+        fill!(bucket_prev, 0)
+    else
+        bucket_head = fill(0, max(max_λ_val + 1, 1))
+        bucket_next = zeros(Int, n)
+        bucket_prev = zeros(Int, n)
+    end
     @inbounds for i in 1:n
         cf[i] != 0 && continue
         k = λ[i] + 1
@@ -468,45 +558,6 @@ function _rs_first_pass!(A::CSRMatrix{Tv, Ti}, is_strong::AbstractVector{Bool};
     end
     top_bucket = max_λ_val
 
-    @inline function _bkt_remove!(i)
-        @inbounds begin
-            k = λ[i] + 1
-            p = bucket_prev[i]
-            nx = bucket_next[i]
-            if p != 0
-                bucket_next[p] = nx
-            else
-                bucket_head[k] = nx
-            end
-            if nx != 0
-                bucket_prev[nx] = p
-            end
-            bucket_next[i] = 0
-            bucket_prev[i] = 0
-        end
-    end
-    @inline function _bkt_update!(i, new_λ)
-        @inbounds begin
-            _bkt_remove!(i)
-            λ[i] = new_λ
-            k = new_λ + 1
-            old_len = length(bucket_head)
-            if k > old_len
-                resize!(bucket_head, k)
-                for idx in (old_len + 1):k
-                    bucket_head[idx] = 0
-                end
-            end
-            old_head = bucket_head[k]
-            bucket_head[k] = i
-            bucket_next[i] = old_head
-            bucket_prev[i] = 0
-            if old_head != 0
-                bucket_prev[old_head] = i
-            end
-        end
-    end
-
     # Main RS first pass greedy loop
     while true
         while top_bucket >= 0 && bucket_head[top_bucket + 1] == 0
@@ -515,7 +566,7 @@ function _rs_first_pass!(A::CSRMatrix{Tv, Ti}, is_strong::AbstractVector{Bool};
         top_bucket < 0 && break
         best_i = bucket_head[top_bucket + 1]
         best_i == 0 && break
-        _bkt_remove!(best_i)
+        _bucket_remove_node!(best_i, λ, bucket_head, bucket_next, bucket_prev)
         cf[best_i] = 1  # C-point
 
         # For each undecided node j that strongly depends on best_i (S^T neighbors):
@@ -523,14 +574,14 @@ function _rs_first_pass!(A::CSRMatrix{Tv, Ti}, is_strong::AbstractVector{Bool};
         @inbounds for idx in st_offsets[best_i]:(st_offsets[best_i + 1] - 1)
             j = st_sources[idx]
             cf[j] != 0 && continue
-            _bkt_remove!(j)
+            _bucket_remove_node!(j, λ, bucket_head, bucket_next, bucket_prev)
             cf[j] = -1  # F-point (permanent)
             # Increment λ for undecided nodes that j strongly depends on
             for nz2 in nzrange(A, j)
                 k = cv[nz2]
                 if k != j && is_strong[nz2] && cf[k] == 0
                     new_val = λ[k] + 1
-                    _bkt_update!(k, new_val)
+                    _bucket_update_node!(k, new_val, λ, bucket_head, bucket_next, bucket_prev)
                     if new_val > top_bucket
                         top_bucket = new_val
                     end
@@ -542,17 +593,17 @@ function _rs_first_pass!(A::CSRMatrix{Tv, Ti}, is_strong::AbstractVector{Bool};
             j = cv[nz]
             if j != best_i && is_strong[nz] && cf[j] == 0
                 new_val = max(0, λ[j] - 1)
-                _bkt_update!(j, new_val)
+                _bucket_update_node!(j, new_val, λ, bucket_head, bucket_next, bucket_prev)
                 if new_val == 0
                     # Node has no more undecided dependents → mark with f_pnt
-                    _bkt_remove!(j)
+                    _bucket_remove_node!(j, λ, bucket_head, bucket_next, bucket_prev)
                     cf[j] = f_pnt  # Z_PT for HMIS, F_PT for RS
                     # Increment λ for its undecided strong neighbors
                     for nz2 in nzrange(A, j)
                         k = cv[nz2]
                         if k != j && is_strong[nz2] && cf[k] == 0
                             new_val2 = λ[k] + 1
-                            _bkt_update!(k, new_val2)
+                            _bucket_update_node!(k, new_val2, λ, bucket_head, bucket_next, bucket_prev)
                             if new_val2 > top_bucket
                                 top_bucket = new_val2
                             end
@@ -670,24 +721,29 @@ instead of the naive O(n²) greedy scan.
 """
 function coarsen_rs(A_in::CSRMatrix{Tv, Ti}, θ::Real;
                     rng=Random.default_rng(),
-                    backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
+                    backend=DEFAULT_BACKEND, block_size::Int=64,
+                    setup_workspace=nothing) where {Tv, Ti}
     n = size(A_in, 1)
     if n <= 1
         return ones(Int, n), collect(1:n), n
     end
     # Compute strength on GPU if available, then convert to CPU for graph algorithms
-    is_strong_raw = strength_graph(A_in, θ; backend=backend, block_size=block_size)
+    is_strong_raw = strength_graph(A_in, θ; backend=backend, block_size=block_size,
+        is_strong=setup_workspace !== nothing ? setup_workspace.is_strong : nothing)
     is_strong = is_strong_raw isa Array ? is_strong_raw : Array(is_strong_raw)
     A = csr_to_cpu(A_in)
     cv = colvals(A)
     # Compute λ_i = number of points that strongly depend on i (transpose measure)
-    λ = _compute_strong_transpose_count(A, is_strong)
-    # Precompute transpose adjacency: for each node j, which nodes i strongly
-    # depend on j (i.e., is_strong[nz] where cv[nz]==j in row i).
-    # This avoids the O(n) scan per greedy step.
-    st_offsets, st_sources = _build_strong_transpose_adj(A, is_strong)
+    λ = _compute_strong_transpose_count(A, is_strong; setup_workspace=setup_workspace)
+    # Precompute transpose adjacency
+    st_offsets, st_sources = _build_strong_transpose_adj(A, is_strong; setup_workspace=setup_workspace)
     # CF splitting
-    cf = zeros(Int, n)  # 0 = undecided, 1 = C, -1 = F
+    if setup_workspace !== nothing
+        cf = _ws_resize!(setup_workspace.cf, n)
+        fill!(cf, 0)
+    else
+        cf = zeros(Int, n)
+    end
     # Mark isolated nodes immediately
     @inbounds for i in 1:n
         has_strong = false
@@ -709,9 +765,18 @@ function coarsen_rs(A_in::CSRMatrix{Tv, Ti}, θ::Real;
     # Build bucket structure: bucket_head[k+1] = first node with λ==k
     # (shift by 1 so λ==0 maps to index 1)
     # Pre-allocate to n to avoid resizing during λ increments
-    bucket_head = fill(0, max(max_λ_val + 1, n))
-    bucket_next = zeros(Int, n)
-    bucket_prev = zeros(Int, n)
+    if setup_workspace !== nothing
+        bucket_head = _ws_resize!(setup_workspace.bucket_head, max(max_λ_val + 1, n))
+        fill!(bucket_head, 0)
+        bucket_next = _ws_resize!(setup_workspace.bucket_next, n)
+        fill!(bucket_next, 0)
+        bucket_prev = _ws_resize!(setup_workspace.bucket_prev, n)
+        fill!(bucket_prev, 0)
+    else
+        bucket_head = fill(0, max(max_λ_val + 1, n))
+        bucket_next = zeros(Int, n)
+        bucket_prev = zeros(Int, n)
+    end
     @inbounds for i in 1:n
         cf[i] != 0 && continue
         k = λ[i] + 1
@@ -724,46 +789,6 @@ function coarsen_rs(A_in::CSRMatrix{Tv, Ti}, θ::Real;
         end
     end
     top_bucket = max_λ_val
-    # Helper: remove node i from its bucket
-    @inline function _bucket_remove!(i)
-        @inbounds begin
-            k = λ[i] + 1
-            p = bucket_prev[i]
-            nx = bucket_next[i]
-            if p != 0
-                bucket_next[p] = nx
-            else
-                bucket_head[k] = nx
-            end
-            if nx != 0
-                bucket_prev[nx] = p
-            end
-            bucket_next[i] = 0
-            bucket_prev[i] = 0
-        end
-    end
-    # Helper: move node i to new bucket for updated λ value
-    @inline function _bucket_update!(i, new_λ)
-        @inbounds begin
-            _bucket_remove!(i)
-            λ[i] = new_λ
-            k = new_λ + 1
-            old_len = length(bucket_head)
-            if k > old_len
-                resize!(bucket_head, k)
-                for idx in (old_len + 1):k
-                    bucket_head[idx] = 0
-                end
-            end
-            old_head = bucket_head[k]
-            bucket_head[k] = i
-            bucket_next[i] = old_head
-            bucket_prev[i] = 0
-            if old_head != 0
-                bucket_prev[old_head] = i
-            end
-        end
-    end
     while true
         # Find highest non-empty bucket
         while top_bucket >= 0 && bucket_head[top_bucket + 1] == 0
@@ -773,13 +798,13 @@ function coarsen_rs(A_in::CSRMatrix{Tv, Ti}, θ::Real;
         best_i = bucket_head[top_bucket + 1]
         best_i == 0 && break
         # Remove best_i from bucket and make it coarse
-        _bucket_remove!(best_i)
+        _bucket_remove_node!(best_i, λ, bucket_head, bucket_next, bucket_prev)
         cf[best_i] = 1
         # For each undecided node j that strongly depends on best_i, make j fine
         @inbounds for idx in st_offsets[best_i]:(st_offsets[best_i + 1] - 1)
             j = st_sources[idx]
             cf[j] != 0 && continue
-            _bucket_remove!(j)
+            _bucket_remove_node!(j, λ, bucket_head, bucket_next, bucket_prev)
             cf[j] = -1  # j becomes fine
             # Increment λ for undecided nodes that j strongly depends on
             # (they gain influence because j is now F)
@@ -787,7 +812,7 @@ function coarsen_rs(A_in::CSRMatrix{Tv, Ti}, θ::Real;
                 k = cv[nz2]
                 if k != j && is_strong[nz2] && cf[k] == 0
                     new_val = λ[k] + 1
-                    _bucket_update!(k, new_val)
+                    _bucket_update_node!(k, new_val, λ, bucket_head, bucket_next, bucket_prev)
                     if new_val > top_bucket
                         top_bucket = new_val
                     end
@@ -799,7 +824,7 @@ function coarsen_rs(A_in::CSRMatrix{Tv, Ti}, θ::Real;
             j = cv[nz]
             if j != best_i && is_strong[nz] && cf[j] == 0
                 new_val = max(0, λ[j] - 1)
-                _bucket_update!(j, new_val)
+                _bucket_update_node!(j, new_val, λ, bucket_head, bucket_next, bucket_prev)
             end
         end
     end
@@ -807,7 +832,12 @@ function coarsen_rs(A_in::CSRMatrix{Tv, Ti}, θ::Real;
     _ensure_fine_have_coarse_neighbor!(cf, A, is_strong)
     # Build coarse map
     n_coarse = 0
-    coarse_map = zeros(Int, n)
+    if setup_workspace !== nothing
+        coarse_map = _ws_resize!(setup_workspace.coarse_map, n)
+        fill!(coarse_map, 0)
+    else
+        coarse_map = zeros(Int, n)
+    end
     @inbounds for i in 1:n
         if cf[i] == 1
             n_coarse += 1
@@ -824,11 +854,17 @@ Build the transpose adjacency list for strong connections. For each node j,
 `sources[offsets[j]:(offsets[j+1]-1)]` gives the list of nodes i such that
 row i has a strong connection to column j (i.e., i strongly depends on j).
 """
-function _build_strong_transpose_adj(A::CSRMatrix{Tv, Ti}, is_strong::AbstractVector{Bool}) where {Tv, Ti}
+function _build_strong_transpose_adj(A::CSRMatrix{Tv, Ti}, is_strong::AbstractVector{Bool};
+                                     setup_workspace=nothing) where {Tv, Ti}
     n = size(A, 1)
     cv = colvals(A)
     # Count: how many nodes strongly depend on each j
-    counts = zeros(Int, n)
+    if setup_workspace !== nothing
+        counts = _ws_resize!(setup_workspace.counts, n)
+        fill!(counts, 0)
+    else
+        counts = zeros(Int, n)
+    end
     @inbounds for i in 1:n
         for nz in nzrange(A, i)
             j = cv[nz]
@@ -838,15 +874,28 @@ function _build_strong_transpose_adj(A::CSRMatrix{Tv, Ti}, is_strong::AbstractVe
         end
     end
     # Build offsets (CSR-style)
-    offsets = Vector{Int}(undef, n + 1)
+    if setup_workspace !== nothing
+        offsets = _ws_resize!(setup_workspace.offsets, n + 1)
+    else
+        offsets = Vector{Int}(undef, n + 1)
+    end
     offsets[1] = 1
     @inbounds for j in 1:n
         offsets[j + 1] = offsets[j] + counts[j]
     end
     total = offsets[n + 1] - 1
-    sources = Vector{Int}(undef, total)
+    if setup_workspace !== nothing
+        sources = _ws_resize!(setup_workspace.sources, total)
+    else
+        sources = Vector{Int}(undef, total)
+    end
     # Fill sources
-    pos = copy(offsets[1:n])
+    if setup_workspace !== nothing
+        pos = _ws_resize!(setup_workspace.pos, n)
+        copyto!(pos, 1, offsets, 1, n)
+    else
+        pos = copy(offsets[1:n])
+    end
     @inbounds for i in 1:n
         for nz in nzrange(A, i)
             j = cv[nz]
@@ -990,7 +1039,8 @@ as fine than standard HMIS/PMIS alone.
 function coarsen_aggressive_cf(A_in::CSRMatrix{Tv, Ti}, θ::Real, base::Symbol;
                                config::AMGConfig=AMGConfig(),
                                rng=Random.default_rng(),
-                               backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
+                               backend=DEFAULT_BACKEND, block_size::Int=64,
+                               setup_workspace=nothing) where {Tv, Ti}
     n = size(A_in, 1)
     if n <= 1
         return ones(Int, n), collect(1:n), n
@@ -998,14 +1048,15 @@ function coarsen_aggressive_cf(A_in::CSRMatrix{Tv, Ti}, θ::Real, base::Symbol;
     # First pass: standard CF-splitting using base algorithm
     A_eff = config.max_row_sum < 1.0 ? _apply_max_row_sum(csr_to_cpu(A_in), config.max_row_sum) : A_in
     if base == :hmis
-        cf1, _, nc1 = coarsen_hmis(A_eff, θ; rng=rng, backend=backend, block_size=block_size)
+        cf1, _, nc1 = coarsen_hmis(A_eff, θ; rng=rng, backend=backend, block_size=block_size, setup_workspace=setup_workspace)
     else  # :pmis
-        cf1, _, nc1 = coarsen_pmis(A_eff, θ; rng=rng, backend=backend, block_size=block_size)
+        cf1, _, nc1 = coarsen_pmis(A_eff, θ; rng=rng, backend=backend, block_size=block_size, setup_workspace=setup_workspace)
     end
     # Second pass: among C-points from first pass, do another CF-splitting
     # using distance-2 strong connections to further reduce the coarse set.
     # Compute strength on GPU if available, then convert to CPU for graph algorithms
-    is_strong_raw = strength_graph(A_eff, θ; backend=backend, block_size=block_size)
+    is_strong_raw = strength_graph(A_eff, θ; backend=backend, block_size=block_size,
+        is_strong=setup_workspace !== nothing ? setup_workspace.is_strong : nothing)
     is_strong = is_strong_raw isa Array ? is_strong_raw : Array(is_strong_raw)
     A_eff = csr_to_cpu(A_eff)
     cv = colvals(A_eff)
@@ -1119,7 +1170,8 @@ end
 
 function coarsen(A::CSRMatrix, alg::AggregationCoarsening,
                 config::AMGConfig=AMGConfig();
-                backend=DEFAULT_BACKEND, block_size::Int=64)
+                backend=DEFAULT_BACKEND, block_size::Int=64,
+                setup_workspace=nothing)
     if config.max_row_sum < 1.0
         A_weak = _apply_max_row_sum(csr_to_cpu(A), config.max_row_sum)
         return coarsen_aggregation(A_weak, alg.θ; backend=backend, block_size=block_size)
@@ -1129,7 +1181,8 @@ end
 
 function coarsen(A::CSRMatrix, alg::AggressiveCoarsening,
                 config::AMGConfig=AMGConfig();
-                backend=DEFAULT_BACKEND, block_size::Int=64)
+                backend=DEFAULT_BACKEND, block_size::Int=64,
+                setup_workspace=nothing)
     if config.max_row_sum < 1.0
         A_weak = _apply_max_row_sum(csr_to_cpu(A), config.max_row_sum)
         return coarsen_aggressive(A_weak, alg.θ; backend=backend, block_size=block_size)
@@ -1156,32 +1209,35 @@ Perform CF-splitting coarsening. Returns `(cf, coarse_map, n_coarse)`.
 """
 function coarsen_cf(A::CSRMatrix, alg::PMISCoarsening,
                     config::AMGConfig=AMGConfig();
-                    backend=DEFAULT_BACKEND, block_size::Int=64)
+                    backend=DEFAULT_BACKEND, block_size::Int=64,
+                    setup_workspace=nothing)
     if config.max_row_sum < 1.0
         A_weak = _apply_max_row_sum(csr_to_cpu(A), config.max_row_sum)
-        return coarsen_pmis(A_weak, alg.θ; backend=backend, block_size=block_size)
+        return coarsen_pmis(A_weak, alg.θ; backend=backend, block_size=block_size, setup_workspace=setup_workspace)
     end
-    return coarsen_pmis(A, alg.θ; backend=backend, block_size=block_size)
+    return coarsen_pmis(A, alg.θ; backend=backend, block_size=block_size, setup_workspace=setup_workspace)
 end
 
 function coarsen_cf(A::CSRMatrix, alg::HMISCoarsening,
                     config::AMGConfig=AMGConfig();
-                    backend=DEFAULT_BACKEND, block_size::Int=64)
+                    backend=DEFAULT_BACKEND, block_size::Int=64,
+                    setup_workspace=nothing)
     if config.max_row_sum < 1.0
         A_weak = _apply_max_row_sum(csr_to_cpu(A), config.max_row_sum)
-        return coarsen_hmis(A_weak, alg.θ; backend=backend, block_size=block_size)
+        return coarsen_hmis(A_weak, alg.θ; backend=backend, block_size=block_size, setup_workspace=setup_workspace)
     end
-    return coarsen_hmis(A, alg.θ; backend=backend, block_size=block_size)
+    return coarsen_hmis(A, alg.θ; backend=backend, block_size=block_size, setup_workspace=setup_workspace)
 end
 
 function coarsen_cf(A::CSRMatrix, alg::RSCoarsening,
                     config::AMGConfig=AMGConfig();
-                    backend=DEFAULT_BACKEND, block_size::Int=64)
+                    backend=DEFAULT_BACKEND, block_size::Int=64,
+                    setup_workspace=nothing)
     if config.max_row_sum < 1.0
         A_weak = _apply_max_row_sum(csr_to_cpu(A), config.max_row_sum)
-        return coarsen_rs(A_weak, alg.θ; backend=backend, block_size=block_size)
+        return coarsen_rs(A_weak, alg.θ; backend=backend, block_size=block_size, setup_workspace=setup_workspace)
     end
-    return coarsen_rs(A, alg.θ; backend=backend, block_size=block_size)
+    return coarsen_rs(A, alg.θ; backend=backend, block_size=block_size, setup_workspace=setup_workspace)
 end
 
 """

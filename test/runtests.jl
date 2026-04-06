@@ -184,8 +184,8 @@ end
         Ac = to_csr(A)
         agg, nc = Draugr.coarsen_aggregation(Ac, 0.25)
         P = Draugr.build_prolongation(Ac, agg, nc)
-        A_coarse, r_map = Draugr.compute_coarse_sparsity(Ac, P, nc)
-        # Verify nz_offsets structure
+        Pt_map = Draugr.build_transpose_map(P)
+        A_coarse, r_map = Draugr.compute_coarse_sparsity(Ac, P, Pt_map, nc)
         nnz_c = SparseArrays.nnz(A_coarse)
         @test length(r_map.nz_offsets) == nnz_c + 1
         @test r_map.nz_offsets[1] == 1
@@ -217,8 +217,8 @@ end
         Ac = to_csr(A)
         agg, nc = Draugr.coarsen_aggregation(Ac, 0.25)
         P = Draugr.build_prolongation(Ac, agg, nc)
-        A_coarse, r_map = Draugr.compute_coarse_sparsity(Ac, P, nc)
-        @test size(A_coarse) == (nc, nc)
+        Pt_map = Draugr.build_transpose_map(P)
+        A_coarse, r_map = Draugr.compute_coarse_sparsity(Ac, P, Pt_map, nc)
         # Verify Galerkin product against explicit computation
         # Build explicit P as sparse matrix
         I_p = Int[]; J_p = Int[]; V_p = Float64[]
@@ -245,8 +245,8 @@ end
         Ac = to_csr(A)
         agg, nc = Draugr.coarsen_aggregation(Ac, 0.25)
         P = Draugr.build_prolongation(Ac, agg, nc)
-        A_coarse, r_map = Draugr.compute_coarse_sparsity(Ac, P, nc)
-        # Now modify A's values (scale by 2)
+        Pt_map = Draugr.build_transpose_map(P)
+        A_coarse, r_map = Draugr.compute_coarse_sparsity(Ac, P, Pt_map, nc)
         nzv = nonzeros(A)
         nzv .*= 2.0
         Ac = to_csr(A)
@@ -437,8 +437,8 @@ end
         n = 10
         A = poisson2d_csr(n)
         N = n*n
-        config = AMGConfig(coarsening=AggregationCoarsening())
-        hierarchy = amg_setup(A, config; allow_partial_resetup=false)
+        config = AMGConfig(coarsening=AggregationCoarsening(), allow_partial_resetup=false)
+        hierarchy = amg_setup(A, config)
         @test length(hierarchy.levels) > 0
         # R_map should be nothing when allow_partial_resetup=false
         for lvl in hierarchy.levels
@@ -456,8 +456,8 @@ end
     @testset "AMG Setup - allow_partial_resetup=true has R_map" begin
         n = 10
         A = poisson2d_csr(n)
-        config = AMGConfig(coarsening=AggregationCoarsening())
-        hierarchy = amg_setup(A, config; allow_partial_resetup=true)
+        config = AMGConfig(coarsening=AggregationCoarsening(), allow_partial_resetup=true)
+        hierarchy = amg_setup(A, config)
         @test length(hierarchy.levels) > 0
         for lvl in hierarchy.levels
             @test lvl.R_map !== nothing
@@ -490,23 +490,24 @@ end
         n = 10
         A = poisson2d_csr(n)
         N = n*n
-        config = AMGConfig(coarsening=AggregationCoarsening())
-        hierarchy = amg_setup(A, config; allow_partial_resetup=false)
+        config_no_partial = AMGConfig(coarsening=AggregationCoarsening(), allow_partial_resetup=false)
+        hierarchy = amg_setup(A, config_no_partial)
         # R_map should be nothing
         for lvl in hierarchy.levels
             @test lvl.R_map === nothing
         end
-        # Full resetup with allow_partial_resetup=true should populate R_map
-        amg_resetup!(hierarchy, A, config; partial=false, allow_partial_resetup=true)
+        # Full resetup with allow_partial_resetup=true config should populate R_map
+        config_with_partial = AMGConfig(coarsening=AggregationCoarsening(), allow_partial_resetup=true)
+        amg_resetup!(hierarchy, A, config_with_partial; partial=false)
         for lvl in hierarchy.levels
             @test lvl.R_map !== nothing
         end
         # Partial resetup should now work
         nonzeros(A) .*= 2.0
-        amg_resetup!(hierarchy, A, config; partial=true)
+        amg_resetup!(hierarchy, A, config_with_partial; partial=true)
         b = rand(N)
         x = zeros(N)
-        x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+        x, niter = amg_solve!(x, b, hierarchy, config_with_partial; tol=1e-8, maxiter=200)
         r = b - sparse(A.At') * x
         @test norm(r) / norm(b) < 1e-8
     end
@@ -518,10 +519,145 @@ end
         config = AMGConfig(coarsening=AggregationCoarsening())
         hierarchy = amg_setup(A, config)
         # Full resetup without restriction maps
-        amg_resetup!(hierarchy, A, config; partial=false, allow_partial_resetup=false)
+        config_no_partial = AMGConfig(coarsening=AggregationCoarsening(), allow_partial_resetup=false)
+        amg_resetup!(hierarchy, A, config_no_partial; partial=false)
         for lvl in hierarchy.levels
             @test lvl.R_map === nothing
         end
+        b = rand(N)
+        x = zeros(N)
+        x, niter = amg_solve!(x, b, hierarchy, config_no_partial; tol=1e-8, maxiter=200)
+        r = b - sparse(A.At') * x
+        @test norm(r) / norm(b) < 1e-8
+    end
+
+    @testset "AMG Resetup - update_P=true with HMIS coarsening" begin
+        n = 10
+        A = poisson2d_csr(n)
+        N = n*n
+        config = AMGConfig(coarsening=HMISCoarsening(0.5, DirectInterpolation()))
+        hierarchy = amg_setup(A, config)
+        @test length(hierarchy.levels) > 0
+        # P_update_map should be present for CF-splitting methods
+        for lvl in hierarchy.levels
+            @test lvl.P_update_map !== nothing
+        end
+        # Solve with original matrix
+        b = rand(N)
+        x1 = zeros(N)
+        x1, niter1 = amg_solve!(x1, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r1 = b - sparse(A.At') * x1
+        @test norm(r1) / norm(b) < 1e-8
+        # Scale matrix and resetup with update_P=true
+        nonzeros(A) .*= 2.0
+        amg_resetup!(hierarchy, A, config; partial=true, update_P=true)
+        # Solve with updated matrix
+        x2 = zeros(N)
+        x2, niter2 = amg_solve!(x2, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r2 = b - sparse(A.At') * x2
+        @test norm(r2) / norm(b) < 1e-8
+    end
+
+    @testset "AMG Resetup - update_P=true with PMIS coarsening" begin
+        n = 10
+        A = poisson2d_csr(n)
+        N = n*n
+        config = AMGConfig(coarsening=PMISCoarsening(0.5, DirectInterpolation()))
+        hierarchy = amg_setup(A, config)
+        if length(hierarchy.levels) > 0
+            # P_update_map should be present
+            for lvl in hierarchy.levels
+                @test lvl.P_update_map !== nothing
+            end
+            # Scale and resetup with update_P=true
+            nonzeros(A) .*= 2.0
+            amg_resetup!(hierarchy, A, config; partial=true, update_P=true)
+            b = rand(N)
+            x = zeros(N)
+            x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+            r = b - sparse(A.At') * x
+            @test norm(r) / norm(b) < 1e-8
+        end
+    end
+
+    @testset "AMG Resetup - update_P=true with RS coarsening" begin
+        n = 10
+        A = poisson2d_csr(n)
+        N = n*n
+        config = AMGConfig(coarsening=RSCoarsening(0.5, DirectInterpolation()))
+        hierarchy = amg_setup(A, config)
+        if length(hierarchy.levels) > 0
+            # P_update_map should be present
+            for lvl in hierarchy.levels
+                @test lvl.P_update_map !== nothing
+            end
+            # Scale and resetup with update_P=true
+            nonzeros(A) .*= 2.0
+            amg_resetup!(hierarchy, A, config; partial=true, update_P=true)
+            b = rand(N)
+            x = zeros(N)
+            x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+            r = b - sparse(A.At') * x
+            @test norm(r) / norm(b) < 1e-8
+        end
+    end
+
+    @testset "AMG Resetup - update_P=true with StandardInterpolation" begin
+        n = 10
+        A = poisson2d_csr(n)
+        N = n*n
+        config = AMGConfig(coarsening=HMISCoarsening(0.5, StandardInterpolation()))
+        hierarchy = amg_setup(A, config)
+        @test length(hierarchy.levels) > 0
+        # Standard interpolation now supports update_P (interp_type=2)
+        for lvl in hierarchy.levels
+            @test lvl.P_update_map !== nothing
+            @test lvl.P_update_map.interp_type == 2
+        end
+        nonzeros(A) .*= 2.0
+        amg_resetup!(hierarchy, A, config; partial=true, update_P=true)
+        b = rand(N)
+        x = zeros(N)
+        x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r = b - sparse(A.At') * x
+        @test norm(r) / norm(b) < 1e-8
+    end
+
+    @testset "AMG Resetup - update_P=true with ExtendedIInterpolation" begin
+        n = 10
+        A = poisson2d_csr(n)
+        N = n*n
+        config = AMGConfig(coarsening=HMISCoarsening(0.5, ExtendedIInterpolation()))
+        hierarchy = amg_setup(A, config)
+        @test length(hierarchy.levels) > 0
+        # Extended+i interpolation now supports update_P (interp_type=3)
+        for lvl in hierarchy.levels
+            @test lvl.P_update_map !== nothing
+            @test lvl.P_update_map.interp_type == 3
+        end
+        nonzeros(A) .*= 2.0
+        amg_resetup!(hierarchy, A, config; partial=true, update_P=true)
+        b = rand(N)
+        x = zeros(N)
+        x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+        r = b - sparse(A.At') * x
+        @test norm(r) / norm(b) < 1e-8
+    end
+
+    @testset "AMG Resetup - update_P does not impact Aggregation" begin
+        n = 10
+        A = poisson2d_csr(n)
+        N = n*n
+        config = AMGConfig(coarsening=AggregationCoarsening())
+        hierarchy = amg_setup(A, config)
+        @test length(hierarchy.levels) > 0
+        # P_update_map should be nothing for aggregation-based methods
+        for lvl in hierarchy.levels
+            @test lvl.P_update_map === nothing
+        end
+        # update_P=true should still work (just does nothing for aggregation)
+        nonzeros(A) .*= 2.0
+        amg_resetup!(hierarchy, A, config; partial=true, update_P=true)
         b = rand(N)
         x = zeros(N)
         x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
@@ -926,6 +1062,122 @@ end
         @test Jutul.operator_nrows(prec) == N
     end
 
+    @testset "Jutul Interface - Smart resetup (update_P when available)" begin
+        # With HMIS+ExtendedI (default), P_update_map is built → update_P=true path
+        n = 10
+        A = poisson2d_csr(n)
+        N = n*n
+        b = rand(N)
+        config = AMGConfig(coarsening=HMISCoarsening(0.5, DirectInterpolation()))
+        prec = DraugrPreconditioner(solver=:jutul, coarsening=HMISCoarsening(0.5, DirectInterpolation()))
+        ctx = Jutul.DefaultContext()
+
+        # First call: full setup
+        Jutul.update_preconditioner!(prec, A, b, ctx, nothing)
+        @test !isnothing(prec.hierarchy)
+        @test Jutul.operator_nrows(prec) == N
+        has_p_update = prec.hierarchy.levels[1].P_update_map !== nothing
+        has_r_map    = prec.hierarchy.levels[1].R_map !== nothing
+
+        # Second call (resetup): should use smartest available path
+        nonzeros(A) .*= 2.0
+        Jutul.update_preconditioner!(prec, A, b, ctx, nothing)
+        @test Jutul.operator_nrows(prec) == N
+
+        # Result should still converge
+        x = zeros(N)
+        Jutul.apply!(x, prec, b)
+        @test norm(x) > 0
+    end
+
+    @testset "Jutul Interface - :jutul_partial preconditioner" begin
+        n = 10
+        A = poisson2d_csr(n)
+        N = n*n
+        b = rand(N)
+
+        prec = DraugrPreconditioner(solver=:jutul_partial)
+        @test prec isa Jutul.JutulPreconditioner
+        @test isnothing(prec.hierarchy)
+        @test Jutul.operator_nrows(prec) == 0
+
+        ctx = Jutul.DefaultContext()
+        # First call: full setup
+        Jutul.update_preconditioner!(prec, A, b, ctx, nothing)
+        @test !isnothing(prec.hierarchy)
+        @test Jutul.operator_nrows(prec) == N
+
+        # Apply
+        x = zeros(N)
+        Jutul.apply!(x, prec, b)
+        @test norm(x) > 0
+
+        # Second call (resetup): uses smart strategy
+        nonzeros(A) .*= 2.0
+        Jutul.update_preconditioner!(prec, A, b, ctx, nothing)
+        @test Jutul.operator_nrows(prec) == N
+    end
+
+    @testset "Jutul Interface - :jutul_partial with AggregationCoarsening (no P_update_map)" begin
+        # Aggregation coarsening → no P_update_map → should fall back to partial=true
+        n = 10
+        A = poisson2d_csr(n)
+        N = n*n
+        b = rand(N)
+
+        prec = DraugrPreconditioner(solver=:jutul_partial,
+                                    coarsening=AggregationCoarsening())
+        ctx = Jutul.DefaultContext()
+        Jutul.update_preconditioner!(prec, A, b, ctx, nothing)
+        @test !isnothing(prec.hierarchy)
+        # Aggregation doesn't build P_update_map
+        for lvl in prec.hierarchy.levels
+            @test lvl.P_update_map === nothing
+        end
+        # But R_map should be present (allow_partial_resetup=true by default)
+        @test prec.hierarchy.levels[1].R_map !== nothing
+
+        # Second call: falls back to partial=true (no update_P)
+        nonzeros(A) .*= 3.0
+        Jutul.update_preconditioner!(prec, A, b, ctx, nothing)
+        @test Jutul.operator_nrows(prec) == N
+
+        # Should still converge
+        x = zeros(N)
+        for _ in 1:100
+            r = b - sparse(A.At') * x
+            dx = zeros(N)
+            Jutul.apply!(dx, prec, r)
+            x .+= dx
+        end
+        r = b - sparse(A.At') * x
+        @test norm(r) / norm(b) < 1e-6
+    end
+
+    @testset "Jutul Interface - :jutul_partial with allow_partial_resetup=false (full rebuild)" begin
+        # No restriction maps → should fall back to partial=false
+        n = 8
+        A = poisson2d_csr(n)
+        N = n*n
+        b = rand(N)
+
+        prec = DraugrPreconditioner(solver=:jutul_partial,
+                                    coarsening=AggregationCoarsening(),
+                                    allow_partial_resetup=false)
+        ctx = Jutul.DefaultContext()
+        Jutul.update_preconditioner!(prec, A, b, ctx, nothing)
+        @test !isnothing(prec.hierarchy)
+        # No R_map with allow_partial_resetup=false
+        for lvl in prec.hierarchy.levels
+            @test lvl.R_map === nothing
+        end
+
+        # Second call: should do full rebuild (partial=false)
+        nonzeros(A) .*= 2.0
+        Jutul.update_preconditioner!(prec, A, b, ctx, nothing)
+        @test Jutul.operator_nrows(prec) == N
+    end
+
     # ══════════════════════════════════════════════════════════════════════════
     # HMIS Coarsening
     # ══════════════════════════════════════════════════════════════════════════
@@ -1186,7 +1438,7 @@ end
         cf, cmap, nc = Draugr.coarsen_pmis(Ac, 0.25)
         # Test all three interpolation types
         for interp in [DirectInterpolation(), StandardInterpolation(), ExtendedIInterpolation()]
-            P = Draugr.build_cf_prolongation(Ac, cf, cmap, nc, interp)
+            P, _ = Draugr.build_cf_prolongation(Ac, cf, cmap, nc, interp)
             @test P.nrow == 20
             @test P.ncol == nc
             # Coarse points should have identity mapping: P[i, cmap[i]] = 1
@@ -1206,7 +1458,7 @@ end
         Ac = to_csr(A)
         cf, cmap, nc = Draugr.coarsen_pmis(Ac, 0.25)
         for interp in [DirectInterpolation(), StandardInterpolation(), ExtendedIInterpolation()]
-            P = Draugr.build_cf_prolongation(Ac, cf, cmap, nc, interp)
+            P, _ = Draugr.build_cf_prolongation(Ac, cf, cmap, nc, interp)
             for i in 1:20
                 if cf[i] == -1
                     nnz_row = P.rowptr[i+1] - P.rowptr[i]
@@ -1220,8 +1472,9 @@ end
         A = poisson2d_csr(6)
         Ac = to_csr(A)
         cf, cmap, nc = Draugr.coarsen_pmis(Ac, 0.25)
-        P = Draugr.build_cf_prolongation(Ac, cf, cmap, nc, StandardInterpolation())
-        A_coarse, r_map = Draugr.compute_coarse_sparsity(Ac, P, nc)
+        P, _ = Draugr.build_cf_prolongation(Ac, cf, cmap, nc, StandardInterpolation())
+        Pt_map = Draugr.build_transpose_map(P)
+        A_coarse, r_map = Draugr.compute_coarse_sparsity(Ac, P, Pt_map, nc)
         # Verify against explicit computation
         I_p = Int[]; J_p = Int[]; V_p = Float64[]
         for i in 1:P.nrow

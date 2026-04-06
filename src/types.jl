@@ -513,19 +513,19 @@ mutable struct ProlongationUpdateMap{Ti<:Integer, Tv<:Number}
     #   - std_sum_indices[...]: A.nzval indices for computing sum_C_k
     # - std_d_base_offsets[k]: offset into base denominator indices
     # - std_d_base_entries[...]: A.nzval indices for a_{i,i} + weak neighbors
-    std_direct_numer_idx::Vector{Ti}
-    std_fine_offsets::Vector{Ti}
-    std_a_ik::Vector{Ti}
-    std_a_kJ::Vector{Ti}
-    std_diag_k::Vector{Ti}
-    std_a_ki::Vector{Ti}
-    std_sum_offsets::Vector{Ti}
-    std_sum_indices::Vector{Ti}
-    std_d_base_offsets::Vector{Ti}
-    std_d_base_entries::Vector{Ti}
+    std_direct_numer_idx::AbstractVector{Ti}
+    std_fine_offsets::AbstractVector{Ti}
+    std_a_ik::AbstractVector{Ti}
+    std_a_kJ::AbstractVector{Ti}
+    std_diag_k::AbstractVector{Ti}
+    std_a_ki::AbstractVector{Ti}
+    std_sum_offsets::AbstractVector{Ti}
+    std_sum_indices::AbstractVector{Ti}
+    std_d_base_offsets::AbstractVector{Ti}
+    std_d_base_entries::AbstractVector{Ti}
     
     # ═══════════════════════════════════════════════════════════════════════════
-    # GPU kernel data for Extended+i interpolation (interp_type == 3)
+    # Kernel data for Extended+i interpolation (interp_type == 3)
     # ═══════════════════════════════════════════════════════════════════════════
     # Similar structure but C-hat includes distance-2 coarse points.
     # For each P entry k at row i to coarse column J:
@@ -537,19 +537,19 @@ mutable struct ProlongationUpdateMap{Ti<:Integer, Tv<:Number}
     # - For fine neighbors (contribute indirectly):
     #   - extd_fine_offsets[k]: offset into fine neighbor contribution data
     #   - extd_fine_data[...]: (similar structure to Standard)
-    extd_entry_row::Vector{Ti}
-    extd_p_col::Vector{Ti}
-    extd_direct_a_idx::Vector{Ti}       # A.nzval index for direct contribution
-    extd_fine_offsets::Vector{Ti}
-    extd_a_ik::Vector{Ti}
-    extd_diag_k::Vector{Ti}
-    extd_sum_offsets::Vector{Ti}
-    extd_sum_indices::Vector{Ti}
-    extd_contrib_offsets::Vector{Ti}
-    extd_contrib_a_idx::Vector{Ti}      # A.nzval indices that contribute to P entry
-    extd_contrib_p_col::Vector{Ti}      # P column for each contribution
-    extd_d_base_offsets::Vector{Ti}
-    extd_d_base_entries::Vector{Ti}
+    extd_entry_row::AbstractVector{Ti}
+    extd_p_col::AbstractVector{Ti}
+    extd_direct_a_idx::AbstractVector{Ti}       # A.nzval index for direct contribution
+    extd_fine_offsets::AbstractVector{Ti}
+    extd_a_ik::AbstractVector{Ti}
+    extd_diag_k::AbstractVector{Ti}
+    extd_sum_offsets::AbstractVector{Ti}
+    extd_sum_indices::AbstractVector{Ti}
+    extd_contrib_offsets::AbstractVector{Ti}
+    extd_contrib_a_idx::AbstractVector{Ti}      # A.nzval indices that contribute to P entry
+    extd_contrib_p_col::AbstractVector{Ti}      # P column for each contribution
+    extd_d_base_offsets::AbstractVector{Ti}
+    extd_d_base_entries::AbstractVector{Ti}
 end
 
 # ── AMG Level ─────────────────────────────────────────────────────────────────

@@ -85,6 +85,26 @@ function _to_device(ref::CSRMatrix, v::AbstractVector)
 end
 
 """
+    _match_device(ref::AbstractVector, v::AbstractVector)
+
+Ensure `v` is on the same device as `ref`.  If both are CPU arrays (or both
+already share the same backend), returns `v` as-is.  Otherwise copies `v` to
+the device of `ref` (CPU→GPU) or to CPU (GPU→CPU).
+"""
+function _match_device(ref::AbstractVector, v::AbstractVector)
+    ref_cpu = ref isa Array
+    v_cpu   = v   isa Array
+    ref_cpu == v_cpu && return v          # already on the same device
+    if ref_cpu
+        return Array(v)                   # GPU → CPU
+    else
+        tmp = similar(ref, eltype(v), length(v))
+        copyto!(tmp, v isa Array ? v : Array(v))
+        return tmp                        # CPU → GPU
+    end
+end
+
+"""
     _csr_to_device(ref, A_cpu) -> CSRMatrix
 
 Copy a CPU CSRMatrix to the same device as `ref`'s arrays.

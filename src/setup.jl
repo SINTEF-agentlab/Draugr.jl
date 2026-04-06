@@ -52,6 +52,9 @@ function _prolongation_update_map_to_device(ref::CSRMatrix{Tv, Ti}, p_map::Prolo
     denom_entries = _to_device(ref, p_map.denom_entries)
     
     # Graph structure and workspace stays on CPU for Standard/Extended+i recomputation
+    # Kernel data arrays are transferred to device once here so they are not
+    # copied on every reconstruct call.
+    _td(arr) = isempty(arr) ? arr : _to_device(ref, arr)
     return ProlongationUpdateMap{Ti2, Tv2}(
         p_map.interp_type,
         p_map.is_strong,      # stays on CPU
@@ -68,31 +71,31 @@ function _prolongation_update_map_to_device(ref::CSRMatrix{Tv, Ti}, p_map::Prolo
         p_map.P_marker,             # stays on CPU
         p_map.chat_indices,         # stays on CPU
         p_map.P_data,               # stays on CPU
-        # GPU kernel data for Standard (stays on CPU, converted at kernel launch time)
-        p_map.std_direct_numer_idx,
-        p_map.std_fine_offsets,
-        p_map.std_a_ik,
-        p_map.std_a_kJ,
-        p_map.std_diag_k,
-        p_map.std_a_ki,
-        p_map.std_sum_offsets,
-        p_map.std_sum_indices,
-        p_map.std_d_base_offsets,
-        p_map.std_d_base_entries,
-        # GPU kernel data for Extended+i (stays on CPU)
-        p_map.extd_entry_row,
-        p_map.extd_p_col,
-        p_map.extd_direct_a_idx,
-        p_map.extd_fine_offsets,
-        p_map.extd_a_ik,
-        p_map.extd_diag_k,
-        p_map.extd_sum_offsets,
-        p_map.extd_sum_indices,
-        p_map.extd_contrib_offsets,
-        p_map.extd_contrib_a_idx,
-        p_map.extd_contrib_p_col,
-        p_map.extd_d_base_offsets,
-        p_map.extd_d_base_entries
+        # Kernel data for Standard — transferred to device once
+        _td(p_map.std_direct_numer_idx),
+        _td(p_map.std_fine_offsets),
+        _td(p_map.std_a_ik),
+        _td(p_map.std_a_kJ),
+        _td(p_map.std_diag_k),
+        _td(p_map.std_a_ki),
+        _td(p_map.std_sum_offsets),
+        _td(p_map.std_sum_indices),
+        _td(p_map.std_d_base_offsets),
+        _td(p_map.std_d_base_entries),
+        # Kernel data for Extended+i — transferred to device once
+        _td(p_map.extd_entry_row),
+        _td(p_map.extd_p_col),
+        _td(p_map.extd_direct_a_idx),
+        _td(p_map.extd_fine_offsets),
+        _td(p_map.extd_a_ik),
+        _td(p_map.extd_diag_k),
+        _td(p_map.extd_sum_offsets),
+        _td(p_map.extd_sum_indices),
+        _td(p_map.extd_contrib_offsets),
+        _td(p_map.extd_contrib_a_idx),
+        _td(p_map.extd_contrib_p_col),
+        _td(p_map.extd_d_base_offsets),
+        _td(p_map.extd_d_base_entries)
     )
 end
 

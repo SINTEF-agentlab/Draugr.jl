@@ -1,5 +1,6 @@
 using Test
 using Draugr
+import Draugr: colvals
 using SparseArrays
 using LinearAlgebra
 using Random
@@ -421,14 +422,14 @@ end
         config = AMGConfig(coarsening=AggregationCoarsening())
         hierarchy = amg_setup(A, config)
         # Record sparsity pattern
-        patterns = [(copy(colvals(lvl.A)), copy(rowptr(lvl.A)))
+        patterns = [(copy(Draugr.colvals(lvl.A)), copy(rowptr(lvl.A)))
                      for lvl in hierarchy.levels]
         # Scale and resetup
         nonzeros(A) .*= 3.0
         amg_resetup!(hierarchy, A, config)
         # Verify sparsity patterns are unchanged
         for (i, (cv, rp)) in enumerate(patterns)
-            @test colvals(hierarchy.levels[i].A) == cv
+            @test Draugr.colvals(hierarchy.levels[i].A) == cv
             @test rowptr(hierarchy.levels[i].A) == rp
         end
     end
@@ -690,7 +691,7 @@ end
         @test all(colors .> 0)
         @test nc >= 2  # tridiagonal needs at least 2 colors
         # Verify no two adjacent nodes have the same color
-        cv = colvals(Ac)
+        cv = Draugr.colvals(Ac)
         for i in 1:10
             for nz in nzrange(Ac, i)
                 j = cv[nz]
@@ -1191,7 +1192,7 @@ end
         @test nc > 0
         @test nc < 20
         # Every fine point should have at least one coarse neighbor
-        cv = colvals(Ac)
+        cv = Draugr.colvals(Ac)
         for i in 1:20
             if cf[i] == -1
                 has_coarse = false
@@ -2016,7 +2017,6 @@ end
             @test norm(r) / norm(b) < 1e-8
         end
     end
-
     @testset "Anisotropic Matrix - Convergence" begin
         A = anisotropic_csr(8, 8)
         N = 64
@@ -3955,4 +3955,242 @@ end
         draugr_amg_config_free(cfg)
     end
 
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Real Reservoir Simulation Test Matrices
+    # ══════════════════════════════════════════════════════════════════════════
+
+    # Helper: read a Matrix Market (.mtx) file and return a SparseMatrixCSC
+    function read_mtx(path)
+        open(path) do f
+            local header
+            while true
+                line = readline(f)
+                startswith(line, '%') && continue
+                header = strip(line)
+                break
+            end
+            parts = split(header)
+            nrows = parse(Int, parts[1])
+            ncols = parse(Int, parts[2])
+            nz    = parse(Int, parts[3])
+            I_arr = Vector{Int}(undef, nz)
+            J_arr = Vector{Int}(undef, nz)
+            V_arr = Vector{Float64}(undef, nz)
+            for k in 1:nz
+                p = split(strip(readline(f)))
+                I_arr[k] = parse(Int, p[1])
+                J_arr[k] = parse(Int, p[2])
+                V_arr[k] = parse(Float64, p[3])
+            end
+            return sparse(I_arr, J_arr, V_arr, nrows, ncols)
+        end
+    end
+
+    TEST_MATRICES_DIR = joinpath(@__DIR__, "test_matrices")
+
+    # ── Setup and level-count verification for all six test matrices ──────────
+
+    @testset "Real Matrices - AMG Setup and Level Count" begin
+        for name in ["egg", "norne", "olympus_1", "spe10_tarbert", "spe10_ness", "spe10_full"]
+            @testset "$name" begin
+                A = read_mtx(joinpath(TEST_MATRICES_DIR, "$name.mtx"))
+                config = AMGConfig()
+                hierarchy = amg_setup(A, config)
+                nlevels = length(hierarchy.levels)
+                @test nlevels > 0
+                @test nlevels <= 25
+                # Levels must be strictly coarser from fine to coarse
+                for i in 1:(nlevels - 1)
+                    @test size(hierarchy.levels[i + 1].A, 1) < size(hierarchy.levels[i].A, 1)
+                end
+            end
+        end
+    end
+
+    # ── Level counts across coarsening algorithms (egg and norne) ────────────
+
+    @testset "Real Matrices - Level Counts per Coarsening" begin
+        for matname in ["egg", "norne"]
+            A = read_mtx(joinpath(TEST_MATRICES_DIR, "$matname.mtx"))
+            @testset "$matname" begin
+                for coarsening in [
+                        AggregationCoarsening(),
+                        PMISCoarsening(),
+                        HMISCoarsening(),
+                        RSCoarsening(),
+                        AggressiveCoarsening(),
+                        SmoothedAggregationCoarsening(),
+                    ]
+                    @testset "$(typeof(coarsening).name.name)" begin
+                        config = AMGConfig(coarsening=coarsening)
+                        hierarchy = amg_setup(A, config)
+                        nlevels = length(hierarchy.levels)
+                        @test nlevels > 0
+                        @test nlevels <= 25
+                        # Each coarse level must be strictly smaller
+                        for i in 1:(nlevels - 1)
+                            @test size(hierarchy.levels[i + 1].A, 1) < size(hierarchy.levels[i].A, 1)
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    # ── Solve tests with each coarsening (egg) ───────────────────────────────
+
+    @testset "Real Matrices - Solve with Different Coarsenings (egg)" begin
+        A = read_mtx(joinpath(TEST_MATRICES_DIR, "egg.mtx"))
+        N = size(A, 1)
+        b = ones(N)
+        for (cname, coarsening) in [
+                ("Aggregation",          AggregationCoarsening()),
+                ("PMIS",                 PMISCoarsening()),
+                ("HMIS",                 HMISCoarsening()),
+                ("RS",                   RSCoarsening()),
+                ("Aggressive",           AggressiveCoarsening()),
+                ("SmoothedAggregation",  SmoothedAggregationCoarsening()),
+            ]
+            @testset "$cname" begin
+                config = AMGConfig(coarsening=coarsening)
+                hierarchy = amg_setup(A, config)
+                @test length(hierarchy.levels) > 0
+                x = zeros(N)
+                x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-6, maxiter=500)
+                r = b - A * x
+                @test norm(r) / norm(b) < 1e-6
+                @test niter < 500
+            end
+        end
+    end
+
+    # ── Resetup option tests (egg) ────────────────────────────────────────────
+
+    @testset "Real Matrices - Resetup Options (egg)" begin
+        A = read_mtx(joinpath(TEST_MATRICES_DIR, "egg.mtx"))
+        N = size(A, 1)
+        b = ones(N)
+
+        @testset "Partial resetup (R_map, coefficient-only)" begin
+            config = AMGConfig()
+            hierarchy = amg_setup(A, config)
+            # Verify R_map is present by default
+            for lvl in hierarchy.levels
+                @test lvl.R_map !== nothing
+            end
+            x = zeros(N)
+            x, _ = amg_solve!(x, b, hierarchy, config; tol=1e-6, maxiter=500)
+            @test norm(b - A * x) / norm(b) < 1e-6
+            # Scale coefficients and do partial resetup
+            A2 = copy(A)
+            nonzeros(A2) .*= 1.5
+            amg_resetup!(hierarchy, A2, config; partial=true)
+            x2 = zeros(N)
+            x2, _ = amg_solve!(x2, b, hierarchy, config; tol=1e-6, maxiter=500)
+            @test norm(b - A2 * x2) / norm(b) < 1e-6
+        end
+
+        @testset "Full resetup (partial=false)" begin
+            config = AMGConfig()
+            hierarchy = amg_setup(A, config)
+            nlevels_orig = length(hierarchy.levels)
+            A2 = copy(A)
+            nonzeros(A2) .*= 1.5
+            amg_resetup!(hierarchy, A2, config; partial=false)
+            x2 = zeros(N)
+            x2, _ = amg_solve!(x2, b, hierarchy, config; tol=1e-6, maxiter=500)
+            @test norm(b - A2 * x2) / norm(b) < 1e-6
+        end
+
+        @testset "Resetup without allow_partial_resetup (full rebuild only)" begin
+            config = AMGConfig(allow_partial_resetup=false)
+            hierarchy = amg_setup(A, config)
+            for lvl in hierarchy.levels
+                @test lvl.R_map === nothing
+            end
+            A2 = copy(A)
+            nonzeros(A2) .*= 1.5
+            amg_resetup!(hierarchy, A2, config; partial=false)
+            x2 = zeros(N)
+            x2, _ = amg_solve!(x2, b, hierarchy, config; tol=1e-6, maxiter=500)
+            @test norm(b - A2 * x2) / norm(b) < 1e-6
+        end
+
+        @testset "Resetup update_P=true (HMIS + DirectInterpolation)" begin
+            config = AMGConfig(coarsening=HMISCoarsening(0.5, DirectInterpolation()))
+            hierarchy = amg_setup(A, config)
+            for lvl in hierarchy.levels
+                @test lvl.P_update_map !== nothing
+            end
+            x = zeros(N)
+            x, _ = amg_solve!(x, b, hierarchy, config; tol=1e-6, maxiter=500)
+            @test norm(b - A * x) / norm(b) < 1e-6
+            A2 = copy(A)
+            nonzeros(A2) .*= 1.5
+            amg_resetup!(hierarchy, A2, config; partial=true, update_P=true)
+            x2 = zeros(N)
+            x2, _ = amg_solve!(x2, b, hierarchy, config; tol=1e-6, maxiter=500)
+            @test norm(b - A2 * x2) / norm(b) < 1e-6
+        end
+
+        @testset "Resetup update_P=true (HMIS + ExtendedIInterpolation)" begin
+            config = AMGConfig(coarsening=HMISCoarsening(0.5, ExtendedIInterpolation()))
+            hierarchy = amg_setup(A, config)
+            for lvl in hierarchy.levels
+                @test lvl.P_update_map !== nothing
+                @test lvl.P_update_map.interp_type == 3
+            end
+            A2 = copy(A)
+            nonzeros(A2) .*= 1.5
+            amg_resetup!(hierarchy, A2, config; partial=true, update_P=true)
+            x2 = zeros(N)
+            x2, _ = amg_solve!(x2, b, hierarchy, config; tol=1e-6, maxiter=500)
+            @test norm(b - A2 * x2) / norm(b) < 1e-6
+        end
+
+        @testset "Resetup preserves sparsity pattern" begin
+            config = AMGConfig()
+            hierarchy = amg_setup(A, config)
+            patterns = [(copy(colvals(lvl.A)), copy(rowptr(lvl.A))) for lvl in hierarchy.levels]
+            A2 = copy(A)
+            nonzeros(A2) .*= 2.0
+            amg_resetup!(hierarchy, A2, config; partial=true)
+            for (i, (cv, rp)) in enumerate(patterns)
+                @test colvals(hierarchy.levels[i].A) == cv
+                @test rowptr(hierarchy.levels[i].A) == rp
+            end
+        end
+    end
+
+    # ── Resetup option tests (norne) ──────────────────────────────────────────
+
+    @testset "Real Matrices - Resetup Options (norne)" begin
+        A = read_mtx(joinpath(TEST_MATRICES_DIR, "norne.mtx"))
+        N = size(A, 1)
+        b = ones(N)
+        config = AMGConfig()
+
+        @testset "Partial resetup convergence" begin
+            hierarchy = amg_setup(A, config)
+            nlevels_init = length(hierarchy.levels)
+            A2 = copy(A)
+            nonzeros(A2) .*= 1.2
+            amg_resetup!(hierarchy, A2, config; partial=true)
+            @test length(hierarchy.levels) == nlevels_init
+            x = zeros(N)
+            x, _ = amg_solve!(x, b, hierarchy, config; tol=1e-6, maxiter=500)
+            @test norm(b - A2 * x) / norm(b) < 1e-6
+        end
+
+        @testset "Full resetup convergence" begin
+            hierarchy = amg_setup(A, config)
+            A2 = copy(A)
+            nonzeros(A2) .*= 1.5
+            amg_resetup!(hierarchy, A2, config; partial=false)
+            x = zeros(N)
+            x, _ = amg_solve!(x, b, hierarchy, config; tol=1e-6, maxiter=500)
+            @test norm(b - A2 * x) / norm(b) < 1e-6
+        end
+    end
 end

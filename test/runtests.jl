@@ -4,6 +4,7 @@ import Draugr: colvals
 using SparseArrays
 using LinearAlgebra
 using Random
+using StaticArrays
 import Jutul
 using Jutul.StaticCSR: StaticSparsityMatrixCSR, static_sparsity_sparse
 

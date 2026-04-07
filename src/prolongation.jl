@@ -2061,7 +2061,9 @@ where:
 end
 
 """
-Compute Standard interpolation P values using GPU kernel.
+Compute Standard interpolation P values using a KA kernel.
+The map arrays are assumed to already reside on the same device as `P_nzval`.
+Returns true if kernel data was available, false to fall back to CPU implementation.
 """
 function _standard_interp_compute_values!(P_nzval::AbstractVector{Tv}, A_nzval::AbstractVector{Tv},
                                           P_update_map::ProlongationUpdateMap{Ti, Tv2};
@@ -2069,7 +2071,7 @@ function _standard_interp_compute_values!(P_nzval::AbstractVector{Tv}, A_nzval::
     nnz_P = length(P_nzval)
     nnz_P == 0 && return true  # Empty P is considered success
     
-    # Get GPU kernel data
+    # Get kernel data (already on the correct device)
     entry_type = P_update_map.entry_type
     std_direct_numer_idx = P_update_map.std_direct_numer_idx
     std_fine_offsets = P_update_map.std_fine_offsets
@@ -2082,50 +2084,22 @@ function _standard_interp_compute_values!(P_nzval::AbstractVector{Tv}, A_nzval::
     std_d_base_offsets = P_update_map.std_d_base_offsets
     std_d_base_entries = P_update_map.std_d_base_entries
     
-    # Check if GPU kernel data is available
+    # Check if kernel data is available
     if isempty(std_direct_numer_idx)
-        # Fall back to CPU implementation
         return false
     end
     
-    P_on_gpu = !(P_nzval isa Array)
-    A_on_gpu = !(A_nzval isa Array)
+    # Ensure A values are on the same device as P
+    A_nzval_dev = _match_device(P_nzval, A_nzval)
     
-    if P_on_gpu
-        # P is on GPU: convert update map arrays to GPU and use GPU kernel
-        be = _get_backend(P_nzval)
-        # Convert A values to GPU if needed
-        A_nzval_gpu = A_on_gpu ? A_nzval : begin
-            tmp = similar(P_nzval, eltype(A_nzval), length(A_nzval))
-            copyto!(tmp, A_nzval)
-            tmp
-        end
-        # Helper to convert array to GPU
-        _copy_to_gpu(arr) = begin
-            tmp = similar(P_nzval, eltype(arr), length(arr))
-            copyto!(tmp, arr)
-            tmp
-        end
-        
-        kernel! = _p_standard_update_kernel!(be, block_size)
-        kernel!(P_nzval, A_nzval_gpu, _copy_to_gpu(entry_type),
-                _copy_to_gpu(std_direct_numer_idx), _copy_to_gpu(std_fine_offsets),
-                _copy_to_gpu(std_a_ik), _copy_to_gpu(std_a_kJ), _copy_to_gpu(std_diag_k),
-                _copy_to_gpu(std_a_ki), _copy_to_gpu(std_sum_offsets), _copy_to_gpu(std_sum_indices),
-                _copy_to_gpu(std_d_base_offsets), _copy_to_gpu(std_d_base_entries); ndrange=nnz_P)
-        _synchronize(be)
-    else
-        # P is on CPU: use CPU kernel
-        be = _get_backend(P_nzval)
-        A_nzval_cpu = A_on_gpu ? Array(A_nzval) : A_nzval
-        kernel! = _p_standard_update_kernel!(be, block_size)
-        kernel!(P_nzval, A_nzval_cpu, entry_type,
-                std_direct_numer_idx, std_fine_offsets,
-                std_a_ik, std_a_kJ, std_diag_k,
-                std_a_ki, std_sum_offsets, std_sum_indices,
-                std_d_base_offsets, std_d_base_entries; ndrange=nnz_P)
-        _synchronize(be)
-    end
+    be = _get_backend(P_nzval)
+    kernel! = _p_standard_update_kernel!(be, block_size)
+    kernel!(P_nzval, A_nzval_dev, entry_type,
+            std_direct_numer_idx, std_fine_offsets,
+            std_a_ik, std_a_kJ, std_diag_k,
+            std_a_ki, std_sum_offsets, std_sum_indices,
+            std_d_base_offsets, std_d_base_entries; ndrange=nnz_P)
+    _synchronize(be)
     
     return true  # Success
 end
@@ -2229,8 +2203,9 @@ The formula is: P[k] = -numerator / d_i where:
 end
 
 """
-Compute Extended+i interpolation P values using GPU kernel.
-Returns true if GPU kernel was used successfully, false to fall back to CPU.
+Compute Extended+i interpolation P values using a KA kernel.
+The map arrays are assumed to already reside on the same device as `P_nzval`.
+Returns true if kernel data was available, false to fall back to CPU implementation.
 """
 function _extendedi_interp_compute_values!(P_nzval::AbstractVector{Tv}, A_nzval::AbstractVector{Tv},
                                            P_update_map::ProlongationUpdateMap{Ti, Tv2};
@@ -2238,7 +2213,7 @@ function _extendedi_interp_compute_values!(P_nzval::AbstractVector{Tv}, A_nzval:
     nnz_P = length(P_nzval)
     nnz_P == 0 && return true  # Empty P is considered success
     
-    # Get GPU kernel data
+    # Get kernel data (already on the correct device)
     entry_type = P_update_map.entry_type
     extd_direct_a_idx = P_update_map.extd_direct_a_idx
     extd_fine_offsets = P_update_map.extd_fine_offsets
@@ -2253,53 +2228,24 @@ function _extendedi_interp_compute_values!(P_nzval::AbstractVector{Tv}, A_nzval:
     extd_d_base_offsets = P_update_map.extd_d_base_offsets
     extd_d_base_entries = P_update_map.extd_d_base_entries
     
-    # Check if GPU kernel data is available
+    # Check if kernel data is available
     if isempty(extd_direct_a_idx) || isempty(extd_p_col)
         return false  # Fall back to CPU implementation
     end
     
-    P_on_gpu = !(P_nzval isa Array)
-    A_on_gpu = !(A_nzval isa Array)
+    # Ensure A values are on the same device as P
+    A_nzval_dev = _match_device(P_nzval, A_nzval)
     
-    if P_on_gpu
-        # P is on GPU: convert update map arrays to GPU and use GPU kernel
-        be = _get_backend(P_nzval)
-        # Convert A values to GPU if needed
-        A_nzval_gpu = A_on_gpu ? A_nzval : begin
-            tmp = similar(P_nzval, eltype(A_nzval), length(A_nzval))
-            copyto!(tmp, A_nzval)
-            tmp
-        end
-        # Helper to convert array to GPU
-        _copy_to_gpu(arr) = begin
-            tmp = similar(P_nzval, eltype(arr), length(arr))
-            copyto!(tmp, arr)
-            tmp
-        end
-        
-        kernel! = _p_extendedi_update_kernel!(be, block_size)
-        kernel!(P_nzval, A_nzval_gpu, _copy_to_gpu(entry_type),
-                _copy_to_gpu(extd_direct_a_idx), _copy_to_gpu(extd_fine_offsets),
-                _copy_to_gpu(extd_a_ik), _copy_to_gpu(extd_diag_k),
-                _copy_to_gpu(extd_sum_offsets), _copy_to_gpu(extd_sum_indices),
-                _copy_to_gpu(extd_contrib_offsets), _copy_to_gpu(extd_contrib_a_idx),
-                _copy_to_gpu(extd_contrib_p_col), _copy_to_gpu(extd_p_col),
-                _copy_to_gpu(extd_d_base_offsets), _copy_to_gpu(extd_d_base_entries); ndrange=nnz_P)
-        _synchronize(be)
-    else
-        # P is on CPU: use CPU kernel
-        be = _get_backend(P_nzval)
-        A_nzval_cpu = A_on_gpu ? Array(A_nzval) : A_nzval
-        kernel! = _p_extendedi_update_kernel!(be, block_size)
-        kernel!(P_nzval, A_nzval_cpu, entry_type,
-                extd_direct_a_idx, extd_fine_offsets,
-                extd_a_ik, extd_diag_k,
-                extd_sum_offsets, extd_sum_indices,
-                extd_contrib_offsets, extd_contrib_a_idx,
-                extd_contrib_p_col, extd_p_col,
-                extd_d_base_offsets, extd_d_base_entries; ndrange=nnz_P)
-        _synchronize(be)
-    end
+    be = _get_backend(P_nzval)
+    kernel! = _p_extendedi_update_kernel!(be, block_size)
+    kernel!(P_nzval, A_nzval_dev, entry_type,
+            extd_direct_a_idx, extd_fine_offsets,
+            extd_a_ik, extd_diag_k,
+            extd_sum_offsets, extd_sum_indices,
+            extd_contrib_offsets, extd_contrib_a_idx,
+            extd_contrib_p_col, extd_p_col,
+            extd_d_base_offsets, extd_d_base_entries; ndrange=nnz_P)
+    _synchronize(be)
     
     return true  # Success
 end

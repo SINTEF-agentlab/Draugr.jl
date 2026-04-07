@@ -254,5 +254,8 @@ end
 Compute a safe threshold for near-zero checks: eps(Tv) * max(1, scale).
 """
 function _safe_threshold(::Type{Tv}, scale::Real) where Tv
-    return eps(real(Tv)) * max(one(real(Tv)), convert(real(Tv), scale))
+    # For block types (e.g. SMatrix), real(eltype(Tv)) gives the scalar float type.
+    # For scalar types (e.g. Float64), eltype(Float64) == Float64.
+    Ts = real(eltype(Tv))
+    return eps(Ts) * max(one(Ts), convert(Ts, scale))
 end

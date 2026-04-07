@@ -474,8 +474,6 @@ end
 # Block smoother tests (SMatrix entries, SVector rhs)
 # ══════════════════════════════════════════════════════════════════════════
 
-using StaticArrays
-
 """
 Build a 2×2 block version of the 1-D Poisson matrix on n (block-)nodes.
 The entry type is SMatrix{2,2,Float64,4}; entries are block-diagonal:

@@ -197,15 +197,19 @@ abstract type AbstractSmoother end
 
 # ── Smoother types ────────────────────────────────────────────────────────────
 """
-    JacobiSmoother{Tv, V}
+    JacobiSmoother{Tv, Tx, Tω, Vi, Vx}
 
-Weighted Jacobi smoother.  Stores the inverse diagonal and a workspace vector.
-Vector type `V` matches the device (CPU `Vector` or GPU array type).
+Weighted Jacobi smoother.  `Tv` is the matrix entry type (e.g. `Float64` for
+scalars, `SMatrix{B,B,T}` for block systems).  `Tx` is the solution-vector
+element type (same as `Tv` for scalars, `SVector{B,T}` for block systems).
+`Vi` and `Vx` are the matching AbstractVector subtypes (device-aware).
 """
-mutable struct JacobiSmoother{Tv, V<:AbstractVector{Tv}} <: AbstractSmoother
-    invdiag::V
-    tmp::V
-    ω::Tv      # damping factor
+mutable struct JacobiSmoother{Tv, Tx, Tω<:Real,
+                               Vi<:AbstractVector{Tv},
+                               Vx<:AbstractVector{Tx}} <: AbstractSmoother
+    invdiag::Vi   # inv(diag(A)): element type Tv (SMatrix for block)
+    tmp::Vx       # double-buffer for x: element type Tx (SVector for block)
+    ω::Tω         # damping factor (always a real scalar)
 end
 
 """
@@ -270,73 +274,89 @@ mutable struct L1SerialGaussSeidelSmoother{Tv, Ti} <: AbstractSmoother
 end
 
 """
-    SPAI0Smoother{Tv, V}
+    SPAI0Smoother{Tv, Tx, Vm, Vx}
 
 SPAI(0) smoother: diagonal sparse approximate inverse. M ≈ diag(A)⁻¹ where
 M[i,i] = A[i,i] / (A[i,:] ⋅ A[:,i]).  This is the minimizer of ‖I - M*A‖_F
 restricted to diagonal M.
+
+`Tv` is the matrix/diagonal entry type; `Tx` is the solution-vector element type.
 """
-mutable struct SPAI0Smoother{Tv, V<:AbstractVector{Tv}} <: AbstractSmoother
-    m_diag::V         # diagonal of sparse approximate inverse
-    tmp::V            # workspace
+mutable struct SPAI0Smoother{Tv, Tx,
+                              Vm<:AbstractVector{Tv},
+                              Vx<:AbstractVector{Tx}} <: AbstractSmoother
+    m_diag::Vm        # diagonal of sparse approximate inverse (element type Tv)
+    tmp::Vx           # workspace / double-buffer for x (element type Tx)
 end
 
 """
-    SPAI1Smoother{Tv, Ti}
+    SPAI1Smoother{Tv, Ti, Vnz, Vx}
 
 SPAI(1) smoother: sparse approximate inverse using the sparsity pattern of A.
 For each row i, computes the least-squares optimal sparse vector m_i such that
 ‖e_i - A * m_i‖₂ is minimized subject to sparsity(m_i) ⊆ sparsity(A[i,:]).
 The result is stored in CSR format matching A's sparsity.
 
-The `nzval` and `tmp` arrays are stored on the same device as the matrix so
-that the apply kernels can run on GPU without host/device mixing.
+`Tv` is the matrix entry type; `Tx` is the solution-vector element type.
+The `nzval` array is on the same device as the matrix; `tmp` matches `x`/`b`.
 """
-mutable struct SPAI1Smoother{Tv, Ti, V<:AbstractVector{Tv}} <: AbstractSmoother
-    nzval::V          # nonzero values of the approximate inverse (same pattern as A)
-    tmp::V            # workspace
+mutable struct SPAI1Smoother{Tv, Ti, Tx,
+                              Vnz<:AbstractVector{Tv},
+                              Vx<:AbstractVector{Tx}} <: AbstractSmoother
+    nzval::Vnz        # nonzero values of the approximate inverse (same pattern as A)
+    tmp::Vx           # workspace / double-buffer for residual (element type Tx)
 end
 
 """
-    L1JacobiSmoother{Tv, V}
+    L1JacobiSmoother{Tv, Tx, Tω, Vi, Vx}
 
 l1-Jacobi smoother: uses l1 row norms for diagonal scaling instead of just the
 diagonal entry.  More robust for matrices with large off-diagonal entries.
 m[i] = ω / (|a_{i,i}| + Σ_{j≠i} |a_{i,j}|)
+
+`Tv` is the matrix entry type; `Tx` is the solution-vector element type.
 """
-mutable struct L1JacobiSmoother{Tv, V<:AbstractVector{Tv}} <: AbstractSmoother
-    invdiag::V        # 1 / l1_row_norm
-    tmp::V
-    ω::Tv
+mutable struct L1JacobiSmoother{Tv, Tx, Tω<:Real,
+                                 Vi<:AbstractVector{Tv},
+                                 Vx<:AbstractVector{Tx}} <: AbstractSmoother
+    invdiag::Vi   # (1/l1_norm)*I: element type Tv (SMatrix for block)
+    tmp::Vx       # double-buffer for x: element type Tx (SVector for block)
+    ω::Tω         # damping factor (always a real scalar)
 end
 
 """
-    ChebyshevSmoother{Tv, V}
+    ChebyshevSmoother{Tv, Tx, Tλ, Vi, Vx}
 
 Chebyshev polynomial smoother. Uses eigenvalue estimates to construct an optimal
 polynomial iteration. Good for SPD problems. Does not require explicit diagonal info.
+
+`Tv` is the matrix entry type; `Tx` is the solution-vector element type.
+`invdiag` has element type `Tv`; `tmp1`/`tmp2` have element type `Tx`.
 """
-mutable struct ChebyshevSmoother{Tv, V<:AbstractVector{Tv}} <: AbstractSmoother
-    invdiag::V       # inverse diagonal (for preconditioning)
-    tmp1::V
-    tmp2::V
-    λ_min::Tv                 # estimated min eigenvalue
-    λ_max::Tv                 # estimated max eigenvalue
-    degree::Int               # polynomial degree
+mutable struct ChebyshevSmoother{Tv, Tx, Tλ<:Real,
+                                  Vi<:AbstractVector{Tv},
+                                  Vx<:AbstractVector{Tx}} <: AbstractSmoother
+    invdiag::Vi       # inverse diagonal: element type Tv (SMatrix for block)
+    tmp1::Vx          # workspace 1: element type Tx (SVector for block)
+    tmp2::Vx          # workspace 2: element type Tx (SVector for block)
+    λ_min::Tλ         # estimated min eigenvalue (always a real scalar)
+    λ_max::Tλ         # estimated max eigenvalue (always a real scalar)
+    degree::Int       # polynomial degree
 end
 
 """
-    ILU0Smoother{Tv, Ti}
+    ILU0Smoother{Tv, Ti, Tx}
 
 Parallel ILU(0) smoother. Computes an incomplete LU factorization with the same
 sparsity pattern as A, then applies forward/backward substitution using level
 scheduling for parallelism.
 
+`Tv` is the matrix/factorization entry type; `Tx` is the solution-vector element type.
 The factorization data is always stored on CPU since ILU factorization and
 triangular solves require sequential scalar indexing. The apply step copies
 vectors to/from CPU as needed for GPU matrices.
 """
-mutable struct ILU0Smoother{Tv, Ti} <: AbstractSmoother
+mutable struct ILU0Smoother{Tv, Ti, Tx} <: AbstractSmoother
     L_nzval::Vector{Tv}       # strictly lower triangle values (same pattern positions as A)
     U_nzval::Vector{Tv}       # upper triangle + diagonal values
     diag_idx::Vector{Ti}      # index of diagonal in each row's nzrange
@@ -344,24 +364,25 @@ mutable struct ILU0Smoother{Tv, Ti} <: AbstractSmoother
     level_offsets::Vector{Int} # [fwd_offsets..., bwd_offsets...] concatenated
     fwd_order::Vector{Ti}     # rows sorted by forward level
     num_fwd_levels::Int       # number of forward levels
-    tmp::Vector{Tv}
+    tmp::Vector{Tx}           # workspace: element type Tx (SVector for block)
     A_cpu::CSRMatrix{Tv, Ti}  # CPU copy of A's structure for sequential triangular solves
 end
 
 """
-    SerialILU0Smoother{Tv, Ti}
+    SerialILU0Smoother{Tv, Ti, Tx}
 
 Serial ILU(0) smoother. Computes an incomplete LU factorization with the same
 sparsity pattern as A, then applies plain sequential forward/backward
 substitution without graph coloring or parallelism.
 
+`Tv` is the matrix/factorization entry type; `Tx` is the solution-vector element type.
 All data is stored on CPU. For GPU arrays, copies data to/from CPU as needed.
 """
-mutable struct SerialILU0Smoother{Tv, Ti} <: AbstractSmoother
+mutable struct SerialILU0Smoother{Tv, Ti, Tx} <: AbstractSmoother
     L_nzval::Vector{Tv}       # strictly lower triangle values (same pattern positions as A)
     U_nzval::Vector{Tv}       # upper triangle + diagonal values
     diag_idx::Vector{Ti}      # index of diagonal in each row's nzrange
-    tmp::Vector{Tv}
+    tmp::Vector{Tx}           # workspace: element type Tx (SVector for block)
     A_cpu::CSRMatrix{Tv, Ti}  # CPU copy of A's structure for sequential triangular solves
 end
 

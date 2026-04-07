@@ -13,17 +13,28 @@ _entry_norm(v) = sqrt(real(LinearAlgebra.dot(v, v)))
 _is_finite_entry(v::Number) = isfinite(v)
 _is_finite_entry(v) = all(isfinite, v)
 
+# Return the scalar real floating-point type underlying Tv.
+# For scalars (e.g. Float64, ComplexF64): real(eltype(Float64)) = Float64.
+# For block entries (e.g. SMatrix{2,2,Float64,4}): eltype gives Float64, real(Float64) = Float64.
+@inline _scalar_real_type(::Type{T}) where T = real(eltype(T))
+
+# Return the block size (number of rows) of a single entry of type Tv.
+# For scalars, block size is 1 (size(0.0, 1) == 1 in Julia).
+# For SMatrix{B,B,...}, block size is B.
+@inline _block_size(::Type{T}) where T = size(zero(T), 1)
+
 """
     build_jacobi_smoother(A, ω)
 
 Build a weighted Jacobi smoother from matrix `A` with damping `ω`.
 """
-function build_jacobi_smoother(A::CSRMatrix{Tv, Ti}, ω::Real) where {Tv, Ti}
+function build_jacobi_smoother(A::CSRMatrix{Tv, Ti}, ω::Real;
+                               x_eltype::Type{Tx}=Tv) where {Tv, Ti, Tx}
     n = size(A, 1)
     invdiag = _allocate_undef_vector(A, Tv, n)
     compute_inverse_diagonal!(invdiag, A)
-    tmp = _allocate_vector(A, Tv, n)
-    return JacobiSmoother(invdiag, tmp, Tv(ω))
+    tmp = _allocate_vector(A, Tx, n)
+    return JacobiSmoother(invdiag, tmp, ω)
 end
 
 """
@@ -47,8 +58,10 @@ end
 @kernel function invdiag_kernel!(invdiag, @Const(nzval), @Const(colval), @Const(rp))
     i = @index(Global)
     @inbounds begin
-        diag_val = zero(eltype(invdiag))
-        row_norm = zero(real(eltype(invdiag)))
+        Tv = eltype(invdiag)
+        Ts = _scalar_real_type(Tv)
+        diag_val = zero(Tv)
+        row_norm = zero(Ts)
         for nz in rp[i]:(rp[i+1]-1)
             row_norm += _entry_norm(nzval[nz])
             if colval[nz] == i
@@ -57,8 +70,8 @@ end
         end
         # Safe inverse: avoid Inf/NaN for zero or near-zero diagonals
         abs_d = _entry_norm(diag_val)
-        threshold = eps(real(eltype(invdiag))) * max(one(real(eltype(invdiag))), row_norm)
-        invdiag[i] = abs_d > threshold ? inv(diag_val) : zero(eltype(invdiag))
+        threshold = eps(Ts) * max(one(Ts), row_norm)
+        invdiag[i] = abs_d > threshold ? inv(diag_val) : zero(Tv)
     end
 end
 
@@ -327,6 +340,7 @@ Function barrier for computing inverse diagonal. Takes concrete array types
 as arguments to ensure type stability in the inner loop.
 """
 function _serial_gs_compute_invdiag!(invdiag::Vector{Tv}, nzv, cv, rp, n::Int) where {Tv}
+    Ts = _scalar_real_type(Tv)
     @inbounds for i in 1:n
         d = zero(Tv)
         for nz in rp[i]:(rp[i+1]-1)
@@ -336,7 +350,7 @@ function _serial_gs_compute_invdiag!(invdiag::Vector{Tv}, nzv, cv, rp, n::Int) w
             end
         end
         abs_d = _entry_norm(d)
-        invdiag[i] = abs_d > eps(real(Tv)) ? inv(d) : zero(Tv)
+        invdiag[i] = abs_d > eps(Ts) ? inv(d) : zero(Tv)
     end
     return invdiag
 end
@@ -439,12 +453,15 @@ end
 Compute inverse l1 row norms for serial L1 GS smoother.
 """
 function _serial_l1_gs_compute_invdiag!(invdiag::Vector{Tv}, nzv, cv, rp, n::Int) where {Tv}
+    Ts = _scalar_real_type(Tv)
     @inbounds for i in 1:n
-        l1_norm = zero(real(Tv))
+        l1_norm = zero(Ts)
         for nz in rp[i]:(rp[i+1]-1)
             l1_norm += _entry_norm(nzv[nz])
         end
-        invdiag[i] = l1_norm > eps(real(Tv)) ? inv(l1_norm) : zero(Tv)
+        # For block matrices, one(Tv)/l1_norm == (1/l1_norm)*I_B,
+        # so invdiag[i]*r gives (1/l1_norm)*r for any block vector r.
+        invdiag[i] = l1_norm > eps(Ts) ? one(Tv) / l1_norm : zero(Tv)
     end
     return invdiag
 end
@@ -501,11 +518,12 @@ Build an SPAI(0) smoother.  For each row i, the diagonal entry is:
   m[i] = a[i,i] / ‖A[i,:]‖₂²
 This minimizes ‖e_i - m[i]*A[i,:]‖₂.
 """
-function build_spai0_smoother(A::CSRMatrix{Tv, Ti}) where {Tv, Ti}
+function build_spai0_smoother(A::CSRMatrix{Tv, Ti};
+                              x_eltype::Type{Tx}=Tv) where {Tv, Ti, Tx}
     n = size(A, 1)
     m_diag = _allocate_undef_vector(A, Tv, n)
     _compute_spai0!(m_diag, A)
-    tmp = _allocate_vector(A, Tv, n)
+    tmp = _allocate_vector(A, Tx, n)
     return SPAI0Smoother(m_diag, tmp)
 end
 
@@ -524,8 +542,10 @@ end
 @kernel function spai0_kernel!(m_diag, @Const(nzval), @Const(colval), @Const(rp))
     i = @index(Global)
     @inbounds begin
-        diag_val = zero(eltype(m_diag))
-        row_norm_sq = zero(real(eltype(nzval)))
+        Tv = eltype(m_diag)
+        Ts = _scalar_real_type(Tv)
+        diag_val = zero(Tv)
+        row_norm_sq = zero(Ts)
         for nz in rp[i]:(rp[i+1]-1)
             v = nzval[nz]
             row_norm_sq += _frobenius_norm2(v)
@@ -533,7 +553,7 @@ end
                 diag_val = v
             end
         end
-        m_diag[i] = row_norm_sq > zero(row_norm_sq) ? diag_val / row_norm_sq : zero(eltype(m_diag))
+        m_diag[i] = row_norm_sq > zero(Ts) ? diag_val / row_norm_sq : zero(Tv)
     end
 end
 
@@ -595,30 +615,46 @@ m_i that minimizes ‖e_i - A^T * m_i‖₂ with sparsity(m_i) ⊆ sparsity(A[i,
 
 This is stored in the same CSR pattern as A but with modified values.
 """
-function build_spai1_smoother(A::CSRMatrix{Tv, Ti}) where {Tv, Ti}
+function build_spai1_smoother(A::CSRMatrix{Tv, Ti};
+                              x_eltype::Type{Tx}=Tv) where {Tv, Ti, Tx}
     n = size(A, 1)
     A_cpu = csr_to_cpu(A)
     nzval_m = Vector{Tv}(undef, nnz(A))
     _compute_spai1!(nzval_m, A_cpu)
     # Copy nzval to device if needed
     nzval_dev = A.nzval isa Array ? nzval_m : _to_device(A, nzval_m)
-    tmp = _allocate_vector(A, Tv, n)
-    return SPAI1Smoother{Tv, Ti, typeof(nzval_dev)}(nzval_dev, tmp)
+    tmp = _allocate_vector(A, Tx, n)
+    return SPAI1Smoother{Tv, Ti, Tx, typeof(nzval_dev), typeof(tmp)}(nzval_dev, tmp)
 end
 
 """
     _compute_spai1!(nzval_m, A)
 
-Compute SPAI(1) values. For each row i, we solve the small least-squares problem:
-  min_{m_i} ‖e_i - A^T m_i‖₂²
-where m_i has support on the sparsity pattern of A[i,:].
-
-For efficiency, we compute this row-by-row using the normal equations:
-  (A_J^T A_J) m_i = A_J^T e_i = A[:,i][J]
-where J = {columns in row i of A} and A_J = A[:, J] restricted to rows that
-intersect with columns of row i.
+Compute SPAI(1) values. For scalar matrices (`Tv <: Number`), solves a small
+k×k least-squares system per row. For block matrices (e.g. `SMatrix` entries),
+reformulates as a kB×kB scalar system and solves B right-hand sides at once,
+where B is the block size.
 """
 function _compute_spai1!(nzval_m::Vector{Tv}, A::CSRMatrix{Tv, Ti}) where {Tv, Ti}
+    B = _block_size(Tv)
+    if B == 1
+        _compute_spai1_scalar!(nzval_m, A)
+    else
+        _compute_spai1_block!(nzval_m, A, B)
+    end
+    return nzval_m
+end
+
+"""
+    _compute_spai1_scalar!(nzval_m, A)
+
+SPAI(1) for scalar (non-block) entry types. For each row i, solves the small
+least-squares problem:
+  min_{m_i} ‖e_i - A^T m_i‖₂²
+where m_i has support on the sparsity pattern of A[i,:].
+"""
+function _compute_spai1_scalar!(nzval_m::Vector{Tv}, A::CSRMatrix{Tv, Ti}) where {Tv, Ti}
+    Ts = _scalar_real_type(Tv)
     n = size(A, 1)
     nzv = nonzeros(A)
     cv = colvals(A)
@@ -633,15 +669,9 @@ function _compute_spai1!(nzval_m::Vector{Tv}, A::CSRMatrix{Tv, Ti}) where {Tv, T
         J = cv[rng_i]
         # Build the small k×k Gram matrix G = (A_J)^T (A_J)
         # where A_J are the columns of A indexed by J
-        # G[p,q] = A[:,J[p]]' * A[:,J[q]] = sum_r A[r,J[p]] * A[r,J[q]]
-        # For CSR, A[r,j] requires scanning row r for column j.
-        # We compute G by iterating over rows of A that touch columns in J.
+        # G[p,q] = A[:,J[p]]' * A[:,J[q]] = sum_r A[r,J[p]] * conj(A[r,J[q]])
         G = zeros(Tv, k, k)
         rhs = zeros(Tv, k)
-        # For each column j in J, we need to find which rows r have A[r,j] != 0
-        # In CSR, this means finding rows where j appears in the column list.
-        # For efficiency with CSR, compute G[p,q] = sum over rows r of A[r,J[p]]*A[r,J[q]]
-        # We iterate over all rows and accumulate.
         # Build a map: column index -> local index in J
         col_to_local = Dict{Ti, Int}()
         for (p, j) in enumerate(J)
@@ -650,7 +680,6 @@ function _compute_spai1!(nzval_m::Vector{Tv}, A::CSRMatrix{Tv, Ti}) where {Tv, T
         # Iterate over all rows
         for r in 1:n
             rng_r = rp[r]:(rp[r+1]-1)
-            # Collect entries in this row that hit columns in J
             local_entries = Tuple{Int, Tv}[]
             for nz in rng_r
                 c = cv[nz]
@@ -659,13 +688,10 @@ function _compute_spai1!(nzval_m::Vector{Tv}, A::CSRMatrix{Tv, Ti}) where {Tv, T
                 end
             end
             isempty(local_entries) && continue
-            # Accumulate into G
             for (p, vp) in local_entries
                 for (q, vq) in local_entries
                     G[p, q] += vp * vq
                 end
-                # RHS: A[:,i][J[p]] evaluated at row r, but we want (A^T e_i)[J[p]] = A[i, J[p]]
-                # Actually, rhs[p] = (A^T e_i)_J[p] = A[i, J[p]]
             end
         end
         # RHS: for each local index p, rhs[p] = A[i, J[p]]
@@ -680,7 +706,7 @@ function _compute_spai1!(nzval_m::Vector{Tv}, A::CSRMatrix{Tv, Ti}) where {Tv, T
         # Solve the small system G * m = rhs
         # Add small regularization for stability
         for p in 1:k
-            G[p, p] += eps(Tv) * max(one(Tv), abs(G[p, p]))
+            G[p, p] += eps(Ts) * max(one(Ts), abs(G[p, p]))
         end
         m_local = G \ rhs
         # Store back
@@ -691,10 +717,89 @@ function _compute_spai1!(nzval_m::Vector{Tv}, A::CSRMatrix{Tv, Ti}) where {Tv, T
     return nzval_m
 end
 
-function update_smoother!(smoother::SPAI1Smoother, A::CSRMatrix;
-                          backend=_get_backend(nonzeros(A)), block_size::Int=64)
+"""
+    _compute_spai1_block!(nzval_m, A, B)
+
+SPAI(1) for block entry types (e.g. `SMatrix{B,B,T}`). Reformulates the
+least-squares problem as a scalar kB×kB system with B right-hand sides.
+
+The block SPAI(1) minimises ‖I_B - A^T M_i‖_F² where M_i is a block row
+of B×B matrices. This is equivalent to solving B independent kB-vector problems,
+assembled here as a kB×B matrix solve.
+"""
+function _compute_spai1_block!(nzval_m::Vector{Tv}, A::CSRMatrix{Tv, Ti}, B::Int) where {Tv, Ti}
+    T = eltype(Tv)   # scalar float type
+    n = size(A, 1)
+    nzv = nonzeros(A)
+    cv = colvals(A)
+    rp = rowptr(A)
+    @inbounds for i in 1:n
+        rng_i = rp[i]:(rp[i+1]-1)
+        k = length(rng_i)
+        k == 0 && continue
+        J = cv[rng_i]
+        kB = k * B
+
+        col_to_local = Dict{Ti, Int}()
+        for (p, j) in enumerate(J)
+            col_to_local[j] = p
+        end
+
+        # G_flat[kB×kB]: block Gram matrix (scalar)
+        # G_flat[(p-1)*B+1:p*B, (q-1)*B+1:q*B] = Σ_r A[r,J[p]]' * A[r,J[q]]
+        G_flat = zeros(T, kB, kB)
+        # rhs_flat[kB×B]: rhs_flat[(p-1)*B+1:p*B, :] = A[i, J[p]] (a B×B block)
+        rhs_flat = zeros(T, kB, B)
+
+        # Accumulate Gram matrix over all rows
+        for r in 1:n
+            rng_r = rp[r]:(rp[r+1]-1)
+            local_entries = Tuple{Int, Matrix{T}}[]
+            for nz in rng_r
+                c = cv[nz]
+                if haskey(col_to_local, c)
+                    push!(local_entries, (col_to_local[c], Matrix{T}(Array(nzv[nz]))))
+                end
+            end
+            isempty(local_entries) && continue
+            for (p, Mp) in local_entries
+                for (q, Mq) in local_entries
+                    # G[(p-1)*B+1:p*B, (q-1)*B+1:q*B] += Mp' * Mq
+                    mul!(view(G_flat, (p-1)*B+1:p*B, (q-1)*B+1:q*B), Mp', Mq, one(T), one(T))
+                end
+            end
+        end
+
+        # RHS: for each local index p, rhs_flat[(p-1)*B+1:p*B, :] = A[i, J[p]]^T
+        for (p, j) in enumerate(J)
+            for nz in rng_i
+                if cv[nz] == j
+                    rhs_flat[(p-1)*B+1:p*B, :] = Matrix{T}(Array(nzv[nz]))'
+                    break
+                end
+            end
+        end
+
+        # Add small regularization for stability (scalar diagonal)
+        for α in 1:kB
+            G_flat[α, α] += eps(T) * max(one(T), abs(G_flat[α, α]))
+        end
+
+        # Solve: G_flat * M_local = rhs_flat  →  M_local is kB × B
+        M_local = G_flat \ rhs_flat
+
+        # Store back: the p-th block is M_local[(p-1)*B+1:p*B, :] (a B×B matrix)
+        for (p, nz) in enumerate(rng_i)
+            nzval_m[nz] = Tv(M_local[(p-1)*B+1:p*B, :])
+        end
+    end
+    return nzval_m
+end
+
+function update_smoother!(smoother::SPAI1Smoother{Tv}, A::CSRMatrix;
+                          backend=_get_backend(nonzeros(A)), block_size::Int=64) where Tv
     A_cpu = csr_to_cpu(A)
-    nzval_cpu = Vector{eltype(smoother.nzval)}(undef, nnz(A))
+    nzval_cpu = Vector{Tv}(undef, nnz(A))
     _compute_spai1!(nzval_cpu, A_cpu)
     copyto!(smoother.nzval, nzval_cpu)
     return smoother
@@ -763,20 +868,23 @@ end
 # Smoother dispatch based on SmootherType config
 # ══════════════════════════════════════════════════════════════════════════════
 
-function build_smoother(A::CSRMatrix, ::JacobiSmootherType, ω::Real; backend=DEFAULT_BACKEND, block_size::Int=64)
-    return build_jacobi_smoother(A, ω)
+function build_smoother(A::CSRMatrix{Tv, Ti}, ::JacobiSmootherType, ω::Real; backend=DEFAULT_BACKEND, block_size::Int=64,
+                        x_eltype::Type=Tv) where {Tv, Ti}
+    return build_jacobi_smoother(A, ω; x_eltype=x_eltype)
 end
 
 function build_smoother(A::CSRMatrix, ::ColoredGaussSeidelType, ω::Real; backend=DEFAULT_BACKEND, block_size::Int=64)
     return build_colored_gs_smoother(A)
 end
 
-function build_smoother(A::CSRMatrix, ::SPAI0SmootherType, ω::Real; backend=DEFAULT_BACKEND, block_size::Int=64)
-    return build_spai0_smoother(A)
+function build_smoother(A::CSRMatrix{Tv, Ti}, ::SPAI0SmootherType, ω::Real; backend=DEFAULT_BACKEND, block_size::Int=64,
+                        x_eltype::Type=Tv) where {Tv, Ti}
+    return build_spai0_smoother(A; x_eltype=x_eltype)
 end
 
-function build_smoother(A::CSRMatrix, ::SPAI1SmootherType, ω::Real; backend=DEFAULT_BACKEND, block_size::Int=64)
-    return build_spai1_smoother(A)
+function build_smoother(A::CSRMatrix{Tv, Ti}, ::SPAI1SmootherType, ω::Real; backend=DEFAULT_BACKEND, block_size::Int=64,
+                        x_eltype::Type=Tv) where {Tv, Ti}
+    return build_spai1_smoother(A; x_eltype=x_eltype)
 end
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -792,12 +900,13 @@ m[i] = ω / (|a_{i,i}| + Σ_{j≠i} |a_{i,j}|)
 More robust than standard Jacobi for matrices with large off-diagonal entries,
 near-zero diagonals, or wrong-sign off-diagonals.
 """
-function build_l1jacobi_smoother(A::CSRMatrix{Tv, Ti}, ω::Real) where {Tv, Ti}
+function build_l1jacobi_smoother(A::CSRMatrix{Tv, Ti}, ω::Real;
+                                 x_eltype::Type{Tx}=Tv) where {Tv, Ti, Tx}
     n = size(A, 1)
     invdiag = _allocate_undef_vector(A, Tv, n)
     _compute_l1_invdiag!(invdiag, A)
-    tmp = _allocate_vector(A, Tv, n)
-    return L1JacobiSmoother(invdiag, tmp, Tv(ω))
+    tmp = _allocate_vector(A, Tx, n)
+    return L1JacobiSmoother(invdiag, tmp, ω)
 end
 
 function _compute_l1_invdiag!(invdiag::AbstractVector{Tv},
@@ -816,13 +925,15 @@ end
 @kernel function l1_invdiag_kernel!(invdiag, @Const(nzval), @Const(colval), @Const(rp))
     i = @index(Global)
     @inbounds begin
-        l1_norm = zero(real(eltype(invdiag)))
+        Tv = eltype(invdiag)
+        Ts = _scalar_real_type(Tv)
+        l1_norm = zero(Ts)
         for nz in rp[i]:(rp[i+1]-1)
             l1_norm += _entry_norm(nzval[nz])
         end
-        # Safe inverse: for scalars inv(l1_norm) is 1/l1_norm,
-        # for block systems this gives a scalar inverse which scales the identity.
-        invdiag[i] = l1_norm > eps(real(eltype(invdiag))) ? inv(l1_norm) : zero(eltype(invdiag))
+        # For block matrices, store (1/l1_norm)*I so that invdiag[i]*r gives (1/l1_norm)*r.
+        # For scalars, one(Tv)/l1_norm == 1/l1_norm (a scalar).
+        invdiag[i] = l1_norm > eps(Ts) ? one(Tv) / l1_norm : zero(Tv)
     end
 end
 
@@ -853,8 +964,9 @@ function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
     return x
 end
 
-function build_smoother(A::CSRMatrix, ::L1JacobiSmootherType, ω::Real; backend=DEFAULT_BACKEND, block_size::Int=64)
-    return build_l1jacobi_smoother(A, ω)
+function build_smoother(A::CSRMatrix{Tv, Ti}, ::L1JacobiSmootherType, ω::Real; backend=DEFAULT_BACKEND, block_size::Int=64,
+                        x_eltype::Type=Tv) where {Tv, Ti}
+    return build_l1jacobi_smoother(A, ω; x_eltype=x_eltype)
 end
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -864,26 +976,57 @@ end
 """
     _estimate_spectral_radius(A, invdiag; niter=10)
 
-Estimate the spectral radius of D⁻¹A using power iteration.
+Estimate the spectral radius of D⁻¹A using power iteration for scalar matrices,
+or a Gershgorin row-sum upper bound for block matrices.
+
+For scalar matrices (`Tv <: Number`): uses power iteration with a random scalar
+vector. The multiplication order `invdiag[i] * w[i]` is used explicitly to handle
+block types where multiplication is non-commutative (for scalars this is equivalent
+to the previous `w[i] * invdiag[i]`).
+
+For block matrices: uses max_i (‖D_i^{-1}‖_F · Σ_j ‖A_{i,j}‖_F) as a
+Gershgorin-like upper bound on the spectral radius.
 """
 function _estimate_spectral_radius(A::CSRMatrix{Tv, Ti},
                                    invdiag::Vector{Tv}; niter::Int=10) where {Tv, Ti}
-    n = size(A, 1)
-    v = randn(Tv, n)
-    v ./= norm(v)
-    w = similar(v)
-    λ = one(Tv)
-    for _ in 1:niter
-        mul!(w, A, v)
+    Ts = _scalar_real_type(Tv)
+    if Tv <: Number
+        # Scalar path: standard power iteration
+        n = size(A, 1)
+        v = randn(Tv, n)
+        v ./= norm(v)
+        w = similar(v)
+        λ = one(Ts)
+        for _ in 1:niter
+            mul!(w, A, v)
+            @inbounds for i in 1:n
+                # Use left-multiplication so the order is correct for block types.
+                # For scalars this is identical to w[i] *= invdiag[i].
+                w[i] = invdiag[i] * w[i]
+            end
+            λ = norm(w)
+            if λ > eps(Ts)
+                v .= w ./ λ
+            end
+        end
+        return real(λ)
+    else
+        # Block path: Gershgorin row-sum upper bound
+        n = size(A, 1)
+        nzv = nonzeros(A)
+        cv = colvals(A)
+        rp = rowptr(A)
+        ρ = zero(Ts)
         @inbounds for i in 1:n
-            w[i] *= invdiag[i]
+            d_inv_norm = _entry_norm(invdiag[i])
+            row_sum = zero(Ts)
+            for nz in rp[i]:(rp[i+1]-1)
+                row_sum += _entry_norm(nzv[nz])
+            end
+            ρ = max(ρ, d_inv_norm * row_sum)
         end
-        λ = norm(w)
-        if λ > eps(Tv)
-            v .= w ./ λ
-        end
+        return ρ
     end
-    return real(λ)
 end
 
 """
@@ -893,7 +1036,8 @@ Build a Chebyshev polynomial smoother. Estimates eigenvalues of D⁻¹A and
 constructs a degree-`degree` Chebyshev iteration.
 """
 function build_chebyshev_smoother(A::CSRMatrix{Tv, Ti};
-                                  degree::Int=3) where {Tv, Ti}
+                                  degree::Int=3,
+                                  x_eltype::Type{Tx}=Tv) where {Tv, Ti, Tx}
     n = size(A, 1)
     invdiag = _allocate_undef_vector(A, Tv, n)
     compute_inverse_diagonal!(invdiag, A)
@@ -902,10 +1046,11 @@ function build_chebyshev_smoother(A::CSRMatrix{Tv, Ti};
     A_cpu = csr_to_cpu(A)
     ρ = _estimate_spectral_radius(A_cpu, invdiag_cpu)
     # Standard Chebyshev bounds for SPD: [ρ/30, 1.1*ρ]
-    λ_max = Tv(1.1) * ρ
-    λ_min = λ_max / Tv(30.0)
-    tmp1 = _allocate_vector(A, Tv, n)
-    tmp2 = _allocate_vector(A, Tv, n)
+    Tλ = _scalar_real_type(Tv)
+    λ_max = Tλ(1.1) * ρ
+    λ_min = λ_max / Tλ(30.0)
+    tmp1 = _allocate_vector(A, Tx, n)
+    tmp2 = _allocate_vector(A, Tx, n)
     return ChebyshevSmoother(invdiag, tmp1, tmp2, λ_min, λ_max, degree)
 end
 
@@ -916,8 +1061,9 @@ function update_smoother!(smoother::ChebyshevSmoother, A::CSRMatrix;
     invdiag_cpu = smoother.invdiag isa Array ? smoother.invdiag : Array(smoother.invdiag)
     A_cpu = csr_to_cpu(A)
     ρ = _estimate_spectral_radius(A_cpu, invdiag_cpu)
-    smoother.λ_max = eltype(smoother.invdiag)(1.1) * ρ
-    smoother.λ_min = smoother.λ_max / eltype(smoother.invdiag)(30.0)
+    Tλ = typeof(smoother.λ_max)
+    smoother.λ_max = Tλ(1.1) * ρ
+    smoother.λ_min = smoother.λ_max / Tλ(30.0)
     return smoother
 end
 
@@ -947,7 +1093,8 @@ Uses KA kernels for GPU compatibility.
 function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
                  smoother::ChebyshevSmoother; steps::Int=1, backend=DEFAULT_BACKEND, block_size::Int=64)
     n = size(A, 1)
-    Tv = eltype(x)
+    # Tλ is always a real scalar type (Float64, etc.), independent of the block structure.
+    Tλ = typeof(smoother.λ_max)
     nzv = nonzeros(A)
     cv = colvals(A)
     rp = rowptr(A)
@@ -965,7 +1112,7 @@ function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
         rkernel!(r, b, x, nzv, cv, rp; ndrange=n)
         _synchronize(backend)
 
-        init_kernel!(d, x, smoother.invdiag, r, Tv(1) / θ; ndrange=n)
+        init_kernel!(d, x, smoother.invdiag, r, one(Tλ) / θ; ndrange=n)
         _synchronize(backend)
 
         # Iterations 1..degree-1 using three-term recurrence
@@ -974,8 +1121,8 @@ function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
             rkernel!(r, b, x, nzv, cv, rp; ndrange=n)
             _synchronize(backend)
 
-            σ_new = one(Tv) / (Tv(2) * θ / δ - σ_old)
-            scale_r = Tv(2) * σ_new / δ
+            σ_new = one(Tλ) / (Tλ(2) * θ / δ - σ_old)
+            scale_r = Tλ(2) * σ_new / δ
             scale_d = σ_new * σ_old
             iter_kernel!(d, x, smoother.invdiag, r, scale_r, scale_d; ndrange=n)
             _synchronize(backend)
@@ -998,8 +1145,9 @@ end
     end
 end
 
-function build_smoother(A::CSRMatrix, ::ChebyshevSmootherType, ω::Real; backend=DEFAULT_BACKEND, block_size::Int=64)
-    return build_chebyshev_smoother(A)
+function build_smoother(A::CSRMatrix{Tv, Ti}, ::ChebyshevSmootherType, ω::Real; backend=DEFAULT_BACKEND, block_size::Int=64,
+                        x_eltype::Type=Tv) where {Tv, Ti}
+    return build_chebyshev_smoother(A; x_eltype=x_eltype)
 end
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1021,18 +1169,19 @@ function _ilu0_factorize!(L_nzval::Vector{Tv}, U_nzval::Vector{Tv},
     nzv = nonzeros(A)
     rp = rowptr(A)
     ti_one = one(Ti)
+    Ts = _scalar_real_type(Tv)
 
     # Copy A values into U
     copyto!(U_nzval, nzv)
     fill!(L_nzval, zero(Tv))
 
     # Maximum factor growth for ILU entries
-    const_max_ilu_factor = Tv(1e8)
+    const_max_ilu_factor = Ts(1e8)
 
     # Precompute row norms to avoid redundant recomputation in inner loop
-    row_norms = Vector{real(Tv)}(undef, n)
+    row_norms = Vector{Ts}(undef, n)
     @inbounds for i in 1:n
-        s = zero(real(Tv))
+        s = zero(Ts)
         for nz in rp[i]:(rp[i+ti_one]-ti_one)
             s += _entry_norm(nzv[nz])
         end
@@ -1043,7 +1192,9 @@ function _ilu0_factorize!(L_nzval::Vector{Tv}, U_nzval::Vector{Tv},
         # Process row i: for each k < i in row i's lower triangle
         for nz in rp[i]:(diag_idx[i]-ti_one)
             k = cv[nz]
-            # L[i,k] = U[i,k] * U[k,k]⁻¹ (right division for block compatibility)
+            # L[i,k] = U[i,k] * U[k,k]^{-1}  (right division: U[i,k] / U[k,k])
+            # This is the correct formula for row-oriented ILU;
+            # for block matrices, `/` computes the right factor: A * inv(B).
             u_kk = U_nzval[diag_idx[k]]
             if _entry_norm(u_kk) < _safe_threshold(Tv, row_norms[k])
                 L_nzval[nz] = zero(Tv)
@@ -1073,7 +1224,7 @@ function _ilu0_factorize!(L_nzval::Vector{Tv}, U_nzval::Vector{Tv},
         u_ii = U_nzval[diag_idx[i]]
         safe_thresh = _safe_threshold(Tv, row_norms[i])
         if _entry_norm(u_ii) < safe_thresh
-            U_nzval[diag_idx[i]] = safe_thresh
+            U_nzval[diag_idx[i]] = safe_thresh * one(Tv)
         end
     end
     return nothing
@@ -1109,7 +1260,8 @@ the same sparsity pattern as A, using plain sequential forward/backward
 substitution (no graph coloring). All factorization data is stored on CPU;
 GPU matrices are automatically converted.
 """
-function build_serial_ilu0_smoother(A::CSRMatrix{Tv, Ti}) where {Tv, Ti}
+function build_serial_ilu0_smoother(A::CSRMatrix{Tv, Ti};
+                                    x_eltype::Type{Tx}=Tv) where {Tv, Ti, Tx}
     A_cpu = csr_to_cpu(A)
     n = size(A_cpu, 1)
     nzv = nonzeros(A_cpu)
@@ -1121,8 +1273,8 @@ function build_serial_ilu0_smoother(A::CSRMatrix{Tv, Ti}) where {Tv, Ti}
     U_nzval = copy(nzv)
     _ilu0_factorize!(L_nzval, U_nzval, diag_idx, A_cpu)
 
-    tmp = zeros(Tv, n)
-    return SerialILU0Smoother{Tv, Ti}(L_nzval, U_nzval, diag_idx, tmp, A_cpu)
+    tmp = zeros(Tx, n)
+    return SerialILU0Smoother{Tv, Ti, Tx}(L_nzval, U_nzval, diag_idx, tmp, A_cpu)
 end
 
 function update_smoother!(smoother::SerialILU0Smoother, A::CSRMatrix;
@@ -1141,7 +1293,7 @@ Uses plain sequential forward/backward substitution on CPU.
 For GPU arrays, copies data to CPU, applies ILU, and copies back.
 """
 function smooth!(x::AbstractVector, A::CSRMatrix{Tv, Ti}, b::AbstractVector,
-                 smoother::SerialILU0Smoother; steps::Int=1, backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
+                 smoother::SerialILU0Smoother{Tv, Ti, Tx}; steps::Int=1, backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti, Tx}
     n = size(A, 1)
     ti_one = one(Ti)
 
@@ -1165,7 +1317,7 @@ function smooth!(x::AbstractVector, A::CSRMatrix{Tv, Ti}, b::AbstractVector,
     for _ in 1:steps
         # Compute residual: tmp = b - A*x (on CPU)
         @inbounds for i in 1:n
-            Ax_i = zero(Tv)
+            Ax_i = zero(Tx)
             for nz in rp[i]:(rp[i+ti_one]-ti_one)
                 j = cv[nz]
                 Ax_i += nzv[nz] * x_cpu[j]
@@ -1188,7 +1340,7 @@ function smooth!(x::AbstractVector, A::CSRMatrix{Tv, Ti}, b::AbstractVector,
                 tmp[i] -= smoother.U_nzval[nz] * tmp[j]
             end
             u_ii = smoother.U_nzval[smoother.diag_idx[i]]
-            tmp[i] = _entry_norm(u_ii) > eps(real(Tv)) ? u_ii \ tmp[i] : zero(Tv)
+            tmp[i] = _entry_norm(u_ii) > eps(_scalar_real_type(Tv)) ? u_ii \ tmp[i] : zero(Tx)
         end
 
         # Update: x += dx (with NaN protection)
@@ -1207,8 +1359,9 @@ function smooth!(x::AbstractVector, A::CSRMatrix{Tv, Ti}, b::AbstractVector,
     return x
 end
 
-function build_smoother(A::CSRMatrix, ::SerialILU0SmootherType, ω::Real; backend=DEFAULT_BACKEND, block_size::Int=64)
-    return build_serial_ilu0_smoother(A)
+function build_smoother(A::CSRMatrix{Tv, Ti}, ::SerialILU0SmootherType, ω::Real; backend=DEFAULT_BACKEND, block_size::Int=64,
+                        x_eltype::Type=Tv) where {Tv, Ti}
+    return build_serial_ilu0_smoother(A; x_eltype=x_eltype)
 end
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1306,7 +1459,8 @@ the same sparsity pattern as A, using level scheduling for parallel forward/back
 substitution. All factorization data is stored on CPU; GPU matrices are
 automatically converted.
 """
-function build_ilu0_smoother(A::CSRMatrix{Tv, Ti}) where {Tv, Ti}
+function build_ilu0_smoother(A::CSRMatrix{Tv, Ti};
+                             x_eltype::Type{Tx}=Tv) where {Tv, Ti, Tx}
     A_cpu = csr_to_cpu(A)
     n = size(A_cpu, 1)
     nzv = nonzeros(A_cpu)
@@ -1322,11 +1476,11 @@ function build_ilu0_smoother(A::CSRMatrix{Tv, Ti}) where {Tv, Ti}
     U_nzval = copy(nzv)
     _ilu0_factorize!(L_nzval, U_nzval, diag_idx, A_cpu)
 
-    tmp = zeros(Tv, n)
+    tmp = zeros(Tx, n)
     # Concatenate forward and backward level offsets for compact storage
     combined_offsets = vcat(fwd_offsets, bwd_offsets)
-    return ILU0Smoother{Tv, Ti}(L_nzval, U_nzval, diag_idx, bwd_order,
-                                 combined_offsets, fwd_order, num_fwd_levels, tmp, A_cpu)
+    return ILU0Smoother{Tv, Ti, Tx}(L_nzval, U_nzval, diag_idx, bwd_order,
+                                     combined_offsets, fwd_order, num_fwd_levels, tmp, A_cpu)
 end
 
 function update_smoother!(smoother::ILU0Smoother, A::CSRMatrix;
@@ -1346,7 +1500,7 @@ the forward/backward substitution phases.
 For GPU arrays, copies data to CPU, applies ILU, and copies back.
 """
 function smooth!(x::AbstractVector, A::CSRMatrix{Tv, Ti}, b::AbstractVector,
-                 smoother::ILU0Smoother; steps::Int=1, backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
+                 smoother::ILU0Smoother{Tv, Ti, Tx}; steps::Int=1, backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti, Tx}
     n = size(A, 1)
     ti_one = one(Ti)
 
@@ -1383,7 +1537,7 @@ function smooth!(x::AbstractVector, A::CSRMatrix{Tv, Ti}, b::AbstractVector,
     for _ in 1:steps
         # Compute residual: tmp = b - A*x (on CPU)
         @inbounds for i in 1:n
-            Ax_i = zero(Tv)
+            Ax_i = zero(Tx)
             for nz in rp[i]:(rp[i+ti_one]-ti_one)
                 j = cv[nz]
                 Ax_i += nzv[nz] * x_cpu[j]
@@ -1417,7 +1571,7 @@ function smooth!(x::AbstractVector, A::CSRMatrix{Tv, Ti}, b::AbstractVector,
                     tmp[i] -= U_nzval[nz] * tmp[j]
                 end
                 u_ii = U_nzval[diag_idx[i]]
-                tmp[i] = _entry_norm(u_ii) > eps(real(Tv)) ? u_ii \ tmp[i] : zero(Tv)
+                tmp[i] = _entry_norm(u_ii) > eps(_scalar_real_type(Tv)) ? u_ii \ tmp[i] : zero(Tx)
             end
         end
 
@@ -1437,8 +1591,9 @@ function smooth!(x::AbstractVector, A::CSRMatrix{Tv, Ti}, b::AbstractVector,
     return x
 end
 
-function build_smoother(A::CSRMatrix, ::ILU0SmootherType, ω::Real; backend=DEFAULT_BACKEND, block_size::Int=64)
-    return build_ilu0_smoother(A)
+function build_smoother(A::CSRMatrix{Tv, Ti}, ::ILU0SmootherType, ω::Real; backend=DEFAULT_BACKEND, block_size::Int=64,
+                        x_eltype::Type=Tv) where {Tv, Ti}
+    return build_ilu0_smoother(A; x_eltype=x_eltype)
 end
 
 # ══════════════════════════════════════════════════════════════════════════════

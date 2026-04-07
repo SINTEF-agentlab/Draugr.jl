@@ -469,3 +469,226 @@ end
         @test norm(r) < norm(b)
     end
 end
+
+# ══════════════════════════════════════════════════════════════════════════
+# Block smoother tests (SMatrix entries, SVector rhs)
+# ══════════════════════════════════════════════════════════════════════════
+
+"""
+Build a 2×2 block version of the 1-D Poisson matrix on n (block-)nodes.
+The entry type is SMatrix{2,2,Float64,4}; entries are block-diagonal:
+  diag blocks = 2*I₂, off-diag blocks = -I₂.
+Returns the CSRMatrix and a corresponding SparseMatrixCSC for residual checks.
+"""
+function block_poisson1d(n)
+    B = 2
+    T = Float64
+    Tv = SMatrix{B, B, T, B*B}
+    Ti = Int
+    I_rows = Ti[]; J_cols = Ti[]; Vvals = Tv[]
+    for i in 1:n
+        push!(I_rows, i); push!(J_cols, i); push!(Vvals, Tv(2*one(Tv)))
+        if i > 1
+            push!(I_rows, i); push!(J_cols, i-1); push!(Vvals, Tv(-one(Tv)))
+        end
+        if i < n
+            push!(I_rows, i); push!(J_cols, i+1); push!(Vvals, Tv(-one(Tv)))
+        end
+    end
+    # Build CSRMatrix directly
+    row_counts = zeros(Int, n)
+    for r in I_rows; row_counts[r] += 1; end
+    rptr = Vector{Ti}(undef, n+1)
+    rptr[1] = 1
+    for i in 1:n; rptr[i+1] = rptr[i] + row_counts[i]; end
+    pos = copy(rptr[1:n])
+    cval = Vector{Ti}(undef, length(Vvals))
+    nzv  = Vector{Tv}(undef, length(Vvals))
+    for k in eachindex(I_rows)
+        r = I_rows[k]; p = pos[r]
+        cval[p] = J_cols[k]; nzv[p] = Vvals[k]; pos[r] += 1
+    end
+    # Sort each row by column
+    for i in 1:n
+        rng = rptr[i]:(rptr[i+1]-1)
+        perm = sortperm(cval[rng])
+        cval[rng] .= cval[rng][perm]
+        nzv[rng]  .= nzv[rng][perm]
+    end
+    return Draugr.CSRMatrix(rptr, cval, nzv, n, n)
+end
+
+@testset "Block Jacobi Smoother" begin
+    n = 8
+    B = 2; T = Float64
+    Tv = SMatrix{B,B,T,B*B}; Tx = SVector{B,T}
+    Ac = block_poisson1d(n)
+    smoother = Draugr.build_jacobi_smoother(Ac, 2.0/3.0; x_eltype=Tx)
+    @test smoother isa Draugr.JacobiSmoother
+    @test eltype(smoother.invdiag) == Tv
+    @test eltype(smoother.tmp)     == Tx
+    b = [Tx(1.0, 0.0) for _ in 1:n]
+    x = [Tx(0.0, 0.0) for _ in 1:n]
+    smooth!(x, Ac, b, smoother; steps=20)
+    # residual must shrink
+    r_norm = norm([norm(b[i] - sum(Ac.nzval[nz]*x[Ac.colval[nz]] for nz in Ac.rowptr[i]:(Ac.rowptr[i+1]-1))) for i in 1:n])
+    @test r_norm < norm(norm.(b))
+end
+
+@testset "Block L1-Jacobi Smoother" begin
+    n = 8
+    B = 2; T = Float64
+    Tv = SMatrix{B,B,T,B*B}; Tx = SVector{B,T}
+    Ac = block_poisson1d(n)
+    smoother = Draugr.build_l1jacobi_smoother(Ac, 2.0/3.0; x_eltype=Tx)
+    @test smoother isa Draugr.L1JacobiSmoother
+    @test eltype(smoother.invdiag) == Tv
+    @test eltype(smoother.tmp)     == Tx
+    b = [Tx(1.0, 0.0) for _ in 1:n]
+    x = [Tx(0.0, 0.0) for _ in 1:n]
+    smooth!(x, Ac, b, smoother; steps=20)
+    r_norm = norm([norm(b[i] - sum(Ac.nzval[nz]*x[Ac.colval[nz]] for nz in Ac.rowptr[i]:(Ac.rowptr[i+1]-1))) for i in 1:n])
+    @test r_norm < norm(norm.(b))
+end
+
+@testset "Block SPAI0 Smoother" begin
+    n = 8
+    B = 2; T = Float64
+    Tv = SMatrix{B,B,T,B*B}; Tx = SVector{B,T}
+    Ac = block_poisson1d(n)
+    smoother = Draugr.build_spai0_smoother(Ac; x_eltype=Tx)
+    @test smoother isa Draugr.SPAI0Smoother
+    @test eltype(smoother.m_diag) == Tv
+    @test eltype(smoother.tmp)    == Tx
+    b = [Tx(1.0, 0.0) for _ in 1:n]
+    x = [Tx(0.0, 0.0) for _ in 1:n]
+    smooth!(x, Ac, b, smoother; steps=20)
+    r_norm = norm([norm(b[i] - sum(Ac.nzval[nz]*x[Ac.colval[nz]] for nz in Ac.rowptr[i]:(Ac.rowptr[i+1]-1))) for i in 1:n])
+    @test r_norm < norm(norm.(b))
+end
+
+@testset "Block SPAI1 Smoother" begin
+    n = 8
+    B = 2; T = Float64
+    Tv = SMatrix{B,B,T,B*B}; Tx = SVector{B,T}
+    Ac = block_poisson1d(n)
+    smoother = Draugr.build_spai1_smoother(Ac; x_eltype=Tx)
+    @test smoother isa Draugr.SPAI1Smoother
+    @test eltype(smoother.nzval) == Tv
+    @test eltype(smoother.tmp)   == Tx
+    b = [Tx(1.0, 0.0) for _ in 1:n]
+    x = [Tx(0.0, 0.0) for _ in 1:n]
+    smooth!(x, Ac, b, smoother; steps=5)
+    r_norm = norm([norm(b[i] - sum(Ac.nzval[nz]*x[Ac.colval[nz]] for nz in Ac.rowptr[i]:(Ac.rowptr[i+1]-1))) for i in 1:n])
+    @test r_norm < norm(norm.(b))
+end
+
+@testset "Block Chebyshev Smoother" begin
+    n = 8
+    B = 2; T = Float64
+    Tv = SMatrix{B,B,T,B*B}; Tx = SVector{B,T}
+    Ac = block_poisson1d(n)
+    smoother = Draugr.build_chebyshev_smoother(Ac; x_eltype=Tx)
+    @test smoother isa Draugr.ChebyshevSmoother
+    @test eltype(smoother.invdiag) == Tv
+    @test eltype(smoother.tmp1)    == Tx
+    @test eltype(smoother.tmp2)    == Tx
+    b = [Tx(1.0, 0.0) for _ in 1:n]
+    x = [Tx(0.0, 0.0) for _ in 1:n]
+    smooth!(x, Ac, b, smoother; steps=5)
+    r_norm = norm([norm(b[i] - sum(Ac.nzval[nz]*x[Ac.colval[nz]] for nz in Ac.rowptr[i]:(Ac.rowptr[i+1]-1))) for i in 1:n])
+    @test r_norm < norm(norm.(b))
+end
+
+@testset "Block Colored GS Smoother" begin
+    n = 8
+    B = 2; T = Float64
+    Tv = SMatrix{B,B,T,B*B}; Tx = SVector{B,T}
+    Ac = block_poisson1d(n)
+    smoother = Draugr.build_colored_gs_smoother(Ac)
+    @test smoother isa Draugr.ColoredGaussSeidelSmoother
+    @test eltype(smoother.invdiag) == Tv
+    b = [Tx(1.0, 0.0) for _ in 1:n]
+    x = [Tx(0.0, 0.0) for _ in 1:n]
+    smooth!(x, Ac, b, smoother; steps=20)
+    r_norm = norm([norm(b[i] - sum(Ac.nzval[nz]*x[Ac.colval[nz]] for nz in Ac.rowptr[i]:(Ac.rowptr[i+1]-1))) for i in 1:n])
+    @test r_norm < norm(norm.(b))
+end
+
+@testset "Block L1 Colored GS Smoother" begin
+    n = 8
+    B = 2; T = Float64
+    Tv = SMatrix{B,B,T,B*B}; Tx = SVector{B,T}
+    Ac = block_poisson1d(n)
+    smoother = Draugr.build_l1_colored_gs_smoother(Ac)
+    @test smoother isa Draugr.L1ColoredGaussSeidelSmoother
+    @test eltype(smoother.invdiag) == Tv
+    b = [Tx(1.0, 0.0) for _ in 1:n]
+    x = [Tx(0.0, 0.0) for _ in 1:n]
+    smooth!(x, Ac, b, smoother; steps=20)
+    r_norm = norm([norm(b[i] - sum(Ac.nzval[nz]*x[Ac.colval[nz]] for nz in Ac.rowptr[i]:(Ac.rowptr[i+1]-1))) for i in 1:n])
+    @test r_norm < norm(norm.(b))
+end
+
+@testset "Block Serial GS Smoother" begin
+    n = 8
+    B = 2; T = Float64
+    Tv = SMatrix{B,B,T,B*B}; Tx = SVector{B,T}
+    Ac = block_poisson1d(n)
+    smoother = Draugr.build_serial_gs_smoother(Ac)
+    @test smoother isa Draugr.SerialGaussSeidelSmoother
+    @test eltype(smoother.invdiag) == Tv
+    b = [Tx(1.0, 0.0) for _ in 1:n]
+    x = [Tx(0.0, 0.0) for _ in 1:n]
+    smooth!(x, Ac, b, smoother; steps=20)
+    r_norm = norm([norm(b[i] - sum(Ac.nzval[nz]*x[Ac.colval[nz]] for nz in Ac.rowptr[i]:(Ac.rowptr[i+1]-1))) for i in 1:n])
+    @test r_norm < norm(norm.(b))
+end
+
+@testset "Block L1 Serial GS Smoother" begin
+    n = 8
+    B = 2; T = Float64
+    Tv = SMatrix{B,B,T,B*B}; Tx = SVector{B,T}
+    Ac = block_poisson1d(n)
+    smoother = Draugr.build_l1_serial_gs_smoother(Ac)
+    @test smoother isa Draugr.L1SerialGaussSeidelSmoother
+    @test eltype(smoother.invdiag) == Tv
+    b = [Tx(1.0, 0.0) for _ in 1:n]
+    x = [Tx(0.0, 0.0) for _ in 1:n]
+    smooth!(x, Ac, b, smoother; steps=20)
+    r_norm = norm([norm(b[i] - sum(Ac.nzval[nz]*x[Ac.colval[nz]] for nz in Ac.rowptr[i]:(Ac.rowptr[i+1]-1))) for i in 1:n])
+    @test r_norm < norm(norm.(b))
+end
+
+@testset "Block ILU0 Smoother" begin
+    n = 8
+    B = 2; T = Float64
+    Tv = SMatrix{B,B,T,B*B}; Tx = SVector{B,T}
+    Ac = block_poisson1d(n)
+    smoother = Draugr.build_ilu0_smoother(Ac; x_eltype=Tx)
+    @test smoother isa Draugr.ILU0Smoother
+    @test eltype(smoother.L_nzval) == Tv
+    @test eltype(smoother.tmp)     == Tx
+    b = [Tx(1.0, 0.0) for _ in 1:n]
+    x = [Tx(0.0, 0.0) for _ in 1:n]
+    smooth!(x, Ac, b, smoother; steps=3)
+    r_norm = norm([norm(b[i] - sum(Ac.nzval[nz]*x[Ac.colval[nz]] for nz in Ac.rowptr[i]:(Ac.rowptr[i+1]-1))) for i in 1:n])
+    @test r_norm < norm(norm.(b))
+end
+
+@testset "Block Serial ILU0 Smoother" begin
+    n = 8
+    B = 2; T = Float64
+    Tv = SMatrix{B,B,T,B*B}; Tx = SVector{B,T}
+    Ac = block_poisson1d(n)
+    smoother = Draugr.build_serial_ilu0_smoother(Ac; x_eltype=Tx)
+    @test smoother isa Draugr.SerialILU0Smoother
+    @test eltype(smoother.L_nzval) == Tv
+    @test eltype(smoother.tmp)     == Tx
+    b = [Tx(1.0, 0.0) for _ in 1:n]
+    x = [Tx(0.0, 0.0) for _ in 1:n]
+    smooth!(x, Ac, b, smoother; steps=3)
+    r_norm = norm([norm(b[i] - sum(Ac.nzval[nz]*x[Ac.colval[nz]] for nz in Ac.rowptr[i]:(Ac.rowptr[i+1]-1))) for i in 1:n])
+    @test r_norm < norm(norm.(b))
+end
+

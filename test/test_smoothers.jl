@@ -515,7 +515,7 @@ function block_poisson1d(n)
         cval[rng] .= cval[rng][perm]
         nzv[rng]  .= nzv[rng][perm]
     end
-    return Draugr.CSRMatrix{Tv, Ti}(rptr, cval, nzv, n, n)
+    return Draugr.CSRMatrix(rptr, cval, nzv, n, n)
 end
 
 @testset "Block Jacobi Smoother" begin

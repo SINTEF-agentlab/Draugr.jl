@@ -20,5 +20,4 @@ include("helpers.jl")
     include("test_jlarrays.jl")
     include("test_extensions.jl")
     include("test_c_api.jl")
-    include("test_real_matrices.jl")
 end

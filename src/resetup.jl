@@ -60,7 +60,7 @@ function amg_resetup!(hierarchy::AMGHierarchy{Tv, Ti},
         end
         last_level = hierarchy.levels[nlevels]
         _recompute_coarsest_dense!(hierarchy, last_level; backend=backend)
-        hierarchy.coarse_factor = lu(hierarchy.coarse_A)
+        hierarchy.coarse_factor = _safe_lu(hierarchy.coarse_A)
         return hierarchy
     else
         # Full resetup: rebuild hierarchy from scratch, reusing workspace arrays
@@ -194,6 +194,6 @@ function _update_coarse_solver!(hierarchy::AMGHierarchy{Tv}, A::CSRMatrix{Tv};
         # Coarse system is on device — use device CSR directly
         _csr_to_dense!(M, A; backend=backend, block_size=block_size)
     end
-    hierarchy.coarse_factor = lu(hierarchy.coarse_A)
+    hierarchy.coarse_factor = _safe_lu(hierarchy.coarse_A)
     return hierarchy
 end

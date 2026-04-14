@@ -119,7 +119,7 @@ Uses KernelAbstractions for parallel execution. Alternates read/write buffers
 to avoid an extra copy per step; only copies back on odd step counts.
 """
 function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
-                 smoother::JacobiSmoother; steps::Int=1, backend=DEFAULT_BACKEND, block_size::Int=64)
+                 smoother::JacobiSmoother; steps::Int=1, reverse::Bool=false, backend=DEFAULT_BACKEND, block_size::Int=64)
     n = size(A, 1)
     nzv = nonzeros(A)
     cv = colvals(A)
@@ -240,13 +240,15 @@ end
 Apply parallel colored Gauss-Seidel smoothing.
 """
 function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
-                 smoother::ColoredGaussSeidelSmoother; steps::Int=1, backend=DEFAULT_BACKEND, block_size::Int=64)
+                 smoother::ColoredGaussSeidelSmoother; steps::Int=1, reverse::Bool=false, backend=DEFAULT_BACKEND, block_size::Int=64)
     nzv = nonzeros(A)
     cv = colvals(A)
     rp = rowptr(A)
     kernel! = gs_color_kernel!(backend, block_size)
+    nc = smoother.num_colors
     for _ in 1:steps
-        for c in 1:smoother.num_colors
+        color_range = reverse ? (nc:-1:1) : (1:nc)
+        for c in color_range
             start = smoother.color_offsets[c]
             count = smoother.color_offsets[c+1] - start
             count == 0 && continue
@@ -312,13 +314,15 @@ end
 Apply L1 colored Gauss-Seidel smoothing. Uses l1 row norms for diagonal scaling.
 """
 function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
-                 smoother::L1ColoredGaussSeidelSmoother; steps::Int=1, backend=DEFAULT_BACKEND, block_size::Int=64)
+                 smoother::L1ColoredGaussSeidelSmoother; steps::Int=1, reverse::Bool=false, backend=DEFAULT_BACKEND, block_size::Int=64)
     nzv = nonzeros(A)
     cv = colvals(A)
     rp = rowptr(A)
     kernel! = gs_color_kernel!(backend, block_size)
+    nc = smoother.num_colors
     for _ in 1:steps
-        for c in 1:smoother.num_colors
+        color_range = reverse ? (nc:-1:1) : (1:nc)
+        for c in color_range
             start = smoother.color_offsets[c]
             count = smoother.color_offsets[c+1] - start
             count == 0 && continue
@@ -361,20 +365,35 @@ function _serial_gs_compute_invdiag!(invdiag::Vector{Tv}, nzv, cv, rp, n::Int) w
 end
 
 """
-    _serial_gs_sweep!(x, b, nzv, cv, rp, invdiag, n, steps)
+    _serial_gs_sweep!(x, b, nzv, cv, rp, invdiag, n, steps; reverse=false)
 
-Function barrier for the Gauss-Seidel forward sweep. Takes concrete array types
+Function barrier for the Gauss-Seidel sweep. Takes concrete array types
 as arguments to ensure type stability in the inner loop.
+When `reverse=true`, performs a backward sweep (rows n to 1) instead of
+forward (rows 1 to n). Using forward for pre-smoothing and backward for
+post-smoothing matches HYPRE's default l1-GS relaxation and produces a
+more effective AMG preconditioner.
 """
-function _serial_gs_sweep!(x, b, nzv, cv, rp, invdiag, n::Int, steps::Int)
+function _serial_gs_sweep!(x, b, nzv, cv, rp, invdiag, n::Int, steps::Int; reverse::Bool=false)
     for _ in 1:steps
-        @inbounds for i in 1:n
-            r_i = b[i]
-            for nz in rp[i]:(rp[i+1]-1)
-                j = cv[nz]
-                r_i -= nzv[nz] * x[j]
+        if reverse
+            @inbounds for i in n:-1:1
+                r_i = b[i]
+                for nz in rp[i]:(rp[i+1]-1)
+                    j = cv[nz]
+                    r_i -= nzv[nz] * x[j]
+                end
+                x[i] += invdiag[i] * r_i
             end
-            x[i] += invdiag[i] * r_i
+        else
+            @inbounds for i in 1:n
+                r_i = b[i]
+                for nz in rp[i]:(rp[i+1]-1)
+                    j = cv[nz]
+                    r_i -= nzv[nz] * x[j]
+                end
+                x[i] += invdiag[i] * r_i
+            end
         end
     end
     return x
@@ -411,7 +430,7 @@ over all rows without threading or KernelAbstractions. For GPU arrays,
 copies data to CPU, applies GS, and copies back.
 """
 function smooth!(x::AbstractVector, A::CSRMatrix{Tv, Ti}, b::AbstractVector,
-                 smoother::SerialGaussSeidelSmoother; steps::Int=1, backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
+                 smoother::SerialGaussSeidelSmoother; steps::Int=1, reverse::Bool=false, backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
     n = size(A, 1)
     is_gpu = !(x isa Array)
     if is_gpu
@@ -422,7 +441,7 @@ function smooth!(x::AbstractVector, A::CSRMatrix{Tv, Ti}, b::AbstractVector,
         b_cpu = b
     end
     _serial_gs_sweep!(x_cpu, b_cpu, nonzeros(smoother.A_cpu), colvals(smoother.A_cpu),
-                      rowptr(smoother.A_cpu), smoother.invdiag, n, steps)
+                      rowptr(smoother.A_cpu), smoother.invdiag, n, steps; reverse=reverse)
     if is_gpu
         copyto!(x, x_cpu)
     end
@@ -488,7 +507,7 @@ over all rows using l1 row norms for diagonal scaling. For GPU arrays,
 copies data to CPU, applies GS, and copies back.
 """
 function smooth!(x::AbstractVector, A::CSRMatrix{Tv, Ti}, b::AbstractVector,
-                 smoother::L1SerialGaussSeidelSmoother; steps::Int=1, backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
+                 smoother::L1SerialGaussSeidelSmoother; steps::Int=1, reverse::Bool=false, backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
     n = size(A, 1)
     is_gpu = !(x isa Array)
     if is_gpu
@@ -501,7 +520,7 @@ function smooth!(x::AbstractVector, A::CSRMatrix{Tv, Ti}, b::AbstractVector,
     # Reuses the same forward sweep as standard serial GS; the L1 variant
     # differs only in how invdiag is computed (l1 row norms vs diagonal entries).
     _serial_gs_sweep!(x_cpu, b_cpu, nonzeros(smoother.A_cpu), colvals(smoother.A_cpu),
-                      rowptr(smoother.A_cpu), smoother.invdiag, n, steps)
+                      rowptr(smoother.A_cpu), smoother.invdiag, n, steps; reverse=reverse)
     if is_gpu
         copyto!(x, x_cpu)
     end
@@ -588,7 +607,7 @@ end
 Apply SPAI(0) smoothing iterations. Alternates buffers to avoid extra copies.
 """
 function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
-                 smoother::SPAI0Smoother; steps::Int=1, backend=DEFAULT_BACKEND, block_size::Int=64)
+                 smoother::SPAI0Smoother; steps::Int=1, reverse::Bool=false, backend=DEFAULT_BACKEND, block_size::Int=64)
     n = size(A, 1)
     nzv = nonzeros(A)
     cv = colvals(A)
@@ -850,7 +869,7 @@ Apply SPAI(1) smoothing: x <- x + M*(b - A*x) where M ≈ A⁻¹.
 Two-pass: first compute residual into tmp, then apply M.
 """
 function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
-                 smoother::SPAI1Smoother; steps::Int=1, backend=DEFAULT_BACKEND, block_size::Int=64)
+                 smoother::SPAI1Smoother; steps::Int=1, reverse::Bool=false, backend=DEFAULT_BACKEND, block_size::Int=64)
     n = size(A, 1)
     nzv = nonzeros(A)
     cv = colvals(A)
@@ -949,7 +968,7 @@ function update_smoother!(smoother::L1JacobiSmoother, A::CSRMatrix;
 end
 
 function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
-                 smoother::L1JacobiSmoother; steps::Int=1, backend=DEFAULT_BACKEND, block_size::Int=64)
+                 smoother::L1JacobiSmoother; steps::Int=1, reverse::Bool=false, backend=DEFAULT_BACKEND, block_size::Int=64)
     n = size(A, 1)
     nzv = nonzeros(A)
     cv = colvals(A)
@@ -1096,7 +1115,7 @@ of the configured degree using the standard three-term recurrence.
 Uses KA kernels for GPU compatibility.
 """
 function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
-                 smoother::ChebyshevSmoother; steps::Int=1, backend=DEFAULT_BACKEND, block_size::Int=64)
+                 smoother::ChebyshevSmoother; steps::Int=1, reverse::Bool=false, backend=DEFAULT_BACKEND, block_size::Int=64)
     n = size(A, 1)
     # Tλ is always a real scalar type (Float64, etc.), independent of the block structure.
     Tλ = typeof(smoother.λ_max)
@@ -1298,7 +1317,7 @@ Uses plain sequential forward/backward substitution on CPU.
 For GPU arrays, copies data to CPU, applies ILU, and copies back.
 """
 function smooth!(x::AbstractVector, A::CSRMatrix{Tv, Ti}, b::AbstractVector,
-                 smoother::SerialILU0Smoother{Tv, Ti, Tx}; steps::Int=1, backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti, Tx}
+                 smoother::SerialILU0Smoother{Tv, Ti, Tx}; steps::Int=1, reverse::Bool=false, backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti, Tx}
     n = size(A, 1)
     ti_one = one(Ti)
 
@@ -1505,7 +1524,7 @@ the forward/backward substitution phases.
 For GPU arrays, copies data to CPU, applies ILU, and copies back.
 """
 function smooth!(x::AbstractVector, A::CSRMatrix{Tv, Ti}, b::AbstractVector,
-                 smoother::ILU0Smoother{Tv, Ti, Tx}; steps::Int=1, backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti, Tx}
+                 smoother::ILU0Smoother{Tv, Ti, Tx}; steps::Int=1, reverse::Bool=false, backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti, Tx}
     n = size(A, 1)
     ti_one = one(Ti)
 
@@ -1667,7 +1686,7 @@ Apply smoother iterations to solve `Ax = b` using a `SparseMatrixCSC` matrix.
 This is the public API for applying smoothers with `SparseMatrixCSC` matrices.
 """
 function smooth!(x::AbstractVector, A::SparseMatrixCSC, b::AbstractVector,
-                 smoother::AbstractSmoother; steps::Int=1, backend=DEFAULT_BACKEND, block_size::Int=64)
+                 smoother::AbstractSmoother; steps::Int=1, reverse::Bool=false, backend=DEFAULT_BACKEND, block_size::Int=64)
     A_csr = csr_from_csc(A)
-    return smooth!(x, A_csr, b, smoother; steps=steps, backend=backend, block_size=block_size)
+    return smooth!(x, A_csr, b, smoother; steps=steps, reverse=reverse, backend=backend, block_size=block_size)
 end

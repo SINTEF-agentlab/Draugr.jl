@@ -65,6 +65,12 @@ function _prolongation_update_map_to_device(ref::CSRMatrix{Tv, Ti}, p_map::Prolo
         numer_idx,
         denom_offsets,
         denom_entries,
+        # Direct interpolation alfa/beta data — transferred to device once
+        _td(p_map.dir_diag_idx),
+        _td(p_map.dir_all_offsets),
+        _td(p_map.dir_all_entries),
+        _td(p_map.dir_sc_offsets),
+        _td(p_map.dir_sc_entries),
         p_map.strong_nbrs_offsets,  # stays on CPU
         p_map.strong_nbrs_cols,     # stays on CPU
         p_map.strong_nbrs_nz,       # stays on CPU

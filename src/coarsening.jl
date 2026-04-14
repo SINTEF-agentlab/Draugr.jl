@@ -430,9 +430,16 @@ function coarsen_hmis(A_in::CSRMatrix{Tv, Ti}, θ::Real;
         pmis_measure[i] = Float64(st_count_pmis[i]) + rand(rng)
     end
 
-    # Re-evaluate Z_PT nodes (matching hypre's CF_init=1 logic)
+    # Re-evaluate nodes from RS first pass for PMIS (matching hypre's CF_init=1 logic).
+    # In hypre's serial code:
+    #   - F_PT (-1) from main greedy loop → unconditionally reset to undecided (0)
+    #   - Z_PT (-2) from zero-measure init → conditionally: undecided if measure >= 1.0
+    #     or has strong diagonal connections, else final F_PT (-1)
+    #   - C_PT (1) from greedy loop → stays C, enters PMIS graph
     @inbounds for i in 1:n
-        if cf[i] == -2  # Z_PT from RS first pass
+        if cf[i] == -1  # F_PT from main greedy loop or decrement-to-zero
+            cf[i] = 0  # unconditionally undecided for PMIS
+        elseif cf[i] == -2  # Z_PT from zero-measure initialization
             has_strong_diag = false
             for nz in nzrange(A, i)
                 j = cv[nz]
@@ -447,6 +454,7 @@ function coarsen_hmis(A_in::CSRMatrix{Tv, Ti}, θ::Real;
                 cf[i] = -1  # no influence, make final F
             end
         end
+        # C_PT (1) stays C and participates in PMIS
     end
 
     # PMIS iterations on remaining undecided nodes
@@ -570,13 +578,15 @@ function _rs_first_pass!(A::CSRMatrix{Tv, Ti}, is_strong::AbstractVector{Bool};
         cf[best_i] = 1  # C-point
 
         # For each undecided node j that strongly depends on best_i (S^T neighbors):
-        # mark with f_pnt (Z_PT for HMIS, F_PT for RS), matching hypre where ALL
-        # F-points in the first pass use f_pnt so PMIS can re-evaluate them.
+        # mark as F_PT (-1). In hypre's Ruge first pass, the main greedy loop always
+        # uses F_PT (not f_pnt/Z_PT). Only zero-measure initialization uses f_pnt.
+        # For HMIS, the PMIS init (CF_init=1) then unconditionally resets F_PT to
+        # undecided, while Z_PT nodes get conditional re-evaluation.
         @inbounds for idx in st_offsets[best_i]:(st_offsets[best_i + 1] - 1)
             j = st_sources[idx]
             cf[j] != 0 && continue
             _bucket_remove_node!(j, λ, bucket_head, bucket_next, bucket_prev)
-            cf[j] = f_pnt  # Z_PT for HMIS, F_PT for RS
+            cf[j] = -1  # F_PT (always, even for HMIS)
             # Increment λ for undecided nodes that j strongly depends on
             for nz2 in nzrange(A, j)
                 k = cv[nz2]
@@ -596,9 +606,9 @@ function _rs_first_pass!(A::CSRMatrix{Tv, Ti}, is_strong::AbstractVector{Bool};
                 new_val = max(0, λ[j] - 1)
                 _bucket_update_node!(j, new_val, λ, bucket_head, bucket_next, bucket_prev)
                 if new_val == 0
-                    # Node has no more undecided dependents → mark with f_pnt
+                    # Node has no more undecided dependents → mark as F_PT
                     _bucket_remove_node!(j, λ, bucket_head, bucket_next, bucket_prev)
-                    cf[j] = f_pnt  # Z_PT for HMIS, F_PT for RS
+                    cf[j] = -1  # F_PT (always, even for HMIS)
                     # Increment λ for its undecided strong neighbors
                     for nz2 in nzrange(A, j)
                         k = cv[nz2]

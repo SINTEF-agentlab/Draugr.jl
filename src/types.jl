@@ -501,6 +501,13 @@ mutable struct ProlongationUpdateMap{Ti<:Integer, Tv<:Number}
     numer_idx::Vector{Ti}               # A.nzval index for numerator
     denom_offsets::Vector{Ti}           # offset array for denominator
     denom_entries::Vector{Ti}           # A.nzval indices for denominator
+    # Direct interpolation alfa/beta data: per P-entry, stores the A.nzval indices
+    # needed to compute sum_N_neg/pos and sum_P_neg/pos for the alfa/beta formula.
+    dir_diag_idx::AbstractVector{Ti}        # per P-entry: diagonal A.nzval index
+    dir_all_offsets::AbstractVector{Ti}     # per P-entry: offset into all off-diag indices
+    dir_all_entries::AbstractVector{Ti}     # all off-diagonal A.nzval indices for row
+    dir_sc_offsets::AbstractVector{Ti}      # per P-entry: offset into strong-C indices
+    dir_sc_entries::AbstractVector{Ti}      # strong C-neighbor A.nzval indices for row
     # Strong neighbor structure for Standard/Extended+i row recomputation
     strong_nbrs_offsets::Vector{Ti}     # offset array (n_fine + 1)
     strong_nbrs_cols::Vector{Ti}        # column indices of strong neighbors

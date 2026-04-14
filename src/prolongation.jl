@@ -335,9 +335,21 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
     strong_coarse_cols = Ti[]
     strong_coarse_nz_idx = Ti[]
     denom_nz_idx = Ti[]
+    all_offdiag_nz_idx = Ti[]  # all off-diagonal entries for alfa/beta formula
     sizehint!(strong_coarse_cols, max_row_nnz; shrink=false)
     sizehint!(strong_coarse_nz_idx, max_row_nnz; shrink=false)
     sizehint!(denom_nz_idx, max_row_nnz; shrink=false)
+    sizehint!(all_offdiag_nz_idx, max_row_nnz; shrink=false)
+    
+    # Per-entry data for Direct interpolation alfa/beta formula
+    dir_diag_idx_list = Ti[]
+    dir_all_offsets_list = Ti[1]
+    dir_all_entries_list = Ti[]
+    dir_sc_offsets_list = Ti[1]
+    dir_sc_entries_list = Ti[]
+    sizehint!(dir_diag_idx_list, total_nnz; shrink=false)
+    sizehint!(dir_all_entries_list, total_nnz * 4; shrink=false)
+    sizehint!(dir_sc_entries_list, total_nnz * 2; shrink=false)
 
     # Second pass: fill sparsity pattern (colval) and build index mappings
     # NOTE: We do NOT compute nzv_p values here - Phase 2 will do that
@@ -362,18 +374,26 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
             entry_type[pos] = Ti(0)  # type 0 = coarse point (P=1)
             numer_idx[pos] = Ti(0)
             denom_offsets[pos] = Ti(length(denom_entries_list) + 1)
+            # alfa/beta data: coarse point doesn't use formula
+            push!(dir_diag_idx_list, Ti(0))
+            push!(dir_all_offsets_list, Ti(length(dir_all_entries_list) + 1))
+            push!(dir_sc_offsets_list, Ti(length(dir_sc_entries_list) + 1))
         else
             # Clear workspace buffers (reuse allocations)
             empty!(strong_coarse_cols)
             empty!(strong_coarse_nz_idx)
             empty!(denom_nz_idx)
+            empty!(all_offdiag_nz_idx)
             
+            diag_nz_for_row = Ti(0)
             for nz in nzrange(A, i)
                 j = cv[nz]
                 if j == i
-                    # Diagonal always in denominator
+                    # Diagonal
+                    diag_nz_for_row = Ti(nz)
                     push!(denom_nz_idx, Ti(nz))
                 else
+                    push!(all_offdiag_nz_idx, Ti(nz))
                     # Match hypre: all strong C-connections are interpolation
                     # targets, non-strong/fine connections go to denominator
                     is_interp_coarse = is_strong[nz] && cf[j] == 1
@@ -406,15 +426,24 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                 entry_type[pos] = Ti(0)  # fallback = P=1
                 numer_idx[pos] = Ti(0)
                 denom_offsets[pos] = Ti(length(denom_entries_list) + 1)
+                push!(dir_diag_idx_list, Ti(0))
+                push!(dir_all_offsets_list, Ti(length(dir_all_entries_list) + 1))
+                push!(dir_sc_offsets_list, Ti(length(dir_sc_entries_list) + 1))
             else
                 # Fill colval and update map for each interpolation entry
                 for k in eachindex(strong_coarse_cols)
                     cval[pos] = strong_coarse_cols[k]
                     entry_type[pos] = Ti(1)  # type 1 = compute from formula
                     numer_idx[pos] = strong_coarse_nz_idx[k]
-                    # Denominator is the same for all P entries in this row
+                    # Legacy denominator (same for all P entries in this row)
                     denom_offsets[pos] = Ti(length(denom_entries_list) + 1)
                     append!(denom_entries_list, denom_nz_idx)
+                    # Alfa/beta formula data: per P-entry, stores row-level data
+                    push!(dir_diag_idx_list, diag_nz_for_row)
+                    push!(dir_all_offsets_list, Ti(length(dir_all_entries_list) + 1))
+                    append!(dir_all_entries_list, all_offdiag_nz_idx)
+                    push!(dir_sc_offsets_list, Ti(length(dir_sc_entries_list) + 1))
+                    append!(dir_sc_entries_list, strong_coarse_nz_idx)
                     pos += 1
                 end
             end
@@ -424,6 +453,15 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
     # Finalize update map
     denom_offsets[total_nnz + 1] = Ti(length(denom_entries_list) + 1)
     denom_entries = Vector{Ti}(denom_entries_list)
+    
+    # Finalize alfa/beta data arrays
+    dir_diag_idx = Vector{Ti}(dir_diag_idx_list)
+    dir_all_offsets = Vector{Ti}(dir_all_offsets_list)
+    push!(dir_all_offsets, Ti(length(dir_all_entries_list) + 1))
+    dir_all_entries = Vector{Ti}(dir_all_entries_list)
+    dir_sc_offsets = Vector{Ti}(dir_sc_offsets_list)
+    push!(dir_sc_offsets, Ti(length(dir_sc_entries_list) + 1))
+    dir_sc_entries = Vector{Ti}(dir_sc_entries_list)
     
     # ══════════════════════════════════════════════════════════════════════════
     # PHASE 2: Compute P values using the update kernel
@@ -447,7 +485,8 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
     # Use kernel to compute P values (same as resetup)
     # For CPU backend, this is a simple loop; for GPU, it will be a kernel launch
     _direct_interp_compute_values!(P.nzval, nonzeros(A_in), entry_type, numer_idx, 
-                                   denom_offsets, denom_entries;
+                                   dir_diag_idx, dir_all_offsets, dir_all_entries,
+                                   dir_sc_offsets, dir_sc_entries;
                                    backend=backend, block_size=block_size)
     
     # Build and return update map if requested
@@ -474,6 +513,12 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
             numer_idx,
             denom_offsets,
             denom_entries,
+            # Alfa/beta data for Direct interpolation
+            dir_diag_idx,
+            dir_all_offsets,
+            dir_all_entries,
+            dir_sc_offsets,
+            dir_sc_entries,
             strong_nbrs_offsets,
             strong_nbrs_cols,
             strong_nbrs_nz,
@@ -491,14 +536,23 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
 end
 
 """
-    _direct_interp_compute_values!(P_nzval, A_nzval, entry_type, numer_idx, denom_offsets, denom_entries)
+    _direct_interp_compute_values!(P_nzval, A_nzval, entry_type, numer_idx,
+                                   dir_diag_idx, dir_all_offsets, dir_all_entries,
+                                   dir_sc_offsets, dir_sc_entries)
 
-Compute Direct interpolation P values using KernelAbstractions.
+Compute Direct interpolation P values using hypre's alfa/beta sign-based formula:
+  alfa = sum_N_neg / (sum_P_neg * diagonal)   (for negative entries)
+  beta = sum_N_pos / (sum_P_pos * diagonal)   (for positive entries)
+  P[k] = -alfa * a_{i,j}  if a_{i,j} < 0
+  P[k] = -beta * a_{i,j}  if a_{i,j} > 0
+
 This is the same kernel used for both initial setup and update_P=true resetup.
 """
 function _direct_interp_compute_values!(P_nzval::AbstractVector{Tv}, A_nzval::AbstractVector{Tv},
                                         entry_type::AbstractVector{Ti}, numer_idx::AbstractVector{Ti},
-                                        denom_offsets::AbstractVector{Ti}, denom_entries::AbstractVector{Ti};
+                                        dir_diag_idx::AbstractVector{Ti},
+                                        dir_all_offsets::AbstractVector{Ti}, dir_all_entries::AbstractVector{Ti},
+                                        dir_sc_offsets::AbstractVector{Ti}, dir_sc_entries::AbstractVector{Ti};
                                         backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
     nnz_P = length(P_nzval)
     nnz_P == 0 && return P_nzval
@@ -508,35 +562,40 @@ function _direct_interp_compute_values!(P_nzval::AbstractVector{Tv}, A_nzval::Ab
     A_on_gpu = !(A_nzval isa Array)
     
     if P_on_gpu
-        # P is on GPU: convert update map arrays to GPU and use GPU kernel
         be = _get_backend(P_nzval)
-        # Convert A values to GPU if needed
         if A_on_gpu
             A_nzval_gpu = A_nzval
         else
             A_nzval_gpu = similar(P_nzval, eltype(A_nzval), length(A_nzval))
             copyto!(A_nzval_gpu, A_nzval)
         end
-        # Convert update map arrays to GPU
         entry_type_gpu = similar(P_nzval, Ti, length(entry_type))
         numer_idx_gpu = similar(P_nzval, Ti, length(numer_idx))
-        denom_offsets_gpu = similar(P_nzval, Ti, length(denom_offsets))
-        denom_entries_gpu = similar(P_nzval, Ti, length(denom_entries))
+        dir_diag_idx_gpu = similar(P_nzval, Ti, length(dir_diag_idx))
+        dir_all_offsets_gpu = similar(P_nzval, Ti, length(dir_all_offsets))
+        dir_all_entries_gpu = similar(P_nzval, Ti, length(dir_all_entries))
+        dir_sc_offsets_gpu = similar(P_nzval, Ti, length(dir_sc_offsets))
+        dir_sc_entries_gpu = similar(P_nzval, Ti, length(dir_sc_entries))
         copyto!(entry_type_gpu, entry_type)
         copyto!(numer_idx_gpu, numer_idx)
-        copyto!(denom_offsets_gpu, denom_offsets)
-        copyto!(denom_entries_gpu, denom_entries)
+        copyto!(dir_diag_idx_gpu, dir_diag_idx)
+        copyto!(dir_all_offsets_gpu, dir_all_offsets)
+        copyto!(dir_all_entries_gpu, dir_all_entries)
+        copyto!(dir_sc_offsets_gpu, dir_sc_offsets)
+        copyto!(dir_sc_entries_gpu, dir_sc_entries)
         
         kernel! = _p_direct_update_kernel!(be, block_size)
-        kernel!(P_nzval, A_nzval_gpu, entry_type_gpu, numer_idx_gpu, denom_offsets_gpu, denom_entries_gpu; ndrange=nnz_P)
+        kernel!(P_nzval, A_nzval_gpu, entry_type_gpu, numer_idx_gpu,
+                dir_diag_idx_gpu, dir_all_offsets_gpu, dir_all_entries_gpu,
+                dir_sc_offsets_gpu, dir_sc_entries_gpu; ndrange=nnz_P)
         _synchronize(be)
     else
-        # P is on CPU: use CPU computation
         be = _get_backend(P_nzval)
-        # Convert A values to CPU if needed
         A_nzval_cpu = A_on_gpu ? Array(A_nzval) : A_nzval
         kernel! = _p_direct_update_kernel!(be, block_size)
-        kernel!(P_nzval, A_nzval_cpu, entry_type, numer_idx, denom_offsets, denom_entries; ndrange=nnz_P)
+        kernel!(P_nzval, A_nzval_cpu, entry_type, numer_idx,
+                dir_diag_idx, dir_all_offsets, dir_all_entries,
+                dir_sc_offsets, dir_sc_entries; ndrange=nnz_P)
         _synchronize(be)
     end
     
@@ -755,20 +814,13 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                     break
                 end
             end
+            diag_k_val = diag_k_nz > 0 ? nzv[diag_k_nz] : zero(Tv)
+            sgn = real(diag_k_val) < 0 ? -1 : 1
             
-            # Find a_{k,i} index (no sign filtering — matching hypre's Standard
-            # interpolation where all connections participate in redistribution)
-            a_ki_nz = Ti(0)
-            for nz2 in nzrange(A, k)
-                if cv[nz2] == i
-                    a_ki_nz = Ti(nz2)
-                    break
-                end
-            end
-            
-            # Build sum_C_k indices and collect coarse contributions.
-            # Include ALL a_{k,c} for c in C-hat(i) and a_{k,i} without sign
-            # filtering, matching hypre's Standard interpolation formula.
+            # Build sum_C_k: sum of a_{k,c} for c ∈ C_i^s (strong coarse neighbors of i)
+            # with sign filtering: only include entries where sgn * a_{k,c} < 0
+            # (matching hypre's Standard interpolation in par_interp.c).
+            # Note: a_{k,i} is NOT included in sum (hypre only sums P_marker entries).
             sum_C_k_indices = Ti[]
             sum_C_k = zero(Tv)
             coarse_vals_k = Dict{Int, Tuple{Tv, Ti}}()  # cm -> (a_kc, nz_idx)
@@ -779,22 +831,18 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                 a_kj = nzv[nz2]
                 if cf[j2] == 1
                     cm2 = coarse_map[j2]
-                    if haskey(strong_coarse, cm2)
+                    if haskey(strong_coarse, cm2) && sgn * real(a_kj) < 0
                         old = get(coarse_vals_k, cm2, (zero(Tv), Ti(0)))
                         coarse_vals_k[cm2] = (old[1] + a_kj, Ti(nz2))
                         sum_C_k += a_kj
                         push!(sum_C_k_indices, Ti(nz2))
                     end
                 end
-                if j2 == i
-                    sum_C_k += a_kj
-                    push!(sum_C_k_indices, Ti(nz2))
-                end
             end
             
-            # Store fine neighbor info for GPU kernel
+            # Store fine neighbor info for GPU kernel (a_ki not used in standard interp)
             fine_nbr_idx = length(fine_nbr_info) + 1
-            push!(fine_nbr_info, (k, nz_ik, diag_k_nz, a_ki_nz, sum_C_k_indices))
+            push!(fine_nbr_info, (k, nz_ik, diag_k_nz, Ti(0), sum_C_k_indices))
             
             # Record which coarse columns this fine neighbor contributes to
             for (cm2, (a_kj, nz_idx)) in coarse_vals_k
@@ -804,14 +852,13 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                 push!(fine_contribs_per_cm[cm2], (fine_nbr_idx, nz_idx))
             end
             
-            # Update contributions (keep original logic for value computation)
+            # Redistribute: distribute = a_{i,k} / sum_C_k
+            # Only the coarse contributions are updated; NO d_i update from a_{k,i}
+            # (matching hypre which never redistributes back to diagonal).
             if abs(sum_C_k) > eps(real(Tv))
                 distribute = a_ik / sum_C_k
                 for (cm2, (a_kj, _)) in coarse_vals_k
                     contributions[cm2] = get(contributions, cm2, zero(Tv)) + distribute * a_kj
-                end
-                if a_ki_nz > 0
-                    d_i += distribute * nzv[a_ki_nz]
                 end
             else
                 d_i += a_ik
@@ -927,6 +974,8 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
         numer_idx,
         denom_offsets,
         denom_entries,
+        # Direct interpolation alfa/beta data (empty for Standard)
+        Ti[], Ti[], Ti[], Ti[], Ti[],
         strong_nbrs_offsets,
         strong_nbrs_cols,
         strong_nbrs_nz,
@@ -1619,6 +1668,8 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
             numer_idx,
             denom_offsets,
             denom_entries,
+            # Direct interpolation alfa/beta data (empty for Extended+i)
+            Ti[], Ti[], Ti[], Ti[], Ti[],
             strong_nbrs_offsets,
             strong_nbrs_cols,
             strong_nbrs_nz,
@@ -1972,7 +2023,7 @@ GPU-compatible kernel for Direct interpolation P value update.
 
 For each P entry k:
 - If entry_type[k] == 0: P[k] = 1 (coarse point or fallback)
-- If entry_type[k] == 1: P[k] = -A[numer_idx[k]] / d_i where d_i = Σ A[denom_entries[j]]
+- If entry_type[k] == 1: Uses hypre's alfa/beta sign-based formula
 """
 function _update_P_direct_kernel!(P::ProlongationOp, A::CSRMatrix{Tv, Ti},
                                   P_update_map::ProlongationUpdateMap;
@@ -1981,37 +2032,83 @@ function _update_P_direct_kernel!(P::ProlongationOp, A::CSRMatrix{Tv, Ti},
     P_nzval = P.nzval
     entry_type = P_update_map.entry_type
     numer_idx = P_update_map.numer_idx
-    denom_offsets = P_update_map.denom_offsets
-    denom_entries = P_update_map.denom_entries
+    dir_diag_idx = P_update_map.dir_diag_idx
+    dir_all_offsets = P_update_map.dir_all_offsets
+    dir_all_entries = P_update_map.dir_all_entries
+    dir_sc_offsets = P_update_map.dir_sc_offsets
+    dir_sc_entries = P_update_map.dir_sc_entries
     
     # Use the same function that handles GPU/CPU mixing
-    _direct_interp_compute_values!(P_nzval, A_nzval, entry_type, numer_idx, 
-                                   denom_offsets, denom_entries;
+    _direct_interp_compute_values!(P_nzval, A_nzval, entry_type, numer_idx,
+                                   dir_diag_idx, dir_all_offsets, dir_all_entries,
+                                   dir_sc_offsets, dir_sc_entries;
                                    backend=backend, block_size=block_size)
     
     return P
 end
 
 @kernel function _p_direct_update_kernel!(P_nzval, @Const(A_nzval), @Const(entry_type),
-                                          @Const(numer_idx), @Const(denom_offsets), @Const(denom_entries))
+                                          @Const(numer_idx), @Const(dir_diag_idx),
+                                          @Const(dir_all_offsets), @Const(dir_all_entries),
+                                          @Const(dir_sc_offsets), @Const(dir_sc_entries))
     k = @index(Global)
     @inbounds begin
         if entry_type[k] == 0
             # Coarse point or fallback: P value = 1
             P_nzval[k] = one(eltype(P_nzval))
         else
-            # Direct formula: P[k] = -A[numer] / d_i
+            # Hypre's alfa/beta sign-based Direct interpolation formula:
+            # alfa = sum_N_neg / (sum_P_neg * diagonal)
+            # beta = sum_N_pos / (sum_P_pos * diagonal)
+            # P[k] = -alfa * a_{i,j} if a_{i,j} < 0
+            # P[k] = -beta * a_{i,j} if a_{i,j} > 0
             numer = numer_idx[k]
-            d_i = zero(eltype(A_nzval))
-            for j in denom_offsets[k]:(denom_offsets[k+1]-1)
-                d_i += A_nzval[denom_entries[j]]
+            a_ij = A_nzval[numer]
+            
+            # Get diagonal
+            diag_idx = dir_diag_idx[k]
+            diagonal = diag_idx > 0 ? A_nzval[diag_idx] : zero(eltype(A_nzval))
+            
+            # Compute sum_N_neg, sum_N_pos from all off-diagonal entries
+            sum_N_neg = zero(real(eltype(A_nzval)))
+            sum_N_pos = zero(real(eltype(A_nzval)))
+            for j in dir_all_offsets[k]:(dir_all_offsets[k+1]-1)
+                v = real(A_nzval[dir_all_entries[j]])
+                if v > 0
+                    sum_N_pos += v
+                else
+                    sum_N_neg += v
+                end
             end
-            abs_d_i = abs(d_i)
-            threshold = eps(real(eltype(A_nzval))) * max(one(real(eltype(A_nzval))), abs_d_i)
-            if abs_d_i > threshold
-                P_nzval[k] = -A_nzval[numer] / d_i
+            
+            # Compute sum_P_neg, sum_P_pos from strong C-neighbor entries
+            sum_P_neg = zero(real(eltype(A_nzval)))
+            sum_P_pos = zero(real(eltype(A_nzval)))
+            for j in dir_sc_offsets[k]:(dir_sc_offsets[k+1]-1)
+                v = real(A_nzval[dir_sc_entries[j]])
+                if v > 0
+                    sum_P_pos += v
+                else
+                    sum_P_neg += v
+                end
+            end
+            
+            # Compute alfa and beta
+            diag_val = real(diagonal)
+            alfa = one(real(eltype(A_nzval)))
+            beta = one(real(eltype(A_nzval)))
+            if sum_P_neg != zero(real(eltype(A_nzval)))
+                alfa = sum_N_neg / sum_P_neg / diag_val
+            end
+            if sum_P_pos != zero(real(eltype(A_nzval)))
+                beta = sum_N_pos / sum_P_pos / diag_val
+            end
+            
+            # Apply sign-based scaling
+            if real(a_ij) > 0
+                P_nzval[k] = -beta * a_ij
             else
-                P_nzval[k] = zero(eltype(P_nzval))
+                P_nzval[k] = -alfa * a_ij
             end
         end
     end
@@ -2079,11 +2176,7 @@ where:
                         numerator += distribute * A_nzval[a_kJ_idx]
                     end
                     
-                    # Contribution to d_i from a_{k,i}
-                    a_ki_idx = std_a_ki[fnbr_idx]
-                    if a_ki_idx > 0
-                        d_i += distribute * A_nzval[a_ki_idx]
-                    end
+                    # NO d_i update from a_{k,i} (matching hypre's standard interp)
                 else
                     # If sum_C_k is too small, add a_{i,k} to d_i
                     d_i += a_ik_val
@@ -2375,6 +2468,7 @@ function _update_P_standard!(P::ProlongationOp{Ti, Tv}, A::CSRMatrix{Tv, Ti},
                     break
                 end
             end
+            sgn = real(diag_k) < 0 ? -1 : 1
             sum_C_k = zero(Tv)
             coarse_vals_k = Dict{Int, Tv}()
             for nz2 in nzrange(A_cpu, k)
@@ -2383,26 +2477,19 @@ function _update_P_standard!(P::ProlongationOp{Ti, Tv}, A::CSRMatrix{Tv, Ti},
                 a_kj = nzv[nz2]
                 if cf[j2] == 1
                     cm2 = coarse_map[j2]
-                    if haskey(strong_coarse, cm2)
+                    if haskey(strong_coarse, cm2) && sgn * real(a_kj) < 0
                         coarse_vals_k[cm2] = get(coarse_vals_k, cm2, zero(Tv)) + a_kj
                         sum_C_k += a_kj
                     end
                 end
-                if j2 == i
-                    sum_C_k += a_kj
-                end
+                # a_{k,i} NOT included in sum (matching hypre)
             end
             if abs(sum_C_k) > eps(real(Tv))
                 distribute = a_ik / sum_C_k
                 for (cm2, a_kj) in coarse_vals_k
                     contributions[cm2] = get(contributions, cm2, zero(Tv)) + distribute * a_kj
                 end
-                for nz2 in nzrange(A_cpu, k)
-                    if cv[nz2] == i
-                        d_i += distribute * nzv[nz2]
-                        break
-                    end
-                end
+                # NO d_i update from a_{k,i} (matching hypre)
             else
                 d_i += a_ik
             end

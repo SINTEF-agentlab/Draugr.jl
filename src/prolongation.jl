@@ -281,15 +281,14 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
             end
             diag_positive[i] = real(a_ii) >= 0
             diag_sign = sign(real(a_ii))
-            # Fine point: count strong coarse neighbors with opposite sign
+            # Fine point: count strong coarse neighbors (no sign filtering —
+            # matching hypre's Direct interpolation where all strong C-connections
+            # are used for interpolation regardless of sign)
             for nz in nzrange(A, i)
                 j = cv[nz]
                 j == i && continue
                 if is_strong[nz] && cf[j] == 1
-                    # Only interpolate from opposite-sign connections
-                    if diag_sign == 0 || sign(real(nzv[nz])) != diag_sign
-                        row_counts[i] += 1
-                    end
+                    row_counts[i] += 1
                 end
             end
             if row_counts[i] == 0
@@ -382,8 +381,9 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                     # Diagonal always in denominator
                     push!(denom_nz_idx, Ti(nz))
                 else
-                    is_interp_coarse = is_strong[nz] && cf[j] == 1 &&
-                        sign(real(nzv[nz])) != diag_sign
+                    # Match hypre: all strong C-connections are interpolation
+                    # targets, non-strong/fine connections go to denominator
+                    is_interp_coarse = is_strong[nz] && cf[j] == 1
                     if is_interp_coarse
                         push!(strong_coarse_cols, Ti(coarse_map[j]))
                         push!(strong_coarse_nz_idx, Ti(nz))
@@ -762,19 +762,20 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                     break
                 end
             end
-            diag_k_val = diag_k_nz > 0 ? nzv[diag_k_nz] : zero(Tv)
-            sgn = real(diag_k_val) < 0 ? -1 : 1
             
-            # Find a_{k,i} index
+            # Find a_{k,i} index (no sign filtering — matching hypre's Standard
+            # interpolation where all connections participate in redistribution)
             a_ki_nz = Ti(0)
             for nz2 in nzrange(A, k)
-                if cv[nz2] == i && sgn * real(nzv[nz2]) < 0
+                if cv[nz2] == i
                     a_ki_nz = Ti(nz2)
                     break
                 end
             end
             
-            # Build sum_C_k indices and collect coarse contributions
+            # Build sum_C_k indices and collect coarse contributions.
+            # Include ALL a_{k,c} for c in C-hat(i) and a_{k,i} without sign
+            # filtering, matching hypre's Standard interpolation formula.
             sum_C_k_indices = Ti[]
             sum_C_k = zero(Tv)
             coarse_vals_k = Dict{Int, Tuple{Tv, Ti}}()  # cm -> (a_kc, nz_idx)
@@ -785,14 +786,14 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                 a_kj = nzv[nz2]
                 if cf[j2] == 1
                     cm2 = coarse_map[j2]
-                    if haskey(strong_coarse, cm2) && sgn * real(a_kj) < 0
+                    if haskey(strong_coarse, cm2)
                         old = get(coarse_vals_k, cm2, (zero(Tv), Ti(0)))
                         coarse_vals_k[cm2] = (old[1] + a_kj, Ti(nz2))
                         sum_C_k += a_kj
                         push!(sum_C_k_indices, Ti(nz2))
                     end
                 end
-                if j2 == i && sgn * real(a_kj) < 0
+                if j2 == i
                     sum_C_k += a_kj
                     push!(sum_C_k_indices, Ti(nz2))
                 end
@@ -2381,7 +2382,6 @@ function _update_P_standard!(P::ProlongationOp{Ti, Tv}, A::CSRMatrix{Tv, Ti},
                     break
                 end
             end
-            sgn = real(diag_k) < 0 ? -1 : 1
             sum_C_k = zero(Tv)
             coarse_vals_k = Dict{Int, Tv}()
             for nz2 in nzrange(A_cpu, k)
@@ -2390,12 +2390,12 @@ function _update_P_standard!(P::ProlongationOp{Ti, Tv}, A::CSRMatrix{Tv, Ti},
                 a_kj = nzv[nz2]
                 if cf[j2] == 1
                     cm2 = coarse_map[j2]
-                    if haskey(strong_coarse, cm2) && sgn * real(a_kj) < 0
+                    if haskey(strong_coarse, cm2)
                         coarse_vals_k[cm2] = get(coarse_vals_k, cm2, zero(Tv)) + a_kj
                         sum_C_k += a_kj
                     end
                 end
-                if j2 == i && sgn * real(a_kj) < 0
+                if j2 == i
                     sum_C_k += a_kj
                 end
             end
@@ -2405,7 +2405,7 @@ function _update_P_standard!(P::ProlongationOp{Ti, Tv}, A::CSRMatrix{Tv, Ti},
                     contributions[cm2] = get(contributions, cm2, zero(Tv)) + distribute * a_kj
                 end
                 for nz2 in nzrange(A_cpu, k)
-                    if cv[nz2] == i && sgn * real(nzv[nz2]) < 0
+                    if cv[nz2] == i
                         d_i += distribute * nzv[nz2]
                         break
                     end

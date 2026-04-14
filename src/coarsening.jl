@@ -570,12 +570,13 @@ function _rs_first_pass!(A::CSRMatrix{Tv, Ti}, is_strong::AbstractVector{Bool};
         cf[best_i] = 1  # C-point
 
         # For each undecided node j that strongly depends on best_i (S^T neighbors):
-        # mark as F-point (F_PT=-1, not Z_PT, matching hypre's main loop behavior)
+        # mark with f_pnt (Z_PT for HMIS, F_PT for RS), matching hypre where ALL
+        # F-points in the first pass use f_pnt so PMIS can re-evaluate them.
         @inbounds for idx in st_offsets[best_i]:(st_offsets[best_i + 1] - 1)
             j = st_sources[idx]
             cf[j] != 0 && continue
             _bucket_remove_node!(j, λ, bucket_head, bucket_next, bucket_prev)
-            cf[j] = -1  # F-point (permanent)
+            cf[j] = f_pnt  # Z_PT for HMIS, F_PT for RS
             # Increment λ for undecided nodes that j strongly depends on
             for nz2 in nzrange(A, j)
                 k = cv[nz2]
@@ -666,10 +667,11 @@ function _pmis_on_undecided!(cf::Vector{Int}, A::CSRMatrix{Tv, Ti},
         end
         all_decided && break
     end
-    # Any remaining undecided → F
+    # Any remaining undecided → C (matching hypre's PMIS behavior: undecided
+    # nodes that couldn't be resolved become C-points to ensure valid interpolation)
     @inbounds for i in 1:n
         if cf[i] == 0
-            cf[i] = -1
+            cf[i] = 1
         end
     end
 end
@@ -819,12 +821,29 @@ function coarsen_rs(A_in::CSRMatrix{Tv, Ti}, θ::Real;
                 end
             end
         end
-        # Decrement λ for nodes that best_i strongly depends on
+        # Decrement λ for nodes that best_i strongly depends on.
+        # When λ drops to 0, mark the node as F (matching hypre's RS behavior).
         @inbounds for nz in nzrange(A, best_i)
             j = cv[nz]
             if j != best_i && is_strong[nz] && cf[j] == 0
                 new_val = max(0, λ[j] - 1)
                 _bucket_update_node!(j, new_val, λ, bucket_head, bucket_next, bucket_prev)
+                if new_val == 0
+                    # Node has no more undecided dependents → mark as F
+                    _bucket_remove_node!(j, λ, bucket_head, bucket_next, bucket_prev)
+                    cf[j] = -1
+                    # Increment λ for its undecided strong neighbors
+                    for nz2 in nzrange(A, j)
+                        k = cv[nz2]
+                        if k != j && is_strong[nz2] && cf[k] == 0
+                            new_val2 = λ[k] + 1
+                            _bucket_update_node!(k, new_val2, λ, bucket_head, bucket_next, bucket_prev)
+                            if new_val2 > top_bucket
+                                top_bucket = new_val2
+                            end
+                        end
+                    end
+                end
             end
         end
     end

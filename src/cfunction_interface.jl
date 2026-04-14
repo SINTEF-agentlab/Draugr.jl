@@ -205,6 +205,7 @@ Base.@ccallable function draugr_amg_config_from_json(json_ptr::Ptr{UInt8})::Int3
             initial_coarsening_levels = _to_int(get(d, "initial_coarsening_levels", _DEFAULTS.initial_coarsening_levels)),
             max_row_sum           = _to_float(get(d, "max_row_sum", _DEFAULTS.max_row_sum)),
             coarse_solve_on_cpu   = _to_bool(get(d, "coarse_solve_on_cpu", _DEFAULTS.coarse_solve_on_cpu)),
+            reverse_post_smooth   = _to_bool(get(d, "reverse_post_smooth", _DEFAULTS.reverse_post_smooth)),
         )
 
         lock(_HANDLE_LOCK) do
@@ -275,6 +276,7 @@ Base.@ccallable function draugr_amg_setup(n::Int32, nnz_count::Int32,
             strength_type = config.strength_type,
             coarse_solve_on_cpu = config.coarse_solve_on_cpu,
             allow_partial_resetup = (allow_partial_resetup != Int32(0)),
+            reverse_post_smooth = config.reverse_post_smooth,
         )
         hierarchy = amg_setup(A, effective_config)
         lock(_HANDLE_LOCK) do
@@ -353,6 +355,7 @@ Base.@ccallable function draugr_amg_resetup(handle::Int32, n::Int32, nnz_count::
             strength_type = config.strength_type,
             coarse_solve_on_cpu = config.coarse_solve_on_cpu,
             allow_partial_resetup = (allow_partial_resetup != Int32(0)),
+            reverse_post_smooth = config.reverse_post_smooth,
         )
         amg_resetup!(hierarchy, A_csr, effective_config;
                      partial=(partial != Int32(0)))

@@ -201,8 +201,9 @@ function build_cf_prolongation(A::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                                interp::InterpolationType, θ::Real=0.25;
                                backend=DEFAULT_BACKEND, block_size::Int=64,
                                setup_workspace=nothing,
-                               build_update_map::Bool=false) where {Tv, Ti}
-    return _build_interpolation(A, cf, coarse_map, n_coarse, interp, θ; backend=backend, block_size=block_size, setup_workspace=setup_workspace, build_update_map=build_update_map)
+                               build_update_map::Bool=false,
+                               coarsening_is_strong::Union{Nothing, AbstractVector{Bool}}=nothing) where {Tv, Ti}
+    return _build_interpolation(A, cf, coarse_map, n_coarse, interp, θ; backend=backend, block_size=block_size, setup_workspace=setup_workspace, build_update_map=build_update_map, coarsening_is_strong=coarsening_is_strong)
 end
 
 # ── Direct interpolation ─────────────────────────────────────────────────────
@@ -232,11 +233,17 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                               ::DirectInterpolation, θ::Real=0.25;
                               backend=DEFAULT_BACKEND, block_size::Int=64,
                               setup_workspace=nothing,
-                              build_update_map::Bool=false) where {Tv, Ti}
-    # Compute strength on GPU if available, then convert to CPU for graph algorithms
-    is_strong_raw = strength_graph(A_in, θ; backend=backend, block_size=block_size,
-        is_strong=setup_workspace !== nothing ? setup_workspace.is_strong : nothing)
-    is_strong = is_strong_raw isa Array ? is_strong_raw : Array(is_strong_raw)
+                              build_update_map::Bool=false,
+                              coarsening_is_strong::Union{Nothing, AbstractVector{Bool}}=nothing) where {Tv, Ti}
+    # Use the coarsening strength graph if provided (ensures consistency when max_row_sum < 1.0),
+    # otherwise recompute from A_in.
+    if coarsening_is_strong !== nothing
+        is_strong = coarsening_is_strong isa Array ? coarsening_is_strong : Array(coarsening_is_strong)
+    else
+        is_strong_raw = strength_graph(A_in, θ; backend=backend, block_size=block_size,
+            is_strong=setup_workspace !== nothing ? setup_workspace.is_strong : nothing)
+        is_strong = is_strong_raw isa Array ? is_strong_raw : Array(is_strong_raw)
+    end
     A = csr_to_cpu(A_in)
     n_fine = size(A, 1)
     cv = colvals(A)
@@ -567,11 +574,17 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                               ::StandardInterpolation, θ::Real=0.25;
                               backend=DEFAULT_BACKEND, block_size::Int=64,
                               setup_workspace=nothing,
-                              build_update_map::Bool=false) where {Tv, Ti}
-    # Compute strength on GPU if available, then convert to CPU for graph algorithms
-    is_strong_raw = strength_graph(A_in, θ; backend=backend, block_size=block_size,
-        is_strong=setup_workspace !== nothing ? setup_workspace.is_strong : nothing)
-    is_strong = is_strong_raw isa Array ? is_strong_raw : Array(is_strong_raw)
+                              build_update_map::Bool=false,
+                              coarsening_is_strong::Union{Nothing, AbstractVector{Bool}}=nothing) where {Tv, Ti}
+    # Use the coarsening strength graph if provided (ensures consistency when max_row_sum < 1.0),
+    # otherwise recompute from A_in.
+    if coarsening_is_strong !== nothing
+        is_strong = coarsening_is_strong isa Array ? coarsening_is_strong : Array(coarsening_is_strong)
+    else
+        is_strong_raw = strength_graph(A_in, θ; backend=backend, block_size=block_size,
+            is_strong=setup_workspace !== nothing ? setup_workspace.is_strong : nothing)
+        is_strong = is_strong_raw isa Array ? is_strong_raw : Array(is_strong_raw)
+    end
     A = csr_to_cpu(A_in)
     n_fine = size(A, 1)
     cv = colvals(A)
@@ -978,11 +991,17 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                               interp::ExtendedIInterpolation, θ::Real=0.25;
                               backend=DEFAULT_BACKEND, block_size::Int=64,
                               setup_workspace=nothing,
-                              build_update_map::Bool=false) where {Tv, Ti}
-    # Compute strength on GPU if available, then convert to CPU for graph algorithms
-    is_strong_raw = strength_graph(A_in, θ; backend=backend, block_size=block_size,
-        is_strong=setup_workspace !== nothing ? setup_workspace.is_strong : nothing)
-    is_strong = is_strong_raw isa Array ? is_strong_raw : Array(is_strong_raw)
+                              build_update_map::Bool=false,
+                              coarsening_is_strong::Union{Nothing, AbstractVector{Bool}}=nothing) where {Tv, Ti}
+    # Use the coarsening strength graph if provided (ensures consistency when max_row_sum < 1.0),
+    # otherwise recompute from A_in.
+    if coarsening_is_strong !== nothing
+        is_strong = coarsening_is_strong isa Array ? coarsening_is_strong : Array(coarsening_is_strong)
+    else
+        is_strong_raw = strength_graph(A_in, θ; backend=backend, block_size=block_size,
+            is_strong=setup_workspace !== nothing ? setup_workspace.is_strong : nothing)
+        is_strong = is_strong_raw isa Array ? is_strong_raw : Array(is_strong_raw)
+    end
     A = csr_to_cpu(A_in)
     n_fine = size(A, 1)
     cv = colvals(A)
@@ -1073,6 +1092,11 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
     chat_indices = Int[]
     sizehint!(chat_indices, max_chat_est; shrink=false)
 
+    # Pre-allocate workspace arrays for weight computation (avoid per-row allocations)
+    P_data_ws = zeros(Tv, max_chat_est)
+    keep_ws = Vector{Int}(undef, max_chat_est)
+    kept_flags = Vector{Bool}(undef, max_chat_est)
+
     # Build sparsity pattern and compute initial values
     @inbounds for i in 1:n_fine
         if cf[i] == 1
@@ -1124,7 +1148,15 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
         end
 
         # Compute weights (matching hypre's ExtPI formula)
-        P_data = zeros(Tv, n_chat)
+        # Grow pre-allocated workspace if needed
+        if n_chat > length(P_data_ws)
+            resize!(P_data_ws, n_chat)
+            resize!(keep_ws, n_chat)
+            resize!(kept_flags, n_chat)
+        end
+        for idx in 1:n_chat
+            P_data_ws[idx] = zero(Tv)
+        end
         diagonal = zero(Tv)
 
         for nz in nzrange(A, i)
@@ -1138,7 +1170,7 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
 
             p_idx = P_marker[j]
             if p_idx >= 0
-                P_data[p_idx + 1] += a_ij
+                P_data_ws[p_idx + 1] += a_ij
             elseif p_idx == strong_f_marker
                 diag_j = zero(Tv)
                 for nz3 in nzrange(A, j)
@@ -1170,7 +1202,7 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                         if sgn * real(a_jm) < 0
                             p_idx_m = P_marker[m]
                             if p_idx_m >= 0
-                                P_data[p_idx_m + 1] += distribute * a_jm
+                                P_data_ws[p_idx_m + 1] += distribute * a_jm
                             elseif m == i
                                 diagonal += distribute * a_jm
                             end
@@ -1184,36 +1216,51 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
             end
         end
 
-        # Finalize weights: P[j] = P_data[j] / (-diagonal)
+        # Finalize weights: P[j] = P_data_ws[j] / (-diagonal)
         if abs(diagonal) > eps(real(Tv))
             for idx in 1:n_chat
-                P_data[idx] /= -diagonal
+                P_data_ws[idx] /= -diagonal
             end
         end
 
         # Truncation (trunc_factor + max_elements limit)
-        keep = collect(1:n_chat)
+        n_keep = n_chat
+        for idx in 1:n_chat
+            keep_ws[idx] = idx
+        end
         if trunc_factor > 0 && n_chat > 0
             max_w = zero(real(Tv))
             for idx in 1:n_chat
-                max_w = max(max_w, abs(P_data[idx])^norm_p)
+                max_w = max(max_w, abs(P_data_ws[idx])^norm_p)
             end
             threshold = trunc_factor * max_w
-            keep = [idx for idx in 1:n_chat if abs(P_data[idx])^norm_p >= threshold]
+            n_keep = 0
+            for idx in 1:n_chat
+                if abs(P_data_ws[idx])^norm_p >= threshold
+                    n_keep += 1
+                    keep_ws[n_keep] = idx
+                end
+            end
         end
-        if max_elements > 0 && length(keep) > max_elements
-            sort!(keep; by = idx -> abs(P_data[idx]), rev = true)
-            resize!(keep, max_elements)
+        if max_elements > 0 && n_keep > max_elements
+            sort!(view(keep_ws, 1:n_keep); by = idx -> abs(P_data_ws[idx]), rev = true)
+            n_keep = max_elements
         end
         
         # Compute rescaling factor if enabled
         row_scale = one(Tv)
-        if do_rescale && length(keep) < n_chat
-            sum_removed = zero(Tv)
-            kept_set = Set(keep)
+        if do_rescale && n_keep < n_chat
+            # Mark which indices are kept
             for idx in 1:n_chat
-                if !(idx in kept_set)
-                    sum_removed += P_data[idx]
+                kept_flags[idx] = false
+            end
+            for k in 1:n_keep
+                kept_flags[keep_ws[k]] = true
+            end
+            sum_removed = zero(Tv)
+            for idx in 1:n_chat
+                if !kept_flags[idx]
+                    sum_removed += P_data_ws[idx]
                 end
             end
             denom = one(Tv) - sum_removed
@@ -1221,8 +1268,9 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                 row_scale = one(Tv) / denom
             end
         end
-        for idx in keep
-            push!(I_p, Ti(i)); push!(J_p, Ti(coarse_map[chat_indices[idx]])); push!(V_p, P_data[idx] * row_scale)
+        for k in 1:n_keep
+            idx = keep_ws[k]
+            push!(I_p, Ti(i)); push!(J_p, Ti(coarse_map[chat_indices[idx]])); push!(V_p, P_data_ws[idx] * row_scale)
             if do_rescale; push!(S_p, row_scale); end
         end
 

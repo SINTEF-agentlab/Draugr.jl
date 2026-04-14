@@ -1,3 +1,8 @@
+# Minimum number of rows in a level-scheduled ILU level before spawning threads.
+# Below this threshold, the threading overhead from Threads.@threads outweighs
+# the parallel benefit, so levels are processed with a plain serial loop.
+const _ILU0_MIN_PARALLEL_ROWS = 64
+
 # ── Block-aware helpers ───────────────────────────────────────────────────────
 # For scalars, _frobenius_norm2 is just abs2(v). For block matrices (SMatrix),
 # it computes the squared Frobenius norm: sum of abs2 of all elements = tr(v' * v).
@@ -1547,31 +1552,55 @@ function smooth!(x::AbstractVector, A::CSRMatrix{Tv, Ti}, b::AbstractVector,
 
         # Forward substitution: L * z = tmp, using level scheduling.
         # Within each level, rows are independent and can be processed in parallel.
+        # Only spawn threads when a level is large enough to offset the overhead.
         @inbounds for lev in 1:num_fwd_levels
             lev_start = combined_offsets[lev]
             lev_end = combined_offsets[lev+1] - 1
-            Threads.@threads for idx in lev_start:lev_end
-                i = fwd_order[idx]
-                for nz in rp[i]:(diag_idx[i]-ti_one)
-                    j = cv[nz]
-                    tmp[i] -= L_nzval[nz] * tmp[j]
+            if lev_end - lev_start + 1 >= _ILU0_MIN_PARALLEL_ROWS
+                Threads.@threads for idx in lev_start:lev_end
+                    i = fwd_order[idx]
+                    for nz in rp[i]:(diag_idx[i]-ti_one)
+                        j = cv[nz]
+                        tmp[i] -= L_nzval[nz] * tmp[j]
+                    end
+                end
+            else
+                for idx in lev_start:lev_end
+                    i = fwd_order[idx]
+                    for nz in rp[i]:(diag_idx[i]-ti_one)
+                        j = cv[nz]
+                        tmp[i] -= L_nzval[nz] * tmp[j]
+                    end
                 end
             end
         end
 
         # Backward substitution: U * dx = z, using level scheduling.
         # Within each level, rows are independent and can be processed in parallel.
+        # Only spawn threads when a level is large enough to offset the overhead.
         @inbounds for lev in 1:num_bwd_levels
             lev_start = combined_offsets[bwd_offset_start + lev - 1]
             lev_end = combined_offsets[bwd_offset_start + lev] - 1
-            Threads.@threads for idx in lev_start:lev_end
-                i = bwd_order[idx]
-                for nz in (diag_idx[i]+ti_one):(rp[i+ti_one]-ti_one)
-                    j = cv[nz]
-                    tmp[i] -= U_nzval[nz] * tmp[j]
+            if lev_end - lev_start + 1 >= _ILU0_MIN_PARALLEL_ROWS
+                Threads.@threads for idx in lev_start:lev_end
+                    i = bwd_order[idx]
+                    for nz in (diag_idx[i]+ti_one):(rp[i+ti_one]-ti_one)
+                        j = cv[nz]
+                        tmp[i] -= U_nzval[nz] * tmp[j]
+                    end
+                    u_ii = U_nzval[diag_idx[i]]
+                    tmp[i] = _entry_norm(u_ii) > eps(_scalar_real_type(Tv)) ? u_ii \ tmp[i] : zero(Tx)
                 end
-                u_ii = U_nzval[diag_idx[i]]
-                tmp[i] = _entry_norm(u_ii) > eps(_scalar_real_type(Tv)) ? u_ii \ tmp[i] : zero(Tx)
+            else
+                for idx in lev_start:lev_end
+                    i = bwd_order[idx]
+                    for nz in (diag_idx[i]+ti_one):(rp[i+ti_one]-ti_one)
+                        j = cv[nz]
+                        tmp[i] -= U_nzval[nz] * tmp[j]
+                    end
+                    u_ii = U_nzval[diag_idx[i]]
+                    tmp[i] = _entry_norm(u_ii) > eps(_scalar_real_type(Tv)) ? u_ii \ tmp[i] : zero(Tx)
+                end
             end
         end
 

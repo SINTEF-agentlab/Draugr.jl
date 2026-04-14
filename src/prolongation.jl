@@ -818,31 +818,39 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
             sgn = real(diag_k_val) < 0 ? -1 : 1
             
             # Build sum_C_k: sum of a_{k,c} for c ∈ C_i^s (strong coarse neighbors of i)
-            # with sign filtering: only include entries where sgn * a_{k,c} < 0
+            # PLUS a_{k,i} (the connection back to fine point i), with sign filtering:
+            # only include entries where sgn * a_{k,m} < 0
             # (matching hypre's Standard interpolation in par_interp.c).
-            # Note: a_{k,i} is NOT included in sum (hypre only sums P_marker entries).
             sum_C_k_indices = Ti[]
             sum_C_k = zero(Tv)
             coarse_vals_k = Dict{Int, Tuple{Tv, Ti}}()  # cm -> (a_kc, nz_idx)
+            a_ki_nz = Ti(0)  # nz index for a_{k,i} (connection back to i)
             
             for nz2 in nzrange(A, k)
                 j2 = cv[nz2]
                 j2 == k && continue
                 a_kj = nzv[nz2]
-                if cf[j2] == 1
-                    cm2 = coarse_map[j2]
-                    if haskey(strong_coarse, cm2) && sgn * real(a_kj) < 0
-                        old = get(coarse_vals_k, cm2, (zero(Tv), Ti(0)))
-                        coarse_vals_k[cm2] = (old[1] + a_kj, Ti(nz2))
+                if sgn * real(a_kj) < 0
+                    if j2 == i
+                        # Connection back to fine point i: include in sum (matching hypre)
                         sum_C_k += a_kj
                         push!(sum_C_k_indices, Ti(nz2))
+                        a_ki_nz = Ti(nz2)
+                    elseif cf[j2] == 1
+                        cm2 = coarse_map[j2]
+                        if haskey(strong_coarse, cm2)
+                            old = get(coarse_vals_k, cm2, (zero(Tv), Ti(0)))
+                            coarse_vals_k[cm2] = (old[1] + a_kj, Ti(nz2))
+                            sum_C_k += a_kj
+                            push!(sum_C_k_indices, Ti(nz2))
+                        end
                     end
                 end
             end
             
-            # Store fine neighbor info for GPU kernel (a_ki not used in standard interp)
+            # Store fine neighbor info for GPU kernel
             fine_nbr_idx = length(fine_nbr_info) + 1
-            push!(fine_nbr_info, (k, nz_ik, diag_k_nz, Ti(0), sum_C_k_indices))
+            push!(fine_nbr_info, (k, nz_ik, diag_k_nz, a_ki_nz, sum_C_k_indices))
             
             # Record which coarse columns this fine neighbor contributes to
             for (cm2, (a_kj, nz_idx)) in coarse_vals_k
@@ -853,12 +861,15 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
             end
             
             # Redistribute: distribute = a_{i,k} / sum_C_k
-            # Only the coarse contributions are updated; NO d_i update from a_{k,i}
-            # (matching hypre which never redistributes back to diagonal).
+            # a_{k,i} redistribution goes to diagonal (matching hypre).
             if abs(sum_C_k) > eps(real(Tv))
                 distribute = a_ik / sum_C_k
                 for (cm2, (a_kj, _)) in coarse_vals_k
                     contributions[cm2] = get(contributions, cm2, zero(Tv)) + distribute * a_kj
+                end
+                # Redistribute a_{k,i} back to diagonal (matching hypre)
+                if a_ki_nz > 0
+                    d_i += distribute * nzv[a_ki_nz]
                 end
             else
                 d_i += a_ik
@@ -878,7 +889,10 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
             push!(std_d_base_offsets_list, Ti(length(std_d_base_entries_list) + 1))
         else
             # Add entries for all contributing coarse columns
-            for (cm, val) in contributions
+            # Sort by coarse column to ensure COO order matches CSR sorted order
+            sorted_cms = sort!(collect(keys(contributions)))
+            for cm in sorted_cms
+                val = contributions[cm]
                 w = abs(d_i) > eps(real(Tv)) ? -val / d_i : zero(Tv)
                 push!(I_p, Ti(i)); push!(J_p, Ti(cm)); push!(V_p, w)
                 # For Standard interpolation, mark as type 2 (needs full recomputation)
@@ -2177,7 +2191,11 @@ where:
                         numerator += distribute * A_nzval[a_kJ_idx]
                     end
                     
-                    # NO d_i update from a_{k,i} (matching hypre's standard interp)
+                    # Redistribute a_{k,i} back to diagonal (matching hypre)
+                    a_ki_idx = std_a_ki[fnbr_idx]
+                    if a_ki_idx > 0
+                        d_i += distribute * A_nzval[a_ki_idx]
+                    end
                 else
                     # If sum_C_k is too small, add a_{i,k} to d_i
                     d_i += a_ik_val
@@ -2297,28 +2315,38 @@ The formula is: P[k] = -numerator / d_i where:
                 diag_k_val = diag_k_idx > 0 ? A_nzval[diag_k_idx] : zero(eltype(A_nzval))
                 
                 # Compute sum_C_k (sum of connections from k to C-hat ∪ {i})
+                # with sign filtering: only include entries where sgn * a_{k,m} < 0
+                # (matching hypre's Extended+i interpolation)
+                sgn_k = real(diag_k_val) < zero(real(eltype(A_nzval))) ? -one(real(eltype(A_nzval))) : one(real(eltype(A_nzval)))
                 sum_C_k = zero(eltype(A_nzval))
                 for j in extd_sum_offsets[fnbr_idx]:(extd_sum_offsets[fnbr_idx+1]-1)
-                    sum_C_k += A_nzval[extd_sum_indices[j]]
+                    a_val = A_nzval[extd_sum_indices[j]]
+                    if sgn_k * real(a_val) < zero(real(eltype(A_nzval)))
+                        sum_C_k += a_val
+                    end
                 end
                 
                 if abs(sum_C_k) > eps(real(eltype(A_nzval)))
                     distribute = a_ik_val / sum_C_k
                     
                     # Distribute contributions to C-hat and diagonal
+                    # with sign filtering (matching hypre)
                     for contrib_idx in extd_contrib_offsets[fnbr_idx]:(extd_contrib_offsets[fnbr_idx+1]-1)
                         a_km_idx = extd_contrib_a_idx[contrib_idx]
                         contrib_col = extd_contrib_p_col[contrib_idx]
                         a_km_val = A_nzval[a_km_idx]
                         
-                        if contrib_col == target_col
-                            # Contribution to this P entry's numerator
-                            numerator += distribute * a_km_val
-                        elseif contrib_col == 0
-                            # Contribution to diagonal (contrib_col == 0 means this is A[k,i])
-                            d_i += distribute * a_km_val
+                        # Only distribute entries with opposite sign to fine neighbor's diagonal
+                        if sgn_k * real(a_km_val) < zero(real(eltype(A_nzval)))
+                            if contrib_col == target_col
+                                # Contribution to this P entry's numerator
+                                numerator += distribute * a_km_val
+                            elseif contrib_col == 0
+                                # Contribution to diagonal (contrib_col == 0 means this is A[k,i])
+                                d_i += distribute * a_km_val
+                            end
+                            # Note: contributions to other P columns are handled by their respective P entries
                         end
-                        # Note: contributions to other P columns are handled by their respective P entries
                     end
                 else
                     # If sum_C_k is too small, add A[i,k] to d_i

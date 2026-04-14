@@ -72,7 +72,7 @@ function _vcycle_descend!(x::AbstractVector{Tv}, b::AbstractVector{Tv},
     xc = level.xc
     bc = level.bc
     # Pre-smoothing
-    smooth!(x, A, b, level.smoother; steps=config.pre_smoothing_steps, backend=backend, block_size=block_size)
+    smooth!(x, A, b, level.smoother; steps=config.pre_smoothing_steps, reverse=false, backend=backend, block_size=block_size)
     # Compute residual: r = b - A*x (parallelized, no allocations)
     compute_residual!(r, A, x, b; backend=backend, block_size=block_size)
     # Restrict residual to coarse grid
@@ -93,8 +93,8 @@ function _vcycle_descend!(x::AbstractVector{Tv}, b::AbstractVector{Tv},
     end
     # Prolongate and correct: x += P * xc
     prolongate!(x, P, xc; backend=backend, block_size=block_size)
-    # Post-smoothing
-    smooth!(x, A, b, level.smoother; steps=config.post_smoothing_steps, backend=backend, block_size=block_size)
+    # Post-smoothing (backward sweep for GS-type smoothers when configured, matching HYPRE)
+    smooth!(x, A, b, level.smoother; steps=config.post_smoothing_steps, reverse=config.reverse_post_smooth, backend=backend, block_size=block_size)
     return x
 end
 

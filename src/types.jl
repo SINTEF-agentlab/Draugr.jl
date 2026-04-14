@@ -713,6 +713,11 @@ Fields:
   during setup so that `amg_resetup!(…; partial=true)` can update values in-place
   without re-coarsening. Set to `false` for a faster initial setup when only full
   resetup will be used.
+- `reverse_post_smooth`: If `true` (the default), post-smoothing uses the backward
+  sweep direction (rows n→1 for serial GS, reversed color order for colored GS).
+  This matches HYPRE's default of forward pre-smoothing and backward post-smoothing,
+  producing a more effective AMG preconditioner. Set to `false` to use the same
+  forward direction for both pre- and post-smoothing.
 """
 struct AMGConfig
     coarsening::CoarseningAlgorithm
@@ -730,6 +735,7 @@ struct AMGConfig
     strength_type::StrengthType
     coarse_solve_on_cpu::Bool
     allow_partial_resetup::Bool
+    reverse_post_smooth::Bool
 end
 
 function AMGConfig(;
@@ -748,6 +754,7 @@ function AMGConfig(;
     strength_type::StrengthType = AbsoluteStrength(),
     coarse_solve_on_cpu::Bool = false,
     allow_partial_resetup::Bool = true,
+    reverse_post_smooth::Bool = true,
 )
     @assert cycle_type in (:V, :W) "cycle_type must be :V or :W"
     verbose_int = verbose isa Bool ? Int(verbose) : verbose
@@ -755,7 +762,7 @@ function AMGConfig(;
                      pre_smoothing_steps, post_smoothing_steps, jacobi_omega, verbose_int,
                      initial_coarsening, initial_coarsening_levels,
                      max_row_sum, cycle_type, strength_type, coarse_solve_on_cpu,
-                     allow_partial_resetup)
+                     allow_partial_resetup, reverse_post_smooth)
 end
 
 """

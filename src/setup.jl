@@ -286,7 +286,7 @@ function _build_coarse_solver(A_current::CSRMatrix{Tv}, A_ref::CSRMatrix,
         _csr_to_dense!(coarse_cpu, A_cpu)
         if config.coarse_solve_on_cpu
             coarse_dense = coarse_cpu
-            coarse_factor = lu(coarse_dense)
+            coarse_factor = _safe_lu(coarse_dense)
         else
             coarse_dev = _allocate_dense_matrix(A_ref, Tv, n_coarse, n_coarse)
             copyto!(coarse_dev, coarse_cpu)
@@ -301,7 +301,7 @@ function _build_coarse_solver(A_current::CSRMatrix{Tv}, A_ref::CSRMatrix,
         coarse_dense = Matrix{Tv}(undef, n_coarse, n_coarse)
         A_cpu = csr_to_cpu(A_current)
         _csr_to_dense!(coarse_dense, A_cpu)
-        coarse_factor = lu(coarse_dense)
+        coarse_factor = _safe_lu(coarse_dense)
         coarse_x = Vector{Tv}(undef, n_coarse)
         coarse_b = Vector{Tv}(undef, n_coarse)
         solve_r = Vector{Tv}(undef, n_finest)
@@ -636,6 +636,33 @@ end
 end
 
 """
+    _safe_lu(M::Matrix{Tv}) -> LU factorization
+
+Compute an LU factorization of `M`, with a regularization fallback for
+singular or near-singular matrices. Uses `check=false` so that a `SingularException`
+is never thrown; instead, a small diagonal perturbation is added when the
+factorization is rank-deficient (detected via `issuccess`).
+
+This guards against Julia 1.12 (and later) where `lu()` is stricter about
+raising `SingularException` for rank-deficient coarse-level matrices that
+occasionally arise in degenerate AMG coarsening scenarios.
+"""
+function _safe_lu(M::Matrix{Tv}) where Tv
+    F = lu(M; check=false)
+    if issuccess(F)
+        return F
+    end
+    # Matrix is singular — add a small diagonal regularization and retry
+    n = size(M, 1)
+    reg = sqrt(eps(real(Tv))) * max(norm(M, Inf), one(real(Tv)))
+    M_reg = copy(M)
+    @inbounds for i in 1:n
+        M_reg[i, i] += reg
+    end
+    return lu(M_reg)
+end
+
+"""
     _build_coarse_lu(M::AbstractMatrix{Tv}) -> (dense_matrix, factorization)
 
 Build an LU factorization of the dense coarse matrix `M`.
@@ -644,11 +671,16 @@ For GPU arrays without native `lu()` support, falls back to CPU.
 Returns a tuple of (dense_matrix, factorization) where both are on the same device.
 """
 function _build_coarse_lu(M::AbstractMatrix{Tv}) where {Tv}
+    if M isa Matrix{Tv}
+        # CPU matrix: use safe LU with regularization fallback
+        return M, _safe_lu(M)
+    end
     try
+        # GPU matrix: try native lu (e.g., CUDA.jl's lu)
         return M, lu(M)
     catch
         # Fall back to CPU if the GPU backend doesn't support lu()
         M_cpu = Matrix{Tv}(M)
-        return M_cpu, lu(M_cpu)
+        return M_cpu, _safe_lu(M_cpu)
     end
 end

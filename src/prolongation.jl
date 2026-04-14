@@ -253,16 +253,14 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
     # PHASE 1: Build sparsity pattern and update map (graph structure only)
     # ══════════════════════════════════════════════════════════════════════════
     
-    # First pass: count entries per row and determine sign classification
+    # First pass: count entries per row
     row_counts = zeros(Int, n_fine)
-    diag_positive = Vector{Bool}(undef, n_fine)
     diag_nz_idx = Vector{Ti}(undef, n_fine)
     
     @inbounds for i in 1:n_fine
         diag_nz_idx[i] = Ti(0)
         if cf[i] == 1
             row_counts[i] = 1  # coarse point: identity mapping
-            diag_positive[i] = true
             for nz in nzrange(A, i)
                 if cv[nz] == i
                     diag_nz_idx[i] = Ti(nz)
@@ -270,17 +268,13 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                 end
             end
         else
-            # Find diagonal sign and index
-            a_ii = zero(Tv)
+            # Find diagonal index
             for nz in nzrange(A, i)
                 if cv[nz] == i
-                    a_ii = nzv[nz]
                     diag_nz_idx[i] = Ti(nz)
                     break
                 end
             end
-            diag_positive[i] = real(a_ii) >= 0
-            diag_sign = sign(real(a_ii))
             # Fine point: count strong coarse neighbors (no sign filtering —
             # matching hypre's Direct interpolation where all strong C-connections
             # are used for interpolation regardless of sign)
@@ -369,7 +363,6 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
             numer_idx[pos] = Ti(0)
             denom_offsets[pos] = Ti(length(denom_entries_list) + 1)
         else
-            diag_sign = diag_positive[i] ? 1 : -1
             # Clear workspace buffers (reuse allocations)
             empty!(strong_coarse_cols)
             empty!(strong_coarse_nz_idx)

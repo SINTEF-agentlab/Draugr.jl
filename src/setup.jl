@@ -388,10 +388,10 @@ function _coarsen_and_build_P(A::CSRMatrix, alg::CoarseningAlgorithm,
         coarsening_is_strong = nothing
         if config.max_row_sum < 1.0
             A_weak = _apply_max_row_sum(csr_to_cpu(A), config.max_row_sum)
-            is_strong_raw = strength_graph(A_weak, alg.θ; backend=backend, block_size=block_size)
+            is_strong_raw = strength_graph(A_weak, alg.θ, config.strength_type; backend=backend, block_size=block_size)
             coarsening_is_strong = is_strong_raw isa Array ? is_strong_raw : Array(is_strong_raw)
         end
-        P, P_update_map = build_cf_prolongation(A, cf, coarse_map, n_coarse, alg.interpolation, alg.θ; backend=backend, block_size=block_size, setup_workspace=setup_workspace, build_update_map=build_P_update_map, coarsening_is_strong=coarsening_is_strong)
+        P, P_update_map = build_cf_prolongation(A, cf, coarse_map, n_coarse, alg.interpolation, alg.θ; backend=backend, block_size=block_size, setup_workspace=setup_workspace, build_update_map=build_P_update_map, coarsening_is_strong=coarsening_is_strong, strength_type=config.strength_type)
         # Apply interpolation truncation if configured.
         # ExtendedIInterpolation handles truncation internally (trunc_factor + max_elements),
         # so skip the outer truncation to avoid double truncation.
@@ -447,12 +447,12 @@ function _coarsen_and_build_P(A::CSRMatrix, alg::AggressiveCoarsening,
     coarsening_is_strong = nothing
     if config.max_row_sum < 1.0
         A_weak = _apply_max_row_sum(csr_to_cpu(A), config.max_row_sum)
-        is_strong_raw = strength_graph(A_weak, alg.θ; backend=backend, block_size=block_size)
+        is_strong_raw = strength_graph(A_weak, alg.θ, config.strength_type; backend=backend, block_size=block_size)
         coarsening_is_strong = is_strong_raw isa Array ? is_strong_raw : Array(is_strong_raw)
     end
     if alg.base == :hmis
         cf, coarse_map, n_coarse = coarsen_aggressive_cf(A, alg.θ, :hmis; config=config, backend=backend, block_size=block_size, setup_workspace=setup_workspace)
-        P, P_update_map = build_cf_prolongation(A, cf, coarse_map, n_coarse, alg.interpolation, alg.θ; backend=backend, block_size=block_size, setup_workspace=setup_workspace, build_update_map=build_P_update_map, coarsening_is_strong=coarsening_is_strong)
+        P, P_update_map = build_cf_prolongation(A, cf, coarse_map, n_coarse, alg.interpolation, alg.θ; backend=backend, block_size=block_size, setup_workspace=setup_workspace, build_update_map=build_P_update_map, coarsening_is_strong=coarsening_is_strong, strength_type=config.strength_type)
         if !(alg.interpolation isa ExtendedIInterpolation)
             tf = _get_trunc_factor(alg.interpolation)
             if tf > 0
@@ -462,7 +462,7 @@ function _coarsen_and_build_P(A::CSRMatrix, alg::AggressiveCoarsening,
         return P, n_coarse, P_update_map
     elseif alg.base == :pmis
         cf, coarse_map, n_coarse = coarsen_aggressive_cf(A, alg.θ, :pmis; config=config, backend=backend, block_size=block_size, setup_workspace=setup_workspace)
-        P, P_update_map = build_cf_prolongation(A, cf, coarse_map, n_coarse, alg.interpolation, alg.θ; backend=backend, block_size=block_size, setup_workspace=setup_workspace, build_update_map=build_P_update_map, coarsening_is_strong=coarsening_is_strong)
+        P, P_update_map = build_cf_prolongation(A, cf, coarse_map, n_coarse, alg.interpolation, alg.θ; backend=backend, block_size=block_size, setup_workspace=setup_workspace, build_update_map=build_P_update_map, coarsening_is_strong=coarsening_is_strong, strength_type=config.strength_type)
         if !(alg.interpolation isa ExtendedIInterpolation)
             tf = _get_trunc_factor(alg.interpolation)
             if tf > 0

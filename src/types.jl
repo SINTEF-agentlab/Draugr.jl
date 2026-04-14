@@ -711,8 +711,9 @@ Fields:
   When < 1.0, rows where |row_sum| > |a_ii| * max_row_sum have all off-diagonal entries
   zeroed out (all dependencies made weak), matching the hypre definition.
 - `cycle_type`: AMG cycle type, `:V` for V-cycle or `:W` for W-cycle (default: `:V`)
-- `strength_type`: Strength of connection algorithm (default: `AbsoluteStrength()`).
-  Use `SignedStrength()` for non-M-matrices with positive off-diagonals.
+- `strength_type`: Strength of connection algorithm (default: `SignedStrength()`).
+  Matches hypre's default signed strength, which only marks opposite-sign off-diagonals
+  as strong. Use `AbsoluteStrength()` for sign-agnostic strength based on magnitudes.
 - `coarse_solve_on_cpu`: If `true`, the coarsest-level LU factorization and direct
   solve are performed on CPU even when using a GPU backend. Required for backends
   that do not support `lu` on device (e.g., Apple Metal). Default: `false`.
@@ -758,7 +759,7 @@ function AMGConfig(;
     initial_coarsening_levels::Int = 0,
     max_row_sum::Float64 = 1.0,
     cycle_type::Symbol = :V,
-    strength_type::StrengthType = AbsoluteStrength(),
+    strength_type::StrengthType = SignedStrength(),
     coarse_solve_on_cpu::Bool = false,
     allow_partial_resetup::Bool = true,
     reverse_post_smooth::Bool = true,

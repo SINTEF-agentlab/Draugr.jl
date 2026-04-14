@@ -202,8 +202,9 @@ function build_cf_prolongation(A::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                                backend=DEFAULT_BACKEND, block_size::Int=64,
                                setup_workspace=nothing,
                                build_update_map::Bool=false,
-                               coarsening_is_strong::Union{Nothing, AbstractVector{Bool}}=nothing) where {Tv, Ti}
-    return _build_interpolation(A, cf, coarse_map, n_coarse, interp, θ; backend=backend, block_size=block_size, setup_workspace=setup_workspace, build_update_map=build_update_map, coarsening_is_strong=coarsening_is_strong)
+                               coarsening_is_strong::Union{Nothing, AbstractVector{Bool}}=nothing,
+                               strength_type::StrengthType=SignedStrength()) where {Tv, Ti}
+    return _build_interpolation(A, cf, coarse_map, n_coarse, interp, θ; backend=backend, block_size=block_size, setup_workspace=setup_workspace, build_update_map=build_update_map, coarsening_is_strong=coarsening_is_strong, strength_type=strength_type)
 end
 
 # ── Direct interpolation ─────────────────────────────────────────────────────
@@ -234,13 +235,14 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                               backend=DEFAULT_BACKEND, block_size::Int=64,
                               setup_workspace=nothing,
                               build_update_map::Bool=false,
-                              coarsening_is_strong::Union{Nothing, AbstractVector{Bool}}=nothing) where {Tv, Ti}
+                              coarsening_is_strong::Union{Nothing, AbstractVector{Bool}}=nothing,
+                              strength_type::StrengthType=SignedStrength()) where {Tv, Ti}
     # Use the coarsening strength graph if provided (ensures consistency when max_row_sum < 1.0),
     # otherwise recompute from A_in.
     if coarsening_is_strong !== nothing
         is_strong = coarsening_is_strong isa Array ? coarsening_is_strong : Array(coarsening_is_strong)
     else
-        is_strong_raw = strength_graph(A_in, θ; backend=backend, block_size=block_size,
+        is_strong_raw = strength_graph(A_in, θ, strength_type; backend=backend, block_size=block_size,
             is_strong=setup_workspace !== nothing ? setup_workspace.is_strong : nothing)
         is_strong = is_strong_raw isa Array ? is_strong_raw : Array(is_strong_raw)
     end
@@ -624,13 +626,14 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                               backend=DEFAULT_BACKEND, block_size::Int=64,
                               setup_workspace=nothing,
                               build_update_map::Bool=false,
-                              coarsening_is_strong::Union{Nothing, AbstractVector{Bool}}=nothing) where {Tv, Ti}
+                              coarsening_is_strong::Union{Nothing, AbstractVector{Bool}}=nothing,
+                              strength_type::StrengthType=SignedStrength()) where {Tv, Ti}
     # Use the coarsening strength graph if provided (ensures consistency when max_row_sum < 1.0),
     # otherwise recompute from A_in.
     if coarsening_is_strong !== nothing
         is_strong = coarsening_is_strong isa Array ? coarsening_is_strong : Array(coarsening_is_strong)
     else
-        is_strong_raw = strength_graph(A_in, θ; backend=backend, block_size=block_size,
+        is_strong_raw = strength_graph(A_in, θ, strength_type; backend=backend, block_size=block_size,
             is_strong=setup_workspace !== nothing ? setup_workspace.is_strong : nothing)
         is_strong = is_strong_raw isa Array ? is_strong_raw : Array(is_strong_raw)
     end
@@ -1032,13 +1035,14 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                               backend=DEFAULT_BACKEND, block_size::Int=64,
                               setup_workspace=nothing,
                               build_update_map::Bool=false,
-                              coarsening_is_strong::Union{Nothing, AbstractVector{Bool}}=nothing) where {Tv, Ti}
+                              coarsening_is_strong::Union{Nothing, AbstractVector{Bool}}=nothing,
+                              strength_type::StrengthType=SignedStrength()) where {Tv, Ti}
     # Use the coarsening strength graph if provided (ensures consistency when max_row_sum < 1.0),
     # otherwise recompute from A_in.
     if coarsening_is_strong !== nothing
         is_strong = coarsening_is_strong isa Array ? coarsening_is_strong : Array(coarsening_is_strong)
     else
-        is_strong_raw = strength_graph(A_in, θ; backend=backend, block_size=block_size,
+        is_strong_raw = strength_graph(A_in, θ, strength_type; backend=backend, block_size=block_size,
             is_strong=setup_workspace !== nothing ? setup_workspace.is_strong : nothing)
         is_strong = is_strong_raw isa Array ? is_strong_raw : Array(is_strong_raw)
     end

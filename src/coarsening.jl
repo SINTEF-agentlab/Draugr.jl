@@ -64,14 +64,15 @@ Returns `agg::Vector{Int}` where `agg[i]` is the aggregate index (1-based) that
 node `i` belongs to, and `n_coarse` the number of aggregates.
 """
 function coarsen_aggregation(A_in::CSRMatrix{Tv, Ti}, θ::Real;
-                             backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
+                             backend=DEFAULT_BACKEND, block_size::Int=64,
+                             strength_type::StrengthType=SignedStrength()) where {Tv, Ti}
     n = size(A_in, 1)
     # Edge case: trivial system
     if n <= 1
         return ones(Int, n), n
     end
     # Compute strength on GPU if available, then convert to CPU for graph algorithms
-    is_strong_raw = strength_graph(A_in, θ; backend=backend, block_size=block_size)
+    is_strong_raw = strength_graph(A_in, θ, strength_type; backend=backend, block_size=block_size)
     is_strong = is_strong_raw isa Array ? is_strong_raw : Array(is_strong_raw)
     A = csr_to_cpu(A_in)
     cv = colvals(A)
@@ -260,13 +261,14 @@ for fine points, `coarse_map::Vector{Int}`, and `n_coarse`.
 function coarsen_pmis(A_in::CSRMatrix{Tv, Ti}, θ::Real;
                       rng=Random.default_rng(),
                       backend=DEFAULT_BACKEND, block_size::Int=64,
-                      setup_workspace=nothing) where {Tv, Ti}
+                      setup_workspace=nothing,
+                      strength_type::StrengthType=SignedStrength()) where {Tv, Ti}
     n = size(A_in, 1)
     if n <= 1
         return ones(Int, n), collect(1:n), n
     end
     # Compute strength on GPU if available, then convert to CPU for graph algorithms
-    is_strong_raw = strength_graph(A_in, θ; backend=backend, block_size=block_size,
+    is_strong_raw = strength_graph(A_in, θ, strength_type; backend=backend, block_size=block_size,
         is_strong=setup_workspace !== nothing ? setup_workspace.is_strong : nothing)
     is_strong = is_strong_raw isa Array ? is_strong_raw : Array(is_strong_raw)
     A = csr_to_cpu(A_in)
@@ -404,13 +406,14 @@ with f_pnt=Z_PT) followed by `hypre_BoomerAMGCoarsenPMIS(S, A, 1, ...)`.
 function coarsen_hmis(A_in::CSRMatrix{Tv, Ti}, θ::Real;
                       rng=Random.default_rng(),
                       backend=DEFAULT_BACKEND, block_size::Int=64,
-                      setup_workspace=nothing) where {Tv, Ti}
+                      setup_workspace=nothing,
+                      strength_type::StrengthType=SignedStrength()) where {Tv, Ti}
     n = size(A_in, 1)
     if n <= 1
         return ones(Int, n), collect(1:n), n
     end
     # Compute strength on GPU if available, then convert to CPU for graph algorithms
-    is_strong_raw = strength_graph(A_in, θ; backend=backend, block_size=block_size,
+    is_strong_raw = strength_graph(A_in, θ, strength_type; backend=backend, block_size=block_size,
         is_strong=setup_workspace !== nothing ? setup_workspace.is_strong : nothing)
     is_strong = is_strong_raw isa Array ? is_strong_raw : Array(is_strong_raw)
     A = csr_to_cpu(A_in)
@@ -734,13 +737,14 @@ instead of the naive O(n²) greedy scan.
 function coarsen_rs(A_in::CSRMatrix{Tv, Ti}, θ::Real;
                     rng=Random.default_rng(),
                     backend=DEFAULT_BACKEND, block_size::Int=64,
-                    setup_workspace=nothing) where {Tv, Ti}
+                    setup_workspace=nothing,
+                    strength_type::StrengthType=SignedStrength()) where {Tv, Ti}
     n = size(A_in, 1)
     if n <= 1
         return ones(Int, n), collect(1:n), n
     end
     # Compute strength on GPU if available, then convert to CPU for graph algorithms
-    is_strong_raw = strength_graph(A_in, θ; backend=backend, block_size=block_size,
+    is_strong_raw = strength_graph(A_in, θ, strength_type; backend=backend, block_size=block_size,
         is_strong=setup_workspace !== nothing ? setup_workspace.is_strong : nothing)
     is_strong = is_strong_raw isa Array ? is_strong_raw : Array(is_strong_raw)
     A = csr_to_cpu(A_in)
@@ -946,12 +950,13 @@ PMIS pass, merging the results. Returns `agg, n_coarse` like aggregation.
 """
 function coarsen_aggressive(A_in::CSRMatrix{Tv, Ti}, θ::Real;
                             rng=Random.default_rng(),
-                            backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
+                            backend=DEFAULT_BACKEND, block_size::Int=64,
+                            strength_type::StrengthType=SignedStrength()) where {Tv, Ti}
     n = size(A_in, 1)
     # First pass: standard PMIS (will convert to CPU internally)
-    cf, coarse_map, nc1 = coarsen_pmis(A_in, θ; rng=rng, backend=backend, block_size=block_size)
+    cf, coarse_map, nc1 = coarsen_pmis(A_in, θ; rng=rng, backend=backend, block_size=block_size, strength_type=strength_type)
     # Compute strength on GPU if available, then convert to CPU for graph algorithms
-    is_strong_raw = strength_graph(A_in, θ; backend=backend, block_size=block_size)
+    is_strong_raw = strength_graph(A_in, θ, strength_type; backend=backend, block_size=block_size)
     is_strong = is_strong_raw isa Array ? is_strong_raw : Array(is_strong_raw)
     A = csr_to_cpu(A_in)
     cv = colvals(A)
@@ -1074,17 +1079,18 @@ function coarsen_aggressive_cf(A_in::CSRMatrix{Tv, Ti}, θ::Real, base::Symbol;
     if n <= 1
         return ones(Int, n), collect(1:n), n
     end
+    strength_type = config.strength_type
     # First pass: standard CF-splitting using base algorithm
     A_eff = config.max_row_sum < 1.0 ? _apply_max_row_sum(csr_to_cpu(A_in), config.max_row_sum) : A_in
     if base == :hmis
-        cf1, _, nc1 = coarsen_hmis(A_eff, θ; rng=rng, backend=backend, block_size=block_size, setup_workspace=setup_workspace)
+        cf1, _, nc1 = coarsen_hmis(A_eff, θ; rng=rng, backend=backend, block_size=block_size, setup_workspace=setup_workspace, strength_type=strength_type)
     else  # :pmis
-        cf1, _, nc1 = coarsen_pmis(A_eff, θ; rng=rng, backend=backend, block_size=block_size, setup_workspace=setup_workspace)
+        cf1, _, nc1 = coarsen_pmis(A_eff, θ; rng=rng, backend=backend, block_size=block_size, setup_workspace=setup_workspace, strength_type=strength_type)
     end
     # Second pass: among C-points from first pass, do another CF-splitting
     # using distance-2 strong connections to further reduce the coarse set.
     # Compute strength on GPU if available, then convert to CPU for graph algorithms
-    is_strong_raw = strength_graph(A_eff, θ; backend=backend, block_size=block_size,
+    is_strong_raw = strength_graph(A_eff, θ, strength_type; backend=backend, block_size=block_size,
         is_strong=setup_workspace !== nothing ? setup_workspace.is_strong : nothing)
     is_strong = is_strong_raw isa Array ? is_strong_raw : Array(is_strong_raw)
     A_eff = csr_to_cpu(A_eff)
@@ -1203,9 +1209,9 @@ function coarsen(A::CSRMatrix, alg::AggregationCoarsening,
                 setup_workspace=nothing)
     if config.max_row_sum < 1.0
         A_weak = _apply_max_row_sum(csr_to_cpu(A), config.max_row_sum)
-        return coarsen_aggregation(A_weak, alg.θ; backend=backend, block_size=block_size)
+        return coarsen_aggregation(A_weak, alg.θ; backend=backend, block_size=block_size, strength_type=config.strength_type)
     end
-    return coarsen_aggregation(A, alg.θ; backend=backend, block_size=block_size)
+    return coarsen_aggregation(A, alg.θ; backend=backend, block_size=block_size, strength_type=config.strength_type)
 end
 
 function coarsen(A::CSRMatrix, alg::AggressiveCoarsening,
@@ -1214,9 +1220,9 @@ function coarsen(A::CSRMatrix, alg::AggressiveCoarsening,
                 setup_workspace=nothing)
     if config.max_row_sum < 1.0
         A_weak = _apply_max_row_sum(csr_to_cpu(A), config.max_row_sum)
-        return coarsen_aggressive(A_weak, alg.θ; backend=backend, block_size=block_size)
+        return coarsen_aggressive(A_weak, alg.θ; backend=backend, block_size=block_size, strength_type=config.strength_type)
     end
-    return coarsen_aggressive(A, alg.θ; backend=backend, block_size=block_size)
+    return coarsen_aggressive(A, alg.θ; backend=backend, block_size=block_size, strength_type=config.strength_type)
 end
 
 """
@@ -1242,9 +1248,9 @@ function coarsen_cf(A::CSRMatrix, alg::PMISCoarsening,
                     setup_workspace=nothing)
     if config.max_row_sum < 1.0
         A_weak = _apply_max_row_sum(csr_to_cpu(A), config.max_row_sum)
-        return coarsen_pmis(A_weak, alg.θ; backend=backend, block_size=block_size, setup_workspace=setup_workspace)
+        return coarsen_pmis(A_weak, alg.θ; backend=backend, block_size=block_size, setup_workspace=setup_workspace, strength_type=config.strength_type)
     end
-    return coarsen_pmis(A, alg.θ; backend=backend, block_size=block_size, setup_workspace=setup_workspace)
+    return coarsen_pmis(A, alg.θ; backend=backend, block_size=block_size, setup_workspace=setup_workspace, strength_type=config.strength_type)
 end
 
 function coarsen_cf(A::CSRMatrix, alg::HMISCoarsening,
@@ -1253,9 +1259,9 @@ function coarsen_cf(A::CSRMatrix, alg::HMISCoarsening,
                     setup_workspace=nothing)
     if config.max_row_sum < 1.0
         A_weak = _apply_max_row_sum(csr_to_cpu(A), config.max_row_sum)
-        return coarsen_hmis(A_weak, alg.θ; backend=backend, block_size=block_size, setup_workspace=setup_workspace)
+        return coarsen_hmis(A_weak, alg.θ; backend=backend, block_size=block_size, setup_workspace=setup_workspace, strength_type=config.strength_type)
     end
-    return coarsen_hmis(A, alg.θ; backend=backend, block_size=block_size, setup_workspace=setup_workspace)
+    return coarsen_hmis(A, alg.θ; backend=backend, block_size=block_size, setup_workspace=setup_workspace, strength_type=config.strength_type)
 end
 
 function coarsen_cf(A::CSRMatrix, alg::RSCoarsening,
@@ -1264,9 +1270,9 @@ function coarsen_cf(A::CSRMatrix, alg::RSCoarsening,
                     setup_workspace=nothing)
     if config.max_row_sum < 1.0
         A_weak = _apply_max_row_sum(csr_to_cpu(A), config.max_row_sum)
-        return coarsen_rs(A_weak, alg.θ; backend=backend, block_size=block_size, setup_workspace=setup_workspace)
+        return coarsen_rs(A_weak, alg.θ; backend=backend, block_size=block_size, setup_workspace=setup_workspace, strength_type=config.strength_type)
     end
-    return coarsen_rs(A, alg.θ; backend=backend, block_size=block_size, setup_workspace=setup_workspace)
+    return coarsen_rs(A, alg.θ; backend=backend, block_size=block_size, setup_workspace=setup_workspace, strength_type=config.strength_type)
 end
 
 """

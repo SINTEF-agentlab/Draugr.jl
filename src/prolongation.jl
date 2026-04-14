@@ -751,8 +751,10 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
             push!(entry_types_list, Ti(0))  # coarse = P=1
             push!(numer_idx_list, Ti(0))
             push!(denom_offsets_list, Ti(length(denom_entries_list) + 1))
-            # GPU kernel data: coarse point has entry_type=0, so no fine contributions
+            # GPU kernel data: coarse point has entry_type=0, so no fine contributions or d_base
             push!(std_direct_numer_idx_list, Ti(0))
+            # No fine neighbors or d_base data for coarse points.
+            # Push end-of-entry sentinels (= start of next entry).
             push!(std_fine_offsets_list, Ti(length(std_a_ik_list) + 1))
             push!(std_d_base_offsets_list, Ti(length(std_d_base_entries_list) + 1))
             continue
@@ -915,23 +917,25 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                 
                 # Fine neighbor contributions to this coarse column
                 fine_contribs = get(fine_contribs_per_cm, cm, Tuple{Int, Ti}[])
-                push!(std_fine_offsets_list, Ti(length(std_a_ik_list) + 1))
                 for (fnbr_idx, a_kJ_idx) in fine_contribs
                     (_, nz_ik, diag_k_nz, a_ki_nz, sum_C_k_indices) = fine_nbr_info[fnbr_idx]
                     push!(std_a_ik_list, nz_ik)
                     push!(std_a_kJ_list, a_kJ_idx)
                     push!(std_diag_k_list, diag_k_nz)
                     push!(std_a_ki_list, a_ki_nz)
-                    push!(std_sum_offsets_list, Ti(length(std_sum_indices_list) + 1))
                     append!(std_sum_indices_list, sum_C_k_indices)
+                    push!(std_sum_offsets_list, Ti(length(std_sum_indices_list) + 1))
                 end
+                # Push end-of-fine-neighbors sentinel for this P entry
+                push!(std_fine_offsets_list, Ti(length(std_a_ik_list) + 1))
                 
                 # Base d_i indices (diagonal + weak)
-                push!(std_d_base_offsets_list, Ti(length(std_d_base_entries_list) + 1))
                 if diag_nz > 0
                     push!(std_d_base_entries_list, diag_nz)
                 end
                 append!(std_d_base_entries_list, weak_nz_indices)
+                # Push end-of-d_base sentinel for this P entry
+                push!(std_d_base_offsets_list, Ti(length(std_d_base_entries_list) + 1))
             end
         end
     end
@@ -2500,25 +2504,34 @@ function _update_P_standard!(P::ProlongationOp{Ti, Tv}, A::CSRMatrix{Tv, Ti},
             sgn = real(diag_k) < 0 ? -1 : 1
             sum_C_k = zero(Tv)
             coarse_vals_k = Dict{Int, Tv}()
+            a_ki_val = zero(Tv)
             for nz2 in nzrange(A_cpu, k)
                 j2 = cv[nz2]
                 j2 == k && continue
                 a_kj = nzv[nz2]
-                if cf[j2] == 1
-                    cm2 = coarse_map[j2]
-                    if haskey(strong_coarse, cm2) && sgn * real(a_kj) < 0
-                        coarse_vals_k[cm2] = get(coarse_vals_k, cm2, zero(Tv)) + a_kj
+                if sgn * real(a_kj) < 0
+                    if j2 == i
+                        # Connection back to fine point i: include in sum (matching hypre)
                         sum_C_k += a_kj
+                        a_ki_val = a_kj
+                    elseif cf[j2] == 1
+                        cm2 = coarse_map[j2]
+                        if haskey(strong_coarse, cm2)
+                            coarse_vals_k[cm2] = get(coarse_vals_k, cm2, zero(Tv)) + a_kj
+                            sum_C_k += a_kj
+                        end
                     end
                 end
-                # a_{k,i} NOT included in sum (matching hypre)
             end
             if abs(sum_C_k) > eps(real(Tv))
                 distribute = a_ik / sum_C_k
                 for (cm2, a_kj) in coarse_vals_k
                     contributions[cm2] = get(contributions, cm2, zero(Tv)) + distribute * a_kj
                 end
-                # NO d_i update from a_{k,i} (matching hypre)
+                # Redistribute a_{k,i} back to diagonal (matching hypre)
+                if a_ki_val != zero(Tv)
+                    d_i += distribute * a_ki_val
+                end
             else
                 d_i += a_ik
             end

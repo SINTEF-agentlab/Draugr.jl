@@ -696,7 +696,7 @@ end
 Configuration for AMG setup.
 
 Fields:
-- `coarsening`: Main coarsening algorithm used at each level (default: `AggregationCoarsening()`)
+- `coarsening`: Main coarsening algorithm used at each level (default: `HMISCoarsening(0.25, ExtendedIInterpolation())`)
 - `smoother`: Smoother type (default: `JacobiSmootherType()`)
 - `max_levels`, `max_coarse_size`: Hierarchy limits
 - `pre_smoothing_steps`, `post_smoothing_steps`: Smoothing counts
@@ -747,7 +747,7 @@ struct AMGConfig
 end
 
 function AMGConfig(;
-    coarsening::CoarseningAlgorithm = HMISCoarsening(0.5, ExtendedIInterpolation()),
+    coarsening::CoarseningAlgorithm = HMISCoarsening(0.25, ExtendedIInterpolation()),
     smoother::SmootherType = L1ColoredGaussSeidelType(),
     max_levels::Int = 20,
     max_coarse_size::Int = 50,

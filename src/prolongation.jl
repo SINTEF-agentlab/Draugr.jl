@@ -738,7 +738,7 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
     
     # Additional workspace for GPU kernel data building
     # For each fine neighbor, store: (fine_idx, a_ik_idx, diag_k_idx, a_ki_idx, sum_C_k_indices)
-    fine_nbr_info = Tuple{Int, Ti, Ti, Ti, Vector{Ti}}[]
+    fine_nbr_info = Tuple{Int, Ti, Ti, Ti, Vector{Ti}, Dict{Int, Ti}}[]
     sizehint!(fine_nbr_info, max_row_nnz; shrink=false)
 
     # Determine sparsity pattern by computing which coarse columns contribute
@@ -800,8 +800,6 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
         
         empty!(fine_nbr_info)
         contributions = Dict{Int, Tv}()
-        # Maps: coarse_map -> list of (fine_nbr_idx_in_fine_nbr_info, a_kJ_idx) 
-        fine_contribs_per_cm = Dict{Int, Vector{Tuple{Int, Ti}}}()
         
         for (cm, a_ij) in strong_coarse
             contributions[cm] = a_ij
@@ -850,17 +848,16 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                 end
             end
             
+            # Store per-fine-neighbor coarse contributions: cm -> nz_idx of a_{k,c}
+            # (needed so each P entry can find a_kJ for its specific coarse column)
+            fine_nbr_coarse_nz = Dict{Int, Ti}()  # cm -> nz_idx
+            for (cm2, (_, nz_idx)) in coarse_vals_k
+                fine_nbr_coarse_nz[cm2] = nz_idx
+            end
+            
             # Store fine neighbor info for GPU kernel
             fine_nbr_idx = length(fine_nbr_info) + 1
-            push!(fine_nbr_info, (k, nz_ik, diag_k_nz, a_ki_nz, sum_C_k_indices))
-            
-            # Record which coarse columns this fine neighbor contributes to
-            for (cm2, (a_kj, nz_idx)) in coarse_vals_k
-                if !haskey(fine_contribs_per_cm, cm2)
-                    fine_contribs_per_cm[cm2] = Tuple{Int, Ti}[]
-                end
-                push!(fine_contribs_per_cm[cm2], (fine_nbr_idx, nz_idx))
-            end
+            push!(fine_nbr_info, (k, nz_ik, diag_k_nz, a_ki_nz, sum_C_k_indices, fine_nbr_coarse_nz))
             
             # Redistribute: distribute = a_{i,k} / sum_C_k
             # a_{k,i} redistribution goes to diagonal (matching hypre).
@@ -915,12 +912,12 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                 direct_idx = get(strong_coarse_nz, cm, Ti(0))
                 push!(std_direct_numer_idx_list, direct_idx)
                 
-                # Fine neighbor contributions to this coarse column
-                fine_contribs = get(fine_contribs_per_cm, cm, Tuple{Int, Ti}[])
-                for (fnbr_idx, a_kJ_idx) in fine_contribs
-                    (_, nz_ik, diag_k_nz, a_ki_nz, sum_C_k_indices) = fine_nbr_info[fnbr_idx]
+                # Fine neighbor contributions: iterate over ALL fine neighbors in this row
+                # (d_i needs contributions from all fine neighbors, not just per-column ones)
+                for (_, nz_ik, diag_k_nz, a_ki_nz, sum_C_k_indices, coarse_nz_map) in fine_nbr_info
                     push!(std_a_ik_list, nz_ik)
-                    push!(std_a_kJ_list, a_kJ_idx)
+                    # a_kJ for THIS coarse column cm (0 if fine neighbor doesn't contribute to cm)
+                    push!(std_a_kJ_list, get(coarse_nz_map, cm, Ti(0)))
                     push!(std_diag_k_list, diag_k_nz)
                     push!(std_a_ki_list, a_ki_nz)
                     append!(std_sum_indices_list, sum_C_k_indices)

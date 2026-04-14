@@ -341,13 +341,13 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
     sizehint!(denom_nz_idx, max_row_nnz; shrink=false)
     sizehint!(all_offdiag_nz_idx, max_row_nnz; shrink=false)
     
-    # Per-entry data for Direct interpolation alfa/beta formula
-    dir_diag_idx_list = Ti[]
-    dir_all_offsets_list = Ti[1]
+    # Per-entry data for Direct interpolation alfa/beta formula.
+    # Use pre-allocated offset arrays (like denom_offsets) to avoid off-by-one issues.
+    dir_diag_idx = Vector{Ti}(undef, total_nnz)
+    dir_all_offsets = Vector{Ti}(undef, total_nnz + 1)
     dir_all_entries_list = Ti[]
-    dir_sc_offsets_list = Ti[1]
+    dir_sc_offsets = Vector{Ti}(undef, total_nnz + 1)
     dir_sc_entries_list = Ti[]
-    sizehint!(dir_diag_idx_list, total_nnz; shrink=false)
     sizehint!(dir_all_entries_list, total_nnz * 4; shrink=false)
     sizehint!(dir_sc_entries_list, total_nnz * 2; shrink=false)
 
@@ -375,9 +375,9 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
             numer_idx[pos] = Ti(0)
             denom_offsets[pos] = Ti(length(denom_entries_list) + 1)
             # alfa/beta data: coarse point doesn't use formula
-            push!(dir_diag_idx_list, Ti(0))
-            push!(dir_all_offsets_list, Ti(length(dir_all_entries_list) + 1))
-            push!(dir_sc_offsets_list, Ti(length(dir_sc_entries_list) + 1))
+            dir_diag_idx[pos] = Ti(0)
+            dir_all_offsets[pos] = Ti(length(dir_all_entries_list) + 1)
+            dir_sc_offsets[pos] = Ti(length(dir_sc_entries_list) + 1)
         else
             # Clear workspace buffers (reuse allocations)
             empty!(strong_coarse_cols)
@@ -426,9 +426,9 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                 entry_type[pos] = Ti(0)  # fallback = P=1
                 numer_idx[pos] = Ti(0)
                 denom_offsets[pos] = Ti(length(denom_entries_list) + 1)
-                push!(dir_diag_idx_list, Ti(0))
-                push!(dir_all_offsets_list, Ti(length(dir_all_entries_list) + 1))
-                push!(dir_sc_offsets_list, Ti(length(dir_sc_entries_list) + 1))
+                dir_diag_idx[pos] = Ti(0)
+                dir_all_offsets[pos] = Ti(length(dir_all_entries_list) + 1)
+                dir_sc_offsets[pos] = Ti(length(dir_sc_entries_list) + 1)
             else
                 # Fill colval and update map for each interpolation entry
                 for k in eachindex(strong_coarse_cols)
@@ -439,10 +439,10 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                     denom_offsets[pos] = Ti(length(denom_entries_list) + 1)
                     append!(denom_entries_list, denom_nz_idx)
                     # Alfa/beta formula data: per P-entry, stores row-level data
-                    push!(dir_diag_idx_list, diag_nz_for_row)
-                    push!(dir_all_offsets_list, Ti(length(dir_all_entries_list) + 1))
+                    dir_diag_idx[pos] = diag_nz_for_row
+                    dir_all_offsets[pos] = Ti(length(dir_all_entries_list) + 1)
                     append!(dir_all_entries_list, all_offdiag_nz_idx)
-                    push!(dir_sc_offsets_list, Ti(length(dir_sc_entries_list) + 1))
+                    dir_sc_offsets[pos] = Ti(length(dir_sc_entries_list) + 1)
                     append!(dir_sc_entries_list, strong_coarse_nz_idx)
                     pos += 1
                 end
@@ -455,12 +455,9 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
     denom_entries = Vector{Ti}(denom_entries_list)
     
     # Finalize alfa/beta data arrays
-    dir_diag_idx = Vector{Ti}(dir_diag_idx_list)
-    dir_all_offsets = Vector{Ti}(dir_all_offsets_list)
-    push!(dir_all_offsets, Ti(length(dir_all_entries_list) + 1))
+    dir_all_offsets[total_nnz + 1] = Ti(length(dir_all_entries_list) + 1)
     dir_all_entries = Vector{Ti}(dir_all_entries_list)
-    dir_sc_offsets = Vector{Ti}(dir_sc_offsets_list)
-    push!(dir_sc_offsets, Ti(length(dir_sc_entries_list) + 1))
+    dir_sc_offsets[total_nnz + 1] = Ti(length(dir_sc_entries_list) + 1)
     dir_sc_entries = Vector{Ti}(dir_sc_entries_list)
     
     # ══════════════════════════════════════════════════════════════════════════

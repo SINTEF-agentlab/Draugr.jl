@@ -303,13 +303,19 @@ function coarsen_pmis(A_in::CSRMatrix{Tv, Ti}, θ::Real;
             cf[i] = 1  # isolated → coarse
         end
     end
-    # CF splitting: iterative PMIS
+    # CF splitting: iterative PMIS (matching hypre's CLJP/PMIS algorithm)
     max_iter = n + 1
     for iter in 1:max_iter
         all_decided = true
+        # Phase 1: Mark undecided nodes with measure < 1 as F, and select
+        # independent set — local maxima become tentative C (marker 2)
         @inbounds for i in 1:n
             cf[i] != 0 && continue
             all_decided = false
+            if measure[i] < 1.0
+                cf[i] = -1  # no influence → F
+                continue
+            end
             is_max = true
             for nz in nzrange(A, i)
                 j = cv[nz]
@@ -321,9 +327,23 @@ function coarsen_pmis(A_in::CSRMatrix{Tv, Ti}, θ::Real;
                 end
             end
             if is_max
-                cf[i] = 1  # coarse point
+                cf[i] = 2  # tentative C (will be finalized below)
             end
         end
+        # Phase 2: Finalize new C-points and decrement measures of their
+        # undecided strong neighbors (matching hypre — only new C-points trigger
+        # measure updates, not C-points from previous iterations)
+        @inbounds for i in 1:n
+            cf[i] != 2 && continue
+            cf[i] = 1  # finalize as C-point
+            for nz in nzrange(A, i)
+                j = cv[nz]
+                if j != i && is_strong[nz] && cf[j] == 0
+                    measure[j] -= 1.0
+                end
+            end
+        end
+        # Phase 3: Mark undecided nodes adjacent to C-points as F
         @inbounds for i in 1:n
             cf[i] != 0 && continue
             for nz in nzrange(A, i)
@@ -336,11 +356,15 @@ function coarsen_pmis(A_in::CSRMatrix{Tv, Ti}, θ::Real;
         end
         all_decided && break
     end
+    # Safety: any remaining undecided → F (hypre guarantees all nodes are
+    # resolved through the iterations; this is just a fallback)
     @inbounds for i in 1:n
         if cf[i] == 0
-            cf[i] = 1
+            cf[i] = -1
         end
     end
+    # Ensure every F-point has at least one strong C-neighbor for valid interpolation
+    _ensure_fine_have_coarse_neighbor!(cf, A, is_strong)
     # Build coarse map
     n_coarse = 0
     if setup_workspace !== nothing
@@ -440,9 +464,9 @@ function coarsen_hmis(A_in::CSRMatrix{Tv, Ti}, θ::Real;
     #     or has strong diagonal connections, else final F_PT (-1)
     #   - C_PT (1) from greedy loop → stays C, enters PMIS graph
     @inbounds for i in 1:n
-        if cf[i] == -1  # F_PT from main greedy loop or decrement-to-zero
+        if cf[i] == -1  # F_PT from main greedy loop
             cf[i] = 0  # unconditionally undecided for PMIS
-        elseif cf[i] == -2  # Z_PT from zero-measure initialization
+        elseif cf[i] == -2  # Z_PT from zero-measure initialization or decrement-to-zero
             has_strong_diag = false
             for nz in nzrange(A, i)
                 j = cv[nz]
@@ -462,6 +486,9 @@ function coarsen_hmis(A_in::CSRMatrix{Tv, Ti}, θ::Real;
 
     # PMIS iterations on remaining undecided nodes
     _pmis_on_undecided!(cf, A, is_strong, pmis_measure)
+
+    # Ensure every F-point has at least one strong C-neighbor for valid interpolation
+    _ensure_fine_have_coarse_neighbor!(cf, A, is_strong)
 
     n_coarse = 0
     if setup_workspace !== nothing
@@ -609,9 +636,11 @@ function _rs_first_pass!(A::CSRMatrix{Tv, Ti}, is_strong::AbstractVector{Bool};
                 new_val = max(0, λ[j] - 1)
                 _bucket_update_node!(j, new_val, λ, bucket_head, bucket_next, bucket_prev)
                 if new_val == 0
-                    # Node has no more undecided dependents → mark as F_PT
+                    # Node has no more undecided dependents → mark with f_pnt
+                    # (Z_PT for HMIS so PMIS can conditionally re-evaluate,
+                    # F_PT for standalone RS — matching hypre)
                     _bucket_remove_node!(j, λ, bucket_head, bucket_next, bucket_prev)
-                    cf[j] = -1  # F_PT (always, even for HMIS)
+                    cf[j] = f_pnt  # Z_PT for HMIS, F_PT for RS
                     # Increment λ for its undecided strong neighbors
                     for nz2 in nzrange(A, j)
                         k = cv[nz2]
@@ -645,7 +674,7 @@ function _pmis_on_undecided!(cf::Vector{Int}, A::CSRMatrix{Tv, Ti},
     max_iter = n + 1
     for iter in 1:max_iter
         all_decided = true
-        # Identify local maxima as candidate C-points
+        # Phase 1: Identify local maxima as tentative C-points (marker 2)
         @inbounds for i in 1:n
             cf[i] != 0 && continue
             all_decided = false
@@ -664,10 +693,22 @@ function _pmis_on_undecided!(cf::Vector{Int}, A::CSRMatrix{Tv, Ti},
                 end
             end
             if is_max
-                cf[i] = 1  # C-point
+                cf[i] = 2  # tentative C (will be finalized below)
             end
         end
-        # Mark undecided nodes adjacent to C-points as F
+        # Phase 2: Finalize new C-points and decrement measures of their
+        # undecided strong neighbors (only new C-points, matching hypre)
+        @inbounds for i in 1:n
+            cf[i] != 2 && continue
+            cf[i] = 1  # finalize as C-point
+            for nz in nzrange(A, i)
+                j = cv[nz]
+                if j != i && is_strong[nz] && cf[j] == 0
+                    measure[j] -= 1.0
+                end
+            end
+        end
+        # Phase 3: Mark undecided nodes adjacent to C-points as F
         @inbounds for i in 1:n
             cf[i] != 0 && continue
             for nz in nzrange(A, i)
@@ -680,11 +721,11 @@ function _pmis_on_undecided!(cf::Vector{Int}, A::CSRMatrix{Tv, Ti},
         end
         all_decided && break
     end
-    # Any remaining undecided → C (matching hypre's PMIS behavior: undecided
-    # nodes that couldn't be resolved become C-points to ensure valid interpolation)
+    # Safety: any remaining undecided → F (hypre guarantees all nodes are
+    # resolved through the iterations; this is just a fallback)
     @inbounds for i in 1:n
         if cf[i] == 0
-            cf[i] = 1
+            cf[i] = -1
         end
     end
 end

@@ -37,8 +37,8 @@ b = rand(N*N)
 ##
 # Example on running hypre as bench
 x_h, stats_h = solve_hypre(A, b, AggTruncFactor = 0.0)#, RelaxType = 0);
-# Similar options for Draugr
-coarsen = HMISCoarsening(0.5, ExtendedIInterpolation(0.0, 4, 2, true))
+# Matching HYPRE defaults: StrongThreshold=0.25, max_elmts=4, no trunc_factor, max_row_sum=0.9
+coarsen = HMISCoarsening(0.25, ExtendedIInterpolation(0.0, 4, 2, true))
 s = SerialGaussSeidelType()
 
 config = AMGConfig(coarsening=coarsen,

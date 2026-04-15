@@ -1093,8 +1093,9 @@ end
     n = N * N
     b = ones(n)
 
-    # Draugr setup matching HYPRE defaults (no aggressive coarsening, no truncation)
-    coarsen = HMISCoarsening(0.5, ExtendedIInterpolation(0.0, 4, 2, true))
+    # Draugr setup matching HYPRE defaults:
+    #   StrongThreshold = 0.25, max_elmts = 4, max_row_sum = 0.9, no trunc_factor
+    coarsen = HMISCoarsening(0.25, ExtendedIInterpolation(0.0, 4, 2, true))
     config = AMGConfig(coarsening=coarsen,
         smoother = SerialGaussSeidelType(),
         verbose = false,
@@ -1108,9 +1109,8 @@ end
     @test ratio_0 ≈ 0.5 atol=0.05
 
     # Level 1 → Level 2 should also be ~0.5 (not 0.25!)
-    # This is the key test: the strength comparison (strict >) ensures that
-    # the 9-point Galerkin product at Level 1 has only 4 strong connections
-    # (not 8), giving 0.5 coarsening ratio matching HYPRE
+    # With θ=0.25 all 8 connections in the 9-point Galerkin product are strong,
+    # and HMIS still produces ~0.5 coarsening ratio (matching HYPRE's behaviour)
     if length(hierarchy.levels) >= 3
         ratio_1 = hierarchy.levels[3].A.nrow / hierarchy.levels[2].A.nrow
         @test ratio_1 ≈ 0.5 atol=0.05
@@ -1132,8 +1132,9 @@ end
     op_hypre = Jutul.linear_operator(prec_hypre)
     _, stats_h = gmres(A, b; M = op_hypre, rtol = 1e-8, itmax=100)
 
-    # Draugr solve
-    coarsen = HMISCoarsening(0.5, ExtendedIInterpolation(0.0, 4, 2, true))
+    # Draugr solve — parameters matching HYPRE defaults:
+    #   StrongThreshold = 0.25, max_elmts = 4, max_row_sum = 0.9, no trunc_factor
+    coarsen = HMISCoarsening(0.25, ExtendedIInterpolation(0.0, 4, 2, true))
     config = AMGConfig(coarsening=coarsen,
         smoother = SerialGaussSeidelType(),
         verbose = false,
@@ -1144,8 +1145,8 @@ end
     M = DraugrPreconditioner(config, hierarchy, size(A))
     _, stats_d = gmres(A, b; M = M, rtol = 1e-8, itmax=100, ldiv = true)
 
-    # Draugr should be within 3x of HYPRE's iteration count
-    @test stats_d.niter <= 3 * stats_h.niter
+    # Draugr should be within 2x of HYPRE's iteration count
+    @test stats_d.niter <= 2 * stats_h.niter
     # Both should converge
     @test stats_h.solved
     @test stats_d.solved

@@ -1743,6 +1743,32 @@ function _find_nearest_coarse(A::CSRMatrix{Tv, Ti}, i::Int,
     return best_j > 0 ? best_j : 1
 end
 
+"""
+    _apply_trunc_scaling!(P; backend, block_size)
+
+Apply truncation rescaling factors stored in `P.trunc_scaling` to `P.nzval`.
+After this call, `P.nzval[k] *= P.trunc_scaling[k]` for all entries.
+This preserves the original (pre-truncation) row sums, matching hypre's
+truncation rescaling behavior.
+
+No-op when `P.trunc_scaling` is `nothing`.
+"""
+function _apply_trunc_scaling!(P::ProlongationOp;
+                               backend=DEFAULT_BACKEND, block_size::Int=64)
+    ts = P.trunc_scaling
+    ts === nothing && return P
+    nzv = P.nzval
+    kernel! = _trunc_scaling_kernel!(backend, block_size)
+    kernel!(nzv, ts; ndrange=length(nzv))
+    _synchronize(backend)
+    return P
+end
+
+@kernel function _trunc_scaling_kernel!(nzval, @Const(trunc_scaling))
+    k = @index(Global)
+    @inbounds nzval[k] *= trunc_scaling[k]
+end
+
 """Scatter COO entries into CSR arrays using counting sort positions."""
 @inline function _scatter_coo_to_csr!(colval, nzval, I_p, J_p, V_p, pos, nnz_p::Int)
     @inbounds for k in 1:nnz_p
@@ -2570,6 +2596,8 @@ function _update_P_extendedi!(P::ProlongationOp{Ti, Tv}, A::CSRMatrix{Tv, Ti},
         success = _extendedi_interp_compute_values!(P.nzval, nonzeros(A), P_update_map;
                                                      backend=backend, block_size=block_size)
         if success
+            # Apply truncation rescaling if present (preserves row sums after truncation)
+            _apply_trunc_scaling!(P; backend=backend, block_size=block_size)
             return P
         end
     end
@@ -2767,6 +2795,9 @@ function _update_P_extendedi!(P::ProlongationOp{Ti, Tv}, A::CSRMatrix{Tv, Ti},
     if !(P.nzval isa Array)
         copyto!(P.nzval, P_nzval)
     end
+    
+    # Apply truncation rescaling if present (preserves row sums after truncation)
+    _apply_trunc_scaling!(P; backend=backend, block_size=block_size)
     
     return P
 end

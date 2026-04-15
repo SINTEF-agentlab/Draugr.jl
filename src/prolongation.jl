@@ -1306,25 +1306,20 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
             n_keep = max_elements
         end
         
-        # Compute rescaling factor if enabled
+        # Compute rescaling factor if enabled (matching hypre's truncation rescaling:
+        # scale = row_sum / sum_kept, which preserves the original row sum)
         row_scale = one(Tv)
         if do_rescale && n_keep < n_chat
-            # Mark which indices are kept
+            row_sum = zero(Tv)
             for idx in 1:n_chat
-                kept_flags[idx] = false
+                row_sum += P_data_ws[idx]
             end
+            sum_kept = zero(Tv)
             for k in 1:n_keep
-                kept_flags[keep_ws[k]] = true
+                sum_kept += P_data_ws[keep_ws[k]]
             end
-            sum_removed = zero(Tv)
-            for idx in 1:n_chat
-                if !kept_flags[idx]
-                    sum_removed += P_data_ws[idx]
-                end
-            end
-            denom = one(Tv) - sum_removed
-            if abs(denom) > Tv(1e-12)
-                row_scale = one(Tv) / denom
+            if abs(sum_kept) > eps(real(Tv)) && sum_kept != row_sum
+                row_scale = row_sum / sum_kept
             end
         end
         for k in 1:n_keep

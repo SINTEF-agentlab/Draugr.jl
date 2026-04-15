@@ -1,8 +1,11 @@
 # ── Bucket sort helpers (standalone functions to avoid closure boxing) ─────────
+# These use FIFO ordering within each bucket level, matching hypre's linked-list
+# implementation (enter_on_lists appends at tail, selection takes from head).
 
 """Remove node `i` from its bucket in the linked-list bucket structure."""
 @inline function _bucket_remove_node!(i::Int, λ::Vector{Int},
                                       bucket_head::Vector{Int},
+                                      bucket_tail::Vector{Int},
                                       bucket_next::Vector{Int},
                                       bucket_prev::Vector{Int})
     @inbounds begin
@@ -16,6 +19,8 @@
         end
         if nx != 0
             bucket_prev[nx] = p
+        else
+            bucket_tail[k] = p
         end
         bucket_next[i] = 0
         bucket_prev[i] = 0
@@ -23,28 +28,34 @@
     return nothing
 end
 
-"""Remove node `i` from its old bucket and insert into bucket for `new_λ`."""
+"""Remove node `i` from its old bucket and insert at TAIL of bucket for `new_λ` (FIFO)."""
 @inline function _bucket_update_node!(i::Int, new_λ::Int, λ::Vector{Int},
                                       bucket_head::Vector{Int},
+                                      bucket_tail::Vector{Int},
                                       bucket_next::Vector{Int},
                                       bucket_prev::Vector{Int})
     @inbounds begin
-        _bucket_remove_node!(i, λ, bucket_head, bucket_next, bucket_prev)
+        _bucket_remove_node!(i, λ, bucket_head, bucket_tail, bucket_next, bucket_prev)
         λ[i] = new_λ
         k = new_λ + 1
         old_len = length(bucket_head)
         if k > old_len
             resize!(bucket_head, k)
+            resize!(bucket_tail, k)
             for idx in (old_len + 1):k
                 bucket_head[idx] = 0
+                bucket_tail[idx] = 0
             end
         end
-        old_head = bucket_head[k]
-        bucket_head[k] = i
-        bucket_next[i] = old_head
-        bucket_prev[i] = 0
-        if old_head != 0
-            bucket_prev[old_head] = i
+        # Insert at TAIL (FIFO ordering, matching hypre)
+        old_tail = bucket_tail[k]
+        bucket_tail[k] = i
+        bucket_prev[i] = old_tail
+        bucket_next[i] = 0
+        if old_tail != 0
+            bucket_next[old_tail] = i
+        else
+            bucket_head[k] = i
         end
     end
     return nothing
@@ -569,6 +580,8 @@ function _rs_first_pass!(A::CSRMatrix{Tv, Ti}, is_strong::AbstractVector{Bool};
 
     # Build bucket structure for greedy RS first pass.
     # Done after zero-measure processing so λ values are final.
+    # Uses FIFO ordering within each bucket level, matching hypre's linked-list
+    # implementation (enter_on_lists appends at tail, selection takes from head).
     max_λ_val = 0
     @inbounds for i in 1:n
         cf[i] != 0 && continue
@@ -577,24 +590,30 @@ function _rs_first_pass!(A::CSRMatrix{Tv, Ti}, is_strong::AbstractVector{Bool};
     if setup_workspace !== nothing
         bucket_head = _ws_resize!(setup_workspace.bucket_head, max(max_λ_val + 1, 1))
         fill!(bucket_head, 0)
+        bucket_tail = _ws_resize!(setup_workspace.bucket_tail, max(max_λ_val + 1, 1))
+        fill!(bucket_tail, 0)
         bucket_next = _ws_resize!(setup_workspace.bucket_next, n)
         fill!(bucket_next, 0)
         bucket_prev = _ws_resize!(setup_workspace.bucket_prev, n)
         fill!(bucket_prev, 0)
     else
         bucket_head = fill(0, max(max_λ_val + 1, 1))
+        bucket_tail = fill(0, max(max_λ_val + 1, 1))
         bucket_next = zeros(Int, n)
         bucket_prev = zeros(Int, n)
     end
+    # Insert all undecided nodes at TAIL (FIFO: first node in = first selected)
     @inbounds for i in 1:n
         cf[i] != 0 && continue
         k = λ[i] + 1
-        old_head = bucket_head[k]
-        bucket_head[k] = i
-        bucket_next[i] = old_head
-        bucket_prev[i] = 0
-        if old_head != 0
-            bucket_prev[old_head] = i
+        old_tail = bucket_tail[k]
+        bucket_tail[k] = i
+        bucket_prev[i] = old_tail
+        bucket_next[i] = 0
+        if old_tail != 0
+            bucket_next[old_tail] = i
+        else
+            bucket_head[k] = i
         end
     end
     top_bucket = max_λ_val
@@ -607,7 +626,7 @@ function _rs_first_pass!(A::CSRMatrix{Tv, Ti}, is_strong::AbstractVector{Bool};
         top_bucket < 0 && break
         best_i = bucket_head[top_bucket + 1]
         best_i == 0 && break
-        _bucket_remove_node!(best_i, λ, bucket_head, bucket_next, bucket_prev)
+        _bucket_remove_node!(best_i, λ, bucket_head, bucket_tail, bucket_next, bucket_prev)
         cf[best_i] = 1  # C-point
 
         # For each undecided node j that strongly depends on best_i (S^T neighbors):
@@ -618,14 +637,14 @@ function _rs_first_pass!(A::CSRMatrix{Tv, Ti}, is_strong::AbstractVector{Bool};
         @inbounds for idx in st_offsets[best_i]:(st_offsets[best_i + 1] - 1)
             j = st_sources[idx]
             cf[j] != 0 && continue
-            _bucket_remove_node!(j, λ, bucket_head, bucket_next, bucket_prev)
+            _bucket_remove_node!(j, λ, bucket_head, bucket_tail, bucket_next, bucket_prev)
             cf[j] = -1  # F_PT (always, even for HMIS)
             # Increment λ for undecided nodes that j strongly depends on
             for nz2 in nzrange(A, j)
                 k = cv[nz2]
                 if k != j && is_strong[nz2] && cf[k] == 0
                     new_val = λ[k] + 1
-                    _bucket_update_node!(k, new_val, λ, bucket_head, bucket_next, bucket_prev)
+                    _bucket_update_node!(k, new_val, λ, bucket_head, bucket_tail, bucket_next, bucket_prev)
                     if new_val > top_bucket
                         top_bucket = new_val
                     end
@@ -637,19 +656,19 @@ function _rs_first_pass!(A::CSRMatrix{Tv, Ti}, is_strong::AbstractVector{Bool};
             j = cv[nz]
             if j != best_i && is_strong[nz] && cf[j] == 0
                 new_val = max(0, λ[j] - 1)
-                _bucket_update_node!(j, new_val, λ, bucket_head, bucket_next, bucket_prev)
+                _bucket_update_node!(j, new_val, λ, bucket_head, bucket_tail, bucket_next, bucket_prev)
                 if new_val == 0
                     # Node has no more undecided dependents → mark with f_pnt
                     # (Z_PT for HMIS so PMIS can conditionally re-evaluate,
                     # F_PT for standalone RS — matching hypre)
-                    _bucket_remove_node!(j, λ, bucket_head, bucket_next, bucket_prev)
+                    _bucket_remove_node!(j, λ, bucket_head, bucket_tail, bucket_next, bucket_prev)
                     cf[j] = f_pnt  # Z_PT for HMIS, F_PT for RS
                     # Increment λ for its undecided strong neighbors
                     for nz2 in nzrange(A, j)
                         k = cv[nz2]
                         if k != j && is_strong[nz2] && cf[k] == 0
                             new_val2 = λ[k] + 1
-                            _bucket_update_node!(k, new_val2, λ, bucket_head, bucket_next, bucket_prev)
+                            _bucket_update_node!(k, new_val2, λ, bucket_head, bucket_tail, bucket_next, bucket_prev)
                             if new_val2 > top_bucket
                                 top_bucket = new_val2
                             end
@@ -859,7 +878,8 @@ function coarsen_rs(A_in::CSRMatrix{Tv, Ti}, θ::Real;
     end
     # First pass: greedy selection with bucket sorting for O(nnz) complexity.
     # Maintain a set of linked-list buckets indexed by λ value. Each step
-    # picks from the highest non-empty bucket.
+    # picks from the highest non-empty bucket. Uses FIFO ordering within each
+    # bucket level, matching hypre's linked-list implementation.
     max_λ_val = maximum(λ; init=0)
     # Build bucket structure: bucket_head[k+1] = first node with λ==k
     # (shift by 1 so λ==0 maps to index 1)
@@ -867,24 +887,30 @@ function coarsen_rs(A_in::CSRMatrix{Tv, Ti}, θ::Real;
     if setup_workspace !== nothing
         bucket_head = _ws_resize!(setup_workspace.bucket_head, max(max_λ_val + 1, n))
         fill!(bucket_head, 0)
+        bucket_tail = _ws_resize!(setup_workspace.bucket_tail, max(max_λ_val + 1, n))
+        fill!(bucket_tail, 0)
         bucket_next = _ws_resize!(setup_workspace.bucket_next, n)
         fill!(bucket_next, 0)
         bucket_prev = _ws_resize!(setup_workspace.bucket_prev, n)
         fill!(bucket_prev, 0)
     else
         bucket_head = fill(0, max(max_λ_val + 1, n))
+        bucket_tail = fill(0, max(max_λ_val + 1, n))
         bucket_next = zeros(Int, n)
         bucket_prev = zeros(Int, n)
     end
+    # Insert at TAIL (FIFO ordering)
     @inbounds for i in 1:n
         cf[i] != 0 && continue
         k = λ[i] + 1
-        old_head = bucket_head[k]
-        bucket_head[k] = i
-        bucket_next[i] = old_head
-        bucket_prev[i] = 0
-        if old_head != 0
-            bucket_prev[old_head] = i
+        old_tail = bucket_tail[k]
+        bucket_tail[k] = i
+        bucket_prev[i] = old_tail
+        bucket_next[i] = 0
+        if old_tail != 0
+            bucket_next[old_tail] = i
+        else
+            bucket_head[k] = i
         end
     end
     top_bucket = max_λ_val
@@ -897,13 +923,13 @@ function coarsen_rs(A_in::CSRMatrix{Tv, Ti}, θ::Real;
         best_i = bucket_head[top_bucket + 1]
         best_i == 0 && break
         # Remove best_i from bucket and make it coarse
-        _bucket_remove_node!(best_i, λ, bucket_head, bucket_next, bucket_prev)
+        _bucket_remove_node!(best_i, λ, bucket_head, bucket_tail, bucket_next, bucket_prev)
         cf[best_i] = 1
         # For each undecided node j that strongly depends on best_i, make j fine
         @inbounds for idx in st_offsets[best_i]:(st_offsets[best_i + 1] - 1)
             j = st_sources[idx]
             cf[j] != 0 && continue
-            _bucket_remove_node!(j, λ, bucket_head, bucket_next, bucket_prev)
+            _bucket_remove_node!(j, λ, bucket_head, bucket_tail, bucket_next, bucket_prev)
             cf[j] = -1  # j becomes fine
             # Increment λ for undecided nodes that j strongly depends on
             # (they gain influence because j is now F)
@@ -911,7 +937,7 @@ function coarsen_rs(A_in::CSRMatrix{Tv, Ti}, θ::Real;
                 k = cv[nz2]
                 if k != j && is_strong[nz2] && cf[k] == 0
                     new_val = λ[k] + 1
-                    _bucket_update_node!(k, new_val, λ, bucket_head, bucket_next, bucket_prev)
+                    _bucket_update_node!(k, new_val, λ, bucket_head, bucket_tail, bucket_next, bucket_prev)
                     if new_val > top_bucket
                         top_bucket = new_val
                     end
@@ -924,17 +950,17 @@ function coarsen_rs(A_in::CSRMatrix{Tv, Ti}, θ::Real;
             j = cv[nz]
             if j != best_i && is_strong[nz] && cf[j] == 0
                 new_val = max(0, λ[j] - 1)
-                _bucket_update_node!(j, new_val, λ, bucket_head, bucket_next, bucket_prev)
+                _bucket_update_node!(j, new_val, λ, bucket_head, bucket_tail, bucket_next, bucket_prev)
                 if new_val == 0
                     # Node has no more undecided dependents → mark as F
-                    _bucket_remove_node!(j, λ, bucket_head, bucket_next, bucket_prev)
+                    _bucket_remove_node!(j, λ, bucket_head, bucket_tail, bucket_next, bucket_prev)
                     cf[j] = -1
                     # Increment λ for its undecided strong neighbors
                     for nz2 in nzrange(A, j)
                         k = cv[nz2]
                         if k != j && is_strong[nz2] && cf[k] == 0
                             new_val2 = λ[k] + 1
-                            _bucket_update_node!(k, new_val2, λ, bucket_head, bucket_next, bucket_prev)
+                            _bucket_update_node!(k, new_val2, λ, bucket_head, bucket_tail, bucket_next, bucket_prev)
                             if new_val2 > top_bucket
                                 top_bucket = new_val2
                             end

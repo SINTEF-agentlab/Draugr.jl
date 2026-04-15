@@ -20,4 +20,5 @@ include("helpers.jl")
     include("test_jlarrays.jl")
     include("test_extensions.jl")
     include("test_c_api.jl")
+    include("gmres_comparison_tests.jl")
 end

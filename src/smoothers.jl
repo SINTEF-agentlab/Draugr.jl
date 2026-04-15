@@ -475,27 +475,35 @@ end
     _serial_l1_gs_compute_invdiag!(invdiag, nzv, cv, rp, n)
 
 Compute inverse l1 row norms for serial L1 GS smoother.
-Matches hypre's option 4 for serial execution: since all entries are processed
-sequentially (no frozen off-processor entries), l1_norm = |a_{i,i}| + 0.5 * Σ_{j≠i} |a_{i,j}|
-with truncation (Remark 6.2, Baker et al. 2011). In serial mode the off-processor sum
-is zero, so this simplifies to l1_norm = |a_{i,i}|.
+Matches hypre's `ComputeL1Norms` option 4 for a single-processor run:
+    l1_norm = |a_{i,i}| + Σ_{j≠i} |a_{i,j}|
+with truncation: if l1_norm ≤ (4/3)|a_{i,i}|, fall back to |a_{i,i}|.
+
+In parallel HYPRE, option 4 applies a 0.5 factor to off-processor (A_offd)
+entries only.  For a serial run all entries are in the diagonal block, so
+every off-diagonal entry receives full weight.
 """
 function _serial_l1_gs_compute_invdiag!(invdiag::Vector{Tv}, nzv, cv, rp, n::Int) where {Tv}
     Ts = _scalar_real_type(Tv)
     @inbounds for i in 1:n
         abs_diag = zero(Ts)
+        offdiag_sum = zero(Ts)
         for nz in rp[i]:(rp[i+1]-1)
             if cv[nz] == i
                 abs_diag = _entry_norm(nzv[nz])
-                break
+            else
+                offdiag_sum += _entry_norm(nzv[nz])
             end
         end
-        # For serial GS, all connections are updated sequentially, so
-        # there are no "frozen" off-processor entries. This matches
-        # hypre's option 4 for a single-processor run: l1_norm = |a_{i,i}|.
-        l1_norm = abs_diag
-        # For block matrices, one(Tv)/l1_norm == (1/l1_norm)*I_B,
-        # so invdiag[i]*r gives (1/l1_norm)*r for any block vector r.
+        # Full L1 row norm (hypre option 4, serial):
+        # all off-diag entries are in the local diagonal block → full weight.
+        l1_norm = abs_diag + offdiag_sum
+        # Truncation (Remark 6.2, Baker et al. 2011):
+        # when off-diagonal contribution is negligible, fall back to |a_{i,i}|.
+        four_thirds = Ts(4) / Ts(3)
+        if l1_norm <= four_thirds * abs_diag
+            l1_norm = abs_diag
+        end
         invdiag[i] = l1_norm > eps(Ts) ? one(Tv) / l1_norm : zero(Tv)
     end
     return invdiag

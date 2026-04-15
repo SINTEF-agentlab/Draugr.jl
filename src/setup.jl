@@ -228,6 +228,10 @@ function _build_levels!(levels::Vector{AMGLevel{Tv, Ti}},
         P, n_coarse, P_update_map = _coarsen_with_fallback(A_current, coarsening_alg, config; backend=backend, block_size=block_size, setup_workspace=setup_workspace, build_P_update_map=build_P_update_map)
         n_coarse >= n && break
         n_coarse == 0 && break
+        # Stop if coarsening has stalled (ratio > 0.9 even after fallback).
+        # Continuing with near-identity coarsening adds cost without improving
+        # the preconditioner, and can degrade convergence.
+        n_coarse > 0.9 * n && break
         A_cpu = csr_to_cpu(A_current)
         # Get old A_coarse for array reuse (stored as next level's A, CPU only)
         old_A_coarse = nothing

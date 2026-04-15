@@ -2,7 +2,8 @@
 # These use FIFO ordering within each bucket level, matching hypre's linked-list
 # implementation (enter_on_lists appends at tail, selection takes from head).
 
-"""Remove node `i` from its bucket in the linked-list bucket structure."""
+"""Remove node `i` from its bucket in the linked-list bucket structure.
+`bucket_tail[k]` tracks the last node in each bucket for FIFO ordering."""
 @inline function _bucket_remove_node!(i::Int, λ::Vector{Int},
                                       bucket_head::Vector{Int},
                                       bucket_tail::Vector{Int},
@@ -28,7 +29,8 @@
     return nothing
 end
 
-"""Remove node `i` from its old bucket and insert at TAIL of bucket for `new_λ` (FIFO)."""
+"""Remove node `i` from its old bucket and insert at TAIL of bucket for `new_λ` (FIFO).
+`bucket_tail[k]` tracks the last node in each bucket for O(1) tail insertion."""
 @inline function _bucket_update_node!(i::Int, new_λ::Int, λ::Vector{Int},
                                       bucket_head::Vector{Int},
                                       bucket_tail::Vector{Int},

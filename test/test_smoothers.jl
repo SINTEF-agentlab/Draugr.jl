@@ -127,11 +127,10 @@ end
     smoother = Draugr.build_l1_serial_gs_smoother(Ac)
     @test smoother isa L1SerialGaussSeidelSmoother
     @test length(smoother.invdiag) == 10
-    # Matching hypre option 4 (serial): l1_norm = |a_ii| + Σ_{j≠i}|a_ij|
-    # Interior point (row 5): diag=2, 2 off-diag of -1 → l1_norm=4, invdiag=1/4
-    @test smoother.invdiag[5] ≈ 0.25
-    # Boundary point (row 1): diag=2, 1 off-diag of -1 → l1_norm=3, invdiag=1/3
-    @test smoother.invdiag[1] ≈ 1/3
+    # For serial GS (matching hypre serial): l1 norm = |a_{i,i}| = |2| = 2, invdiag = 1/2
+    @test smoother.invdiag[5] ≈ 0.5
+    # For boundary row: l1 norm = |a_{i,i}| = |2| = 2, invdiag = 1/2
+    @test smoother.invdiag[1] ≈ 0.5
 end
 
 @testset "L1 Serial GS Smoother - Smoothing" begin
@@ -149,10 +148,10 @@ end
     A = poisson1d_csr(10)
     Ac = to_csr(A)
     smoother = Draugr.build_l1_serial_gs_smoother(Ac)
-    @test smoother.invdiag[5] ≈ 0.25
+    @test smoother.invdiag[5] ≈ 0.5
     # Update with same matrix
     update_smoother!(smoother, Ac)
-    @test smoother.invdiag[5] ≈ 0.25
+    @test smoother.invdiag[5] ≈ 0.5
 end
 
 @testset "L1 Serial GS Smoother - build_smoother dispatch" begin

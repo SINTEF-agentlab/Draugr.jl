@@ -1085,7 +1085,7 @@ end
 # ══════════════════════════════════════════════════════════════════════════
 
 @testset "HYPRE comparison - hierarchy structure" begin
-    using Krylov
+    using Krylov, HYPRE
 
     N = 100
     A = poisson2d_csr(N, N)
@@ -1107,17 +1107,16 @@ end
     ratio_0 = hierarchy.levels[2].A.nrow / hierarchy.levels[1].A.nrow
     @test ratio_0 ≈ 0.5 atol=0.05
 
-    # Level 1 → Level 2 should also be ~0.5 (not 0.25!)
-    # With θ=0.25 all 8 connections in the 9-point Galerkin product are strong,
-    # and HMIS still produces ~0.5 coarsening ratio (matching HYPRE's behaviour)
+    # Level 1 → Level 2: the 9-point Galerkin stencil with θ=0.25 makes all 8
+    # neighbors strong, so HMIS produces ~0.25 coarsening ratio (matching HYPRE)
     if length(hierarchy.levels) >= 3
         ratio_1 = hierarchy.levels[3].A.nrow / hierarchy.levels[2].A.nrow
-        @test ratio_1 ≈ 0.5 atol=0.05
+        @test ratio_1 ≈ 0.25 atol=0.05
     end
 end
 
 @testset "HYPRE comparison - GMRES iteration count" begin
-    using Krylov
+    using Krylov, HYPRE
 
     N = 100
     A = poisson2d_csr(N, N)

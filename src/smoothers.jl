@@ -475,14 +475,25 @@ end
     _serial_l1_gs_compute_invdiag!(invdiag, nzv, cv, rp, n)
 
 Compute inverse l1 row norms for serial L1 GS smoother.
+Matches hypre's option 4 for serial execution: since all entries are processed
+sequentially (no frozen off-processor entries), l1_norm = |a_{i,i}| + 0.5 * Σ_{j≠i} |a_{i,j}|
+with truncation (Remark 6.2, Baker et al. 2011). In serial mode the off-processor sum
+is zero, so this simplifies to l1_norm = |a_{i,i}|.
 """
 function _serial_l1_gs_compute_invdiag!(invdiag::Vector{Tv}, nzv, cv, rp, n::Int) where {Tv}
     Ts = _scalar_real_type(Tv)
     @inbounds for i in 1:n
-        l1_norm = zero(Ts)
+        abs_diag = zero(Ts)
         for nz in rp[i]:(rp[i+1]-1)
-            l1_norm += _entry_norm(nzv[nz])
+            if cv[nz] == i
+                abs_diag = _entry_norm(nzv[nz])
+                break
+            end
         end
+        # For serial GS, all connections are updated sequentially, so
+        # there are no "frozen" off-processor entries. This matches
+        # hypre's option 4 for a single-processor run: l1_norm = |a_{i,i}|.
+        l1_norm = abs_diag
         # For block matrices, one(Tv)/l1_norm == (1/l1_norm)*I_B,
         # so invdiag[i]*r gives (1/l1_norm)*r for any block vector r.
         invdiag[i] = l1_norm > eps(Ts) ? one(Tv) / l1_norm : zero(Tv)
@@ -928,7 +939,7 @@ function build_l1jacobi_smoother(A::CSRMatrix{Tv, Ti}, ω::Real;
                                  x_eltype::Type{Tx}=Tv) where {Tv, Ti, Tx}
     n = size(A, 1)
     invdiag = _allocate_undef_vector(A, Tv, n)
-    _compute_l1_invdiag!(invdiag, A)
+    _compute_l1_jacobi_invdiag!(invdiag, A)
     tmp = _allocate_vector(A, Tx, n)
     return L1JacobiSmoother(invdiag, tmp, ω)
 end
@@ -951,9 +962,26 @@ end
     @inbounds begin
         Tv = eltype(invdiag)
         Ts = _scalar_real_type(Tv)
-        l1_norm = zero(Ts)
+        # Compute L1 norms matching hypre's option 4 (Remark 6.2 in
+        # "Multigrid Smoothers for Ultra-Parallel Computing", Baker et al. 2011).
+        # For colored GS the non-sequentially-updated connections are the
+        # off-diagonal entries (all neighbors have a different color), so:
+        #   l1_norm = |a_{i,i}| + 0.5 * Σ_{j≠i} |a_{i,j}|
+        # with truncation: if l1_norm ≤ 4/3 * |a_{i,i}|, use |a_{i,i}|.
+        abs_diag = zero(Ts)
+        offdiag_sum = zero(Ts)
         for nz in rp[i]:(rp[i+1]-1)
-            l1_norm += _entry_norm(nzval[nz])
+            if colval[nz] == i
+                abs_diag = _entry_norm(nzval[nz])
+            else
+                offdiag_sum += _entry_norm(nzval[nz])
+            end
+        end
+        l1_norm = abs_diag + Ts(0.5) * offdiag_sum
+        # Truncation: when off-diagonal is small, fall back to diagonal
+        four_thirds = Ts(4) / Ts(3)
+        if l1_norm <= four_thirds * abs_diag
+            l1_norm = abs_diag
         end
         # For block matrices, store (1/l1_norm)*I so that invdiag[i]*r gives (1/l1_norm)*r.
         # For scalars, one(Tv)/l1_norm == 1/l1_norm (a scalar).
@@ -961,9 +989,43 @@ end
     end
 end
 
+"""
+    _compute_l1_jacobi_invdiag!(invdiag, A)
+
+Compute inverse l1 row norms for L1-Jacobi smoother using the full row sum
+(matching hypre's option 1): l1_norm = Σ_j |a_{i,j}|.
+This is the correct formula for Jacobi where ALL off-diagonal entries use
+frozen (previous-iteration) values.
+"""
+function _compute_l1_jacobi_invdiag!(invdiag::AbstractVector{Tv},
+                                      A::CSRMatrix{Tv, Ti};
+                                      backend=_get_backend(nonzeros(A)), block_size::Int=64) where {Tv, Ti}
+    n = size(A, 1)
+    nzv = nonzeros(A)
+    cv = colvals(A)
+    rp = rowptr(A)
+    kernel! = l1_jacobi_invdiag_kernel!(backend, block_size)
+    kernel!(invdiag, nzv, rp; ndrange=n)
+    _synchronize(backend)
+    return invdiag
+end
+
+@kernel function l1_jacobi_invdiag_kernel!(invdiag, @Const(nzval), @Const(rp))
+    i = @index(Global)
+    @inbounds begin
+        Tv = eltype(invdiag)
+        Ts = _scalar_real_type(Tv)
+        l1_norm = zero(Ts)
+        for nz in rp[i]:(rp[i+1]-1)
+            l1_norm += _entry_norm(nzval[nz])
+        end
+        invdiag[i] = l1_norm > eps(Ts) ? one(Tv) / l1_norm : zero(Tv)
+    end
+end
+
 function update_smoother!(smoother::L1JacobiSmoother, A::CSRMatrix;
                           backend=_get_backend(nonzeros(A)), block_size::Int=64)
-    _compute_l1_invdiag!(smoother.invdiag, A; backend=backend, block_size=block_size)
+    _compute_l1_jacobi_invdiag!(smoother.invdiag, A; backend=backend, block_size=block_size)
     return smoother
 end
 

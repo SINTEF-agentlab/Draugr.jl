@@ -48,14 +48,16 @@ Recommended for use with HMIS coarsening for challenging 3D problems.
 `trunc_factor`: entries with |w| < trunc_factor * max|w| per row are dropped
 (0 = no truncation). Maps to HYPRE's `AggTruncFactor`.
 `max_elements`: maximum number of interpolation entries per row (0 = no limit).
-When the number of entries exceeds this limit, only the strongest entries are kept.
-Default: 0.
+When the number of entries exceeds this limit, only the strongest entries are kept
+and surviving entries are rescaled to preserve the original row sum (matching
+HYPRE's default truncation behavior). HYPRE defaults to PMaxElmts=4; set to 4
+when using Gauss-Seidel-type smoothers for best match. Default: 0 (no limit).
 `norm_p`: norm exponent used for measuring entry magnitude during truncation.
 Default: 1 (absolute value). Higher values (e.g. 2) penalize small entries less
 aggressively relative to the maximum.
-`rescale`: if true, after truncation the surviving entries are divided by
-`1 - sum_removed` where `sum_removed` is the sum of removed row entries,
-preserving the original row sum. The per-entry scaling factors are stored in the
+`rescale`: if true, after truncation the surviving entries are rescaled so that
+the original row sum is preserved (scale = row_sum / sum_kept), matching HYPRE's
+default truncation behavior. The per-entry scaling factors are stored in the
 prolongation operator so that they can be reused during resetup without
 recomputing the truncated elements. Default: false.
 """
@@ -501,6 +503,13 @@ mutable struct ProlongationUpdateMap{Ti<:Integer, Tv<:Number}
     numer_idx::Vector{Ti}               # A.nzval index for numerator
     denom_offsets::Vector{Ti}           # offset array for denominator
     denom_entries::Vector{Ti}           # A.nzval indices for denominator
+    # Direct interpolation alfa/beta data: per P-entry, stores the A.nzval indices
+    # needed to compute sum_N_neg/pos and sum_P_neg/pos for the alfa/beta formula.
+    dir_diag_idx::AbstractVector{Ti}        # per P-entry: diagonal A.nzval index
+    dir_all_offsets::AbstractVector{Ti}     # per P-entry: offset into all off-diag indices
+    dir_all_entries::AbstractVector{Ti}     # all off-diagonal A.nzval indices for row
+    dir_sc_offsets::AbstractVector{Ti}      # per P-entry: offset into strong-C indices
+    dir_sc_entries::AbstractVector{Ti}      # strong C-neighbor A.nzval indices for row
     # Strong neighbor structure for Standard/Extended+i row recomputation
     strong_nbrs_offsets::Vector{Ti}     # offset array (n_fine + 1)
     strong_nbrs_cols::Vector{Ti}        # column indices of strong neighbors
@@ -649,6 +658,7 @@ mutable struct SetupWorkspace{Tv, Ti<:Integer}
     pos::Vector{Int}
     # Bucket sort workspace (RS / HMIS first pass)
     bucket_head::Vector{Int}
+    bucket_tail::Vector{Int}
     bucket_next::Vector{Int}
     bucket_prev::Vector{Int}
     # COO accumulation workspace for prolongation building
@@ -673,7 +683,7 @@ function SetupWorkspace{Tv, Ti}() where {Tv, Ti}
     SetupWorkspace{Tv, Ti}(
         Int[], Int[], Float64[], Int[],
         Int[], Int[], Int[], Int[],
-        Int[], Int[], Int[],
+        Int[], Int[], Int[], Int[],
         Ti[], Ti[], Tv[],
         Int[], Int[], Int[],
         Bool[], Int[],
@@ -689,7 +699,7 @@ end
 Configuration for AMG setup.
 
 Fields:
-- `coarsening`: Main coarsening algorithm used at each level (default: `AggregationCoarsening()`)
+- `coarsening`: Main coarsening algorithm used at each level (default: `HMISCoarsening(0.25, ExtendedIInterpolation())`)
 - `smoother`: Smoother type (default: `JacobiSmootherType()`)
 - `max_levels`, `max_coarse_size`: Hierarchy limits
 - `pre_smoothing_steps`, `post_smoothing_steps`: Smoothing counts
@@ -700,12 +710,13 @@ Fields:
   - 2: Additionally print iteration counter and residual norm at each cycle during solve
 - `initial_coarsening`: Optional alternative coarsening for the first N levels (defaults to `coarsening`)
 - `initial_coarsening_levels`: Number of levels to use `initial_coarsening` for (default: 0)
-- `max_row_sum`: Maximum row sum threshold for dependency weakening (default: 1.0, disabled).
-  When < 1.0, rows where |row_sum| > |a_ii| * max_row_sum have all off-diagonal entries
-  zeroed out (all dependencies made weak), matching the hypre definition.
+- `max_row_sum`: Maximum row sum threshold for dependency weakening (default: 1.0, disabled;
+  HYPRE defaults to 0.9). When < 1.0, rows where |row_sum| > |a_ii| * max_row_sum have all
+  off-diagonal entries zeroed out (all dependencies made weak), matching the hypre definition.
 - `cycle_type`: AMG cycle type, `:V` for V-cycle or `:W` for W-cycle (default: `:V`)
-- `strength_type`: Strength of connection algorithm (default: `AbsoluteStrength()`).
-  Use `SignedStrength()` for non-M-matrices with positive off-diagonals.
+- `strength_type`: Strength of connection algorithm (default: `SignedStrength()`).
+  Matches hypre's default signed strength, which only marks opposite-sign off-diagonals
+  as strong. Use `AbsoluteStrength()` for sign-agnostic strength based on magnitudes.
 - `coarse_solve_on_cpu`: If `true`, the coarsest-level LU factorization and direct
   solve are performed on CPU even when using a GPU backend. Required for backends
   that do not support `lu` on device (e.g., Apple Metal). Default: `false`.
@@ -739,7 +750,7 @@ struct AMGConfig
 end
 
 function AMGConfig(;
-    coarsening::CoarseningAlgorithm = HMISCoarsening(0.5, ExtendedIInterpolation()),
+    coarsening::CoarseningAlgorithm = HMISCoarsening(0.25, ExtendedIInterpolation()),
     smoother::SmootherType = L1ColoredGaussSeidelType(),
     max_levels::Int = 20,
     max_coarse_size::Int = 50,
@@ -751,7 +762,7 @@ function AMGConfig(;
     initial_coarsening_levels::Int = 0,
     max_row_sum::Float64 = 1.0,
     cycle_type::Symbol = :V,
-    strength_type::StrengthType = AbsoluteStrength(),
+    strength_type::StrengthType = SignedStrength(),
     coarse_solve_on_cpu::Bool = false,
     allow_partial_resetup::Bool = true,
     reverse_post_smooth::Bool = true,

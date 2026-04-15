@@ -4,7 +4,7 @@
 Compute strength-of-connection for matrix `A` using threshold `θ`.
 Returns a boolean CSR matrix `S` where `S[i,j] = true` if j is a strong connection of i.
 
-A connection (i,j) is strong if |A[i,j]| ≥ θ * max_{k≠i} |A[i,k]|
+A connection (i,j) is strong if |A[i,j]| > θ * max_{k≠i} |A[i,k]|
 
 The backend is inferred from the array type of A's data, so GPU arrays
 will use GPU kernels automatically.
@@ -18,7 +18,7 @@ end
 """
     strength_graph(A, θ, ::AbsoluteStrength)
 
-Absolute-value strength: |a_{i,j}| ≥ θ * max_{k≠i} |a_{i,k}|.
+Absolute-value strength: |a_{i,j}| > θ * max_{k≠i} |a_{i,k}|.
 Uses a KA kernel for GPU compatibility. The result array type matches the
 backend (GPU arrays for GPU backends, CPU arrays for CPU backends).
 """
@@ -56,11 +56,11 @@ end
             end
         end
         threshold = θ * max_offdiag
-        # Mark strong connections
+        # Mark strong connections (strict > to match hypre)
         for nz in rp[row]:(rp[row+1]-1)
             col = colval[nz]
             if col != row
-                is_strong[nz] = abs(nzval[nz]) >= threshold
+                is_strong[nz] = abs(nzval[nz]) > threshold
             else
                 is_strong[nz] = false
             end
@@ -77,7 +77,7 @@ connections. This is critical for reservoir simulation where some off-diagonals
 may have "wrong" (positive) sign.
 
 A connection (i,j) is strong if:
-  sign(a_{i,j}) ≠ sign(a_{i,i})  AND  |a_{i,j}| ≥ θ * max_{k: sign(a_{i,k})≠sign(a_{i,i})} |a_{i,k}|
+  sign(a_{i,j}) ≠ sign(a_{i,i})  AND  |a_{i,j}| > θ * max_{k: sign(a_{i,k})≠sign(a_{i,i})} |a_{i,k}|
 
 If all off-diagonals have the same sign as the diagonal (no "proper" connections),
 falls back to absolute-value strength for that row.
@@ -135,7 +135,7 @@ end
             for nz in rp[row]:(rp[row+1]-1)
                 col = colval[nz]
                 if col != row && sign(real(nzval[nz])) != diag_sign
-                    is_strong[nz] = abs(nzval[nz]) >= threshold
+                    is_strong[nz] = abs(nzval[nz]) > threshold
                 else
                     is_strong[nz] = false
                 end
@@ -153,7 +153,7 @@ end
             for nz in rp[row]:(rp[row+1]-1)
                 col = colval[nz]
                 if col != row
-                    is_strong[nz] = abs(nzval[nz]) >= threshold
+                    is_strong[nz] = abs(nzval[nz]) > threshold
                 else
                     is_strong[nz] = false
                 end

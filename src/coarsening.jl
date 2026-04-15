@@ -268,6 +268,9 @@ end
 
 Parallel Modified Independent Set (PMIS) coarsening. Uses column-based strength
 count (number of points that depend on each node) for the measure, as in hypre.
+Tie-breaking uses a deterministic index-based fractional `i/(n+1)` (matching
+hypre's local measure_type=1). The `rng` parameter is kept for API compatibility
+but is no longer used.
 Returns `cf::Vector{Int}` where `cf[i] = 1` for coarse points and `cf[i] = -1`
 for fine points, `coarse_map::Vector{Int}`, and `n_coarse`.
 """
@@ -286,15 +289,19 @@ function coarsen_pmis(A_in::CSRMatrix{Tv, Ti}, θ::Real;
     is_strong = is_strong_raw isa Array ? is_strong_raw : Array(is_strong_raw)
     A = csr_to_cpu(A_in)
     cv = colvals(A)
-    # Use column-based measure: how many nodes strongly depend on i
+    # Use column-based measure: how many nodes strongly depend on i.
+    # Tie-breaking uses a deterministic index-based fractional: i/(n+1).
+    # This matches hypre's local measure_type=1: (i+1)/(n+1) for 0-indexed i,
+    # which equals i/(n+1) for Julia's 1-indexed i in [1,n].
     st_count = _compute_strong_transpose_count(A, is_strong; setup_workspace=setup_workspace)
     if setup_workspace !== nothing
         measure = _ws_resize!(setup_workspace.measure, n)
     else
         measure = zeros(Float64, n)
     end
+    inv_np1 = 1.0 / Float64(n + 1)
     @inbounds for i in 1:n
-        measure[i] = Float64(st_count[i]) + rand(rng)
+        measure[i] = Float64(st_count[i]) + Float64(i) * inv_np1
     end
     # Mark isolated nodes (no strong connections at all) immediately as coarse
     if setup_workspace !== nothing
@@ -439,6 +446,9 @@ undecided points.
 This matches hypre's `hypre_BoomerAMGCoarsenHMIS` which calls
 `hypre_BoomerAMGCoarsenRuge(S, A, measure_type, 10, ...)` (first pass only,
 with f_pnt=Z_PT) followed by `hypre_BoomerAMGCoarsenPMIS(S, A, 1, ...)`.
+The PMIS second pass uses deterministic index-based tie-breaking `i/(n+1)`,
+matching hypre's local measure_type=1. The `rng` parameter is kept for API
+compatibility but is no longer used.
 """
 function coarsen_hmis(A_in::CSRMatrix{Tv, Ti}, θ::Real;
                       rng=Random.default_rng(),
@@ -460,14 +470,17 @@ function coarsen_hmis(A_in::CSRMatrix{Tv, Ti}, θ::Real;
     cf = _rs_first_pass!(A, is_strong; use_zpt=true, setup_workspace=setup_workspace)
 
     # ── Phase 2: PMIS on remaining undecided points ──
+    # Use deterministic index-based tie-breaking: i/(n+1), matching hypre's
+    # local measure_type=1: (i+1)/(n+1) for 0-indexed i = i/(n+1) for Julia's 1-indexed i.
     st_count_pmis = _compute_strong_transpose_count(A, is_strong; setup_workspace=setup_workspace)
     if setup_workspace !== nothing
         pmis_measure = _ws_resize!(setup_workspace.measure, n)
     else
         pmis_measure = zeros(Float64, n)
     end
+    inv_np1 = 1.0 / Float64(n + 1)
     @inbounds for i in 1:n
-        pmis_measure[i] = Float64(st_count_pmis[i]) + rand(rng)
+        pmis_measure[i] = Float64(st_count_pmis[i]) + Float64(i) * inv_np1
     end
 
     # Re-evaluate nodes from RS first pass for PMIS (matching hypre's CF_init=1 logic).

@@ -484,8 +484,11 @@ function coarsen_hmis(A_in::CSRMatrix{Tv, Ti}, θ::Real;
         # C_PT (1) stays C and participates in PMIS
     end
 
-    # PMIS iterations on remaining undecided nodes
-    _pmis_on_undecided!(cf, A, is_strong, pmis_measure)
+    # PMIS iterations on remaining undecided nodes.
+    # skip_first_is=true matches hypre's CF_init=1: the first PMIS iteration
+    # only propagates F-points from existing RS C-points, without selecting
+    # new C-points via the independent set algorithm.
+    _pmis_on_undecided!(cf, A, is_strong, pmis_measure; skip_first_is=true)
 
     # Ensure every F-point has at least one strong C-neighbor for valid interpolation
     _ensure_fine_have_coarse_neighbor!(cf, A, is_strong)
@@ -661,53 +664,84 @@ function _rs_first_pass!(A::CSRMatrix{Tv, Ti}, is_strong::AbstractVector{Bool};
 end
 
 """
-    _pmis_on_undecided!(cf, A, is_strong, measure)
+    _pmis_on_undecided!(cf, A, is_strong, measure; skip_first_is=false)
 
 Run PMIS iterations on undecided nodes (cf[i] == 0). Nodes with cf[i] == 1 (C)
 or cf[i] == -1 (F) are not modified. This is used as the second phase of HMIS.
+
+When `skip_first_is=true` (matching hypre's `CF_init=1` in `hypre_BoomerAMGCoarsenPMISHost`),
+the first iteration skips the independent set selection (Phase 1 and Phase 2).
+Only Phase 3 (marking undecided nodes adjacent to C-points as F) runs on the
+first iteration. This is critical for HMIS: the RS first pass already provides
+C-points, so the first PMIS iteration should only propagate F-points from those
+existing C-points, not select new C-points. Subsequent iterations (if any
+undecided nodes remain) run the full IS selection.
 """
 function _pmis_on_undecided!(cf::Vector{Int}, A::CSRMatrix{Tv, Ti},
                               is_strong::AbstractVector{Bool},
-                              measure::Vector{Float64}) where {Tv, Ti}
+                              measure::Vector{Float64};
+                              skip_first_is::Bool=false) where {Tv, Ti}
     n = size(A, 1)
     cv = colvals(A)
     max_iter = n + 1
     for iter in 1:max_iter
         all_decided = true
-        # Phase 1: Identify local maxima as tentative C-points (marker 2)
-        @inbounds for i in 1:n
-            cf[i] != 0 && continue
-            all_decided = false
-            if measure[i] < 1.0
-                cf[i] = -1  # no influence → F
-                continue
+
+        # Phase 1 & 2: Independent set selection and finalization.
+        # When skip_first_is=true (HMIS mode, matching hypre's CF_init=1),
+        # skip on the first iteration — only existing C-points from the RS
+        # first pass are used. This matches hypre's
+        #   if (!CF_init || iter) { /* IS selection */ }
+        # where CF_init=1 and iter starts at 0.
+        if !skip_first_is || iter > 1
+            # Phase 1: Identify local maxima as tentative C-points (marker 2)
+            @inbounds for i in 1:n
+                cf[i] != 0 && continue
+                all_decided = false
+                if measure[i] < 1.0
+                    cf[i] = -1  # no influence → F
+                    continue
+                end
+                is_max = true
+                for nz in nzrange(A, i)
+                    j = cv[nz]
+                    if j != i && is_strong[nz] && cf[j] != -1
+                        if measure[j] > measure[i]
+                            is_max = false
+                            break
+                        end
+                    end
+                end
+                if is_max
+                    cf[i] = 2  # tentative C (will be finalized below)
+                end
             end
-            is_max = true
-            for nz in nzrange(A, i)
-                j = cv[nz]
-                if j != i && is_strong[nz] && cf[j] != -1
-                    if measure[j] > measure[i]
-                        is_max = false
-                        break
+            # Phase 2: Finalize new C-points and decrement measures of their
+            # undecided strong neighbors (only new C-points, matching hypre)
+            @inbounds for i in 1:n
+                cf[i] != 2 && continue
+                cf[i] = 1  # finalize as C-point
+                for nz in nzrange(A, i)
+                    j = cv[nz]
+                    if j != i && is_strong[nz] && cf[j] == 0
+                        measure[j] -= 1.0
                     end
                 end
             end
-            if is_max
-                cf[i] = 2  # tentative C (will be finalized below)
-            end
-        end
-        # Phase 2: Finalize new C-points and decrement measures of their
-        # undecided strong neighbors (only new C-points, matching hypre)
-        @inbounds for i in 1:n
-            cf[i] != 2 && continue
-            cf[i] = 1  # finalize as C-point
-            for nz in nzrange(A, i)
-                j = cv[nz]
-                if j != i && is_strong[nz] && cf[j] == 0
-                    measure[j] -= 1.0
+        else
+            # First iteration with skip: still need to check if any undecided remain
+            @inbounds for i in 1:n
+                if cf[i] == 0
+                    all_decided = false
+                    # Also handle measure < 1 nodes (matching hypre's
+                    # "if (measure_array[i] < 1) CF_marker[i] = F_PT" before IS)
+                    if measure[i] < 1.0
+                        cf[i] = -1
+                    end
                 end
             end
         end
+
         # Phase 3: Mark undecided nodes adjacent to C-points as F
         @inbounds for i in 1:n
             cf[i] != 0 && continue
@@ -719,6 +753,14 @@ function _pmis_on_undecided!(cf::Vector{Int}, A::CSRMatrix{Tv, Ti},
                 end
             end
         end
+
+        # Update graph: set measure to 0 for decided nodes (matching hypre)
+        @inbounds for i in 1:n
+            if cf[i] != 0
+                measure[i] = 0.0
+            end
+        end
+
         all_decided && break
     end
     # Safety: any remaining undecided → F (hypre guarantees all nodes are

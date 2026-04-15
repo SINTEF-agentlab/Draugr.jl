@@ -1,6 +1,14 @@
-using Jutul, HYPRE, Draugr, Krylov
+using Jutul, HYPRE, Draugr, Krylov, Test
+using Jutul.StaticCSR: StaticSparsityMatrixCSR, static_sparsity_sparse
+
+include("helpers.jl")
+
+
 # Small test script to compare HYPRE and Draugr on a matrix with gmres.
 function solve_draugr(A, b, config)
+    tol = 1e-8
+    maxit = 100
+
     t_setup_initial = @elapsed hierarchy = amg_setup(A, config);
     t_setup = @elapsed amg_resetup!(hierarchy, A, config);
     M = DraugrPreconditioner(config, hierarchy, size(A))
@@ -11,6 +19,9 @@ function solve_draugr(A, b, config)
 end
 
 function solve_hypre(A, b, ; kwarg...)
+    tol = 1e-8
+    maxit = 100
+
     prec_hypre = BoomerAMGPreconditioner(PrintLevel = 1, AggNumLevels = 0; kwarg...)
     t_setup_hypre = @elapsed Jutul.update_preconditioner!(prec_hypre, A, b, missing, missing)
     op_hypre = Jutul.linear_operator(prec_hypre)
@@ -20,10 +31,15 @@ function solve_hypre(A, b, ; kwarg...)
     return (x, Dict(:t_setup => t_setup_hypre, :t_solve => t_solve_hypre, :nits => stats.niter))
 end
 
+N = 1000
+A = poisson2d_csr(N, N)
+b = rand(N*N)
+##
 # Example on running hypre as bench
 x_h, stats_h = solve_hypre(A, b, AggTruncFactor = 0.0)#, RelaxType = 0);
 # Similar options for Draugr
 coarsen = HMISCoarsening(0.5, ExtendedIInterpolation(0.0, 4, 2, true))
+s = SerialGaussSeidelType()
 
 config = AMGConfig(coarsening=coarsen,
     smoother = s,

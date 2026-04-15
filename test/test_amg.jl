@@ -1086,7 +1086,6 @@ end
 
 @testset "HYPRE comparison - hierarchy structure" begin
     using Krylov
-    using HYPRE: BoomerAMGPreconditioner
 
     N = 100
     A = poisson2d_csr(N, N)
@@ -1119,7 +1118,6 @@ end
 
 @testset "HYPRE comparison - GMRES iteration count" begin
     using Krylov
-    using HYPRE: BoomerAMGPreconditioner
 
     N = 100
     A = poisson2d_csr(N, N)
@@ -1127,7 +1125,7 @@ end
     b = ones(n)
 
     # HYPRE solve
-    prec_hypre = BoomerAMGPreconditioner(PrintLevel = 0, AggNumLevels = 0, AggTruncFactor = 0.0)
+    prec_hypre = Jutul.BoomerAMGPreconditioner(PrintLevel = 0, AggNumLevels = 0, AggTruncFactor = 0.0)
     Jutul.update_preconditioner!(prec_hypre, A, b, missing, missing)
     op_hypre = Jutul.linear_operator(prec_hypre)
     _, stats_h = gmres(A, b; M = op_hypre, rtol = 1e-8, itmax=100)
@@ -1145,8 +1143,8 @@ end
     M = DraugrPreconditioner(config, hierarchy, size(A))
     _, stats_d = gmres(A, b; M = M, rtol = 1e-8, itmax=100, ldiv = true)
 
-    # Draugr should be within 2x of HYPRE's iteration count
-    @test stats_d.niter <= 2 * stats_h.niter
+    # Draugr should be within 10% of HYPRE's iteration count
+    @test stats_d.niter <= 1.1 * stats_h.niter
     # Both should converge
     @test stats_h.solved
     @test stats_d.solved

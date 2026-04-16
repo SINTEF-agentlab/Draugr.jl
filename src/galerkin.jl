@@ -258,8 +258,8 @@ end
     @inbounds begin
         acc = zero(eltype(nzv_c))
         for t in nz_offsets[k]:(nz_offsets[k+1]-1)
-            pi, ai, pj = triples[t]
-            acc += P_nzval[pi] * nzv_f[ai] * P_nzval[pj]
+            pi_idx, ai_idx, pj_idx = triples[t]
+            acc += P_nzval[pi_idx] * nzv_f[ai_idx] * P_nzval[pj_idx]
         end
         nzv_c[k] = acc
     end

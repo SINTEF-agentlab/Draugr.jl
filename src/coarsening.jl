@@ -4,7 +4,7 @@
 
 """Remove node `i` from its bucket in the linked-list bucket structure.
 `bucket_tail[k]` tracks the last node in each bucket for FIFO ordering."""
-@inline function _bucket_remove_node!(i::Int, λ::Vector{Int},
+@inline function _bucket_remove_node!(i, λ::Vector{Int},
                                       bucket_head::Vector{Int},
                                       bucket_tail::Vector{Int},
                                       bucket_next::Vector{Int},
@@ -31,7 +31,7 @@ end
 
 """Remove node `i` from its old bucket and insert at TAIL of bucket for `new_λ` (FIFO).
 `bucket_tail[k]` tracks the last node in each bucket for O(1) tail insertion."""
-@inline function _bucket_update_node!(i::Int, new_λ::Int, λ::Vector{Int},
+@inline function _bucket_update_node!(i, new_λ, λ::Vector{Int},
                                       bucket_head::Vector{Int},
                                       bucket_tail::Vector{Int},
                                       bucket_next::Vector{Int},

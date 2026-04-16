@@ -88,6 +88,8 @@ function reservoir_spe10_like(nx, ny, nz; perm_range=1e6, seed=42)
     for iz in 1:nz, iy in 1:ny, ix in 1:nx
         idx = (iz-1)*nx*ny + (iy-1)*nx + ix
         diag = 0.0
+        # 6 neighbors: ±x, ±y, ±z.  z-direction uses 0.01 scale to model
+        # typical reservoir anisotropy (horizontal permeability ≫ vertical).
         for (dx,dy,dz,scale) in [(-1,0,0,1.0),(1,0,0,1.0),(0,-1,0,1.0),(0,1,0,1.0),(0,0,-1,0.01),(0,0,1,0.01)]
             jx,jy,jz = ix+dx,iy+dy,iz+dz
             (jx < 1 || jx > nx || jy < 1 || jy > ny || jz < 1 || jz > nz) && continue

@@ -1709,6 +1709,400 @@ function build_smoother(A::CSRMatrix{Tv, Ti}, ::ILU0SmootherType, ω::Real; back
 end
 
 # ══════════════════════════════════════════════════════════════════════════════
+# GPU ILU(0) Smoother (level-scheduled KA kernels)
+# ══════════════════════════════════════════════════════════════════════════════
+
+"""
+    build_gpu_ilu0_smoother(A; x_eltype=Tv)
+
+Build a GPU-native ILU(0) smoother. The factorization is computed on CPU,
+then L/U values and level-scheduling data are copied to the same device as `A`.
+Triangular solves run entirely on-device using KernelAbstractions kernels.
+"""
+function build_gpu_ilu0_smoother(A::CSRMatrix{Tv, Ti};
+                                 x_eltype::Type{Tx}=Tv) where {Tv, Ti, Tx}
+    A_cpu = csr_to_cpu(A)
+    n = size(A_cpu, 1)
+
+    diag_idx = _ilu0_diag_indices(A_cpu)
+
+    # Compute level scheduling for parallel triangular solves (reuse from ILU0)
+    fwd_order, fwd_offsets, num_fwd_levels, bwd_order, bwd_offsets, num_bwd_levels =
+        _compute_ilu_levels(A_cpu, diag_idx)
+
+    # ILU(0) factorization (on CPU)
+    L_nzval = zeros(Tv, nnz(A_cpu))
+    U_nzval = copy(nonzeros(A_cpu))
+    _ilu0_factorize!(L_nzval, U_nzval, diag_idx, A_cpu)
+
+    # Copy factorization data to device
+    L_nzval_dev = A.nzval isa Array ? L_nzval : _to_device(A, L_nzval)
+    U_nzval_dev = A.nzval isa Array ? U_nzval : _to_device(A, U_nzval)
+    diag_idx_dev = A.nzval isa Array ? diag_idx : _to_device(A, diag_idx)
+    fwd_order_dev = A.nzval isa Array ? fwd_order : _to_device(A, fwd_order)
+    bwd_order_dev = A.nzval isa Array ? bwd_order : _to_device(A, bwd_order)
+    tmp = _allocate_vector(A, Tx, n)
+
+    combined_offsets = vcat(fwd_offsets, bwd_offsets)
+    return GPUILU0Smoother(L_nzval_dev, U_nzval_dev, diag_idx_dev,
+                           fwd_order_dev, bwd_order_dev,
+                           combined_offsets, num_fwd_levels, tmp, A_cpu)
+end
+
+function update_smoother!(smoother::GPUILU0Smoother{Tv, Ti}, A::CSRMatrix;
+                          backend=_get_backend(nonzeros(A)), block_size::Int=64) where {Tv, Ti}
+    A_cpu = csr_to_cpu(A)
+    copyto!(smoother.A_cpu.nzval, A_cpu.nzval)
+    # Re-factorize on CPU
+    L_cpu = Vector{Tv}(undef, length(smoother.A_cpu.nzval))
+    U_cpu = copy(nonzeros(smoother.A_cpu))
+    fill!(L_cpu, zero(Tv))
+    diag_idx_cpu = Array(smoother.diag_idx)
+    _ilu0_factorize!(L_cpu, U_cpu, diag_idx_cpu, smoother.A_cpu)
+    # Copy updated values to device
+    copyto!(smoother.L_nzval, L_cpu)
+    copyto!(smoother.U_nzval, U_cpu)
+    return smoother
+end
+
+# ── KA kernels for GPU ILU(0) triangular solves ──────────────────────────────
+
+@kernel function _gpu_ilu0_residual_kernel!(tmp, @Const(b), @Const(x),
+                                            @Const(nzval), @Const(colval), @Const(rp))
+    i = @index(Global)
+    @inbounds begin
+        Ax_i = zero(eltype(tmp))
+        for nz in rp[i]:(rp[i+1]-one(eltype(rp)))
+            j = colval[nz]
+            Ax_i += nzval[nz] * x[j]
+        end
+        tmp[i] = b[i] - Ax_i
+    end
+end
+
+@kernel function _gpu_ilu0_fwd_kernel!(tmp, @Const(L_nzval), @Const(colval), @Const(rp),
+                                       @Const(diag_idx), @Const(fwd_order), level_offset)
+    idx = @index(Global)
+    @inbounds begin
+        i = fwd_order[level_offset + idx]
+        ti_one = one(eltype(rp))
+        for nz in rp[i]:(diag_idx[i]-ti_one)
+            j = colval[nz]
+            tmp[i] -= L_nzval[nz] * tmp[j]
+        end
+    end
+end
+
+@kernel function _gpu_ilu0_bwd_kernel!(tmp, @Const(U_nzval), @Const(colval), @Const(rp),
+                                       @Const(diag_idx), @Const(bwd_order), level_offset)
+    idx = @index(Global)
+    @inbounds begin
+        Tv = eltype(U_nzval)
+        Tx = eltype(tmp)
+        Ts = _scalar_real_type(Tv)
+        i = bwd_order[level_offset + idx]
+        ti_one = one(eltype(rp))
+        for nz in (diag_idx[i]+ti_one):(rp[i+ti_one]-ti_one)
+            j = colval[nz]
+            tmp[i] -= U_nzval[nz] * tmp[j]
+        end
+        u_ii = U_nzval[diag_idx[i]]
+        tmp[i] = _entry_norm(u_ii) > eps(Ts) ? u_ii \ tmp[i] : zero(Tx)
+    end
+end
+
+@kernel function _gpu_ilu0_update_kernel!(x, @Const(tmp))
+    i = @index(Global)
+    @inbounds begin
+        v = tmp[i]
+        if _is_finite_entry(v)
+            x[i] += v
+        end
+    end
+end
+
+"""
+    smooth!(x, A, b, smoother::GPUILU0Smoother; steps=1)
+
+Apply GPU-native ILU(0) smoothing: x += (LU)⁻¹ (b - Ax).
+Uses KA kernels with level scheduling for the triangular solves.
+All computation stays on-device — no CPU↔GPU copies per step.
+"""
+function smooth!(x::AbstractVector, A::CSRMatrix{Tv, Ti}, b::AbstractVector,
+                 smoother::GPUILU0Smoother{Tv, Ti, Tx}; steps::Int=1, reverse::Bool=false,
+                 backend=_get_backend(nonzeros(A)), block_size::Int=A.block_size) where {Tv, Ti, Tx}
+    n = size(A, 1)
+    n == 0 && return x
+    nzv = nonzeros(A)
+    cv = colvals(A)
+    rp = rowptr(A)
+    tmp = smoother.tmp
+
+    fwd_order = smoother.fwd_order
+    bwd_order = smoother.bwd_order
+    num_fwd_levels = smoother.num_fwd_levels
+    combined_offsets = smoother.level_offsets
+    bwd_offset_start = num_fwd_levels + 2
+    num_bwd_levels = length(combined_offsets) - bwd_offset_start
+
+    L_nzval = smoother.L_nzval
+    U_nzval = smoother.U_nzval
+    diag_idx = smoother.diag_idx
+
+    res_kernel! = _gpu_ilu0_residual_kernel!(backend, block_size)
+    fwd_kernel! = _gpu_ilu0_fwd_kernel!(backend, block_size)
+    bwd_kernel! = _gpu_ilu0_bwd_kernel!(backend, block_size)
+    upd_kernel! = _gpu_ilu0_update_kernel!(backend, block_size)
+
+    for _ in 1:steps
+        # Compute residual: tmp = b - A*x
+        res_kernel!(tmp, b, x, nzv, cv, rp; ndrange=n)
+        _synchronize(backend)
+
+        # Forward substitution: L * z = tmp, level by level
+        for lev in 1:num_fwd_levels
+            lev_start = combined_offsets[lev]
+            lev_end = combined_offsets[lev+1] - 1
+            count = lev_end - lev_start + 1
+            count == 0 && continue
+            fwd_kernel!(tmp, L_nzval, cv, rp, diag_idx, fwd_order, lev_start - 1; ndrange=count)
+            _synchronize(backend)
+        end
+
+        # Backward substitution: U * dx = z, level by level
+        for lev in 1:num_bwd_levels
+            lev_start = combined_offsets[bwd_offset_start + lev - 1]
+            lev_end = combined_offsets[bwd_offset_start + lev] - 1
+            count = lev_end - lev_start + 1
+            count == 0 && continue
+            bwd_kernel!(tmp, U_nzval, cv, rp, diag_idx, bwd_order, lev_start - 1; ndrange=count)
+            _synchronize(backend)
+        end
+
+        # Update: x += dx
+        upd_kernel!(x, tmp; ndrange=n)
+        _synchronize(backend)
+    end
+    return x
+end
+
+function build_smoother(A::CSRMatrix{Tv, Ti}, ::GPUILU0SmootherType, ω::Real; backend=DEFAULT_BACKEND, block_size::Int=64,
+                        x_eltype::Type=Tv) where {Tv, Ti}
+    return build_gpu_ilu0_smoother(A; x_eltype=x_eltype)
+end
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DILU (Diagonal ILU) Smoother
+# ══════════════════════════════════════════════════════════════════════════════
+
+"""
+    _dilu_factorize!(inv_diag, diag_idx, A)
+
+Compute the DILU modified diagonal and its inverse.
+DILU approximates A ≈ (D+L)*D⁻¹*(D+U) where D is a modified diagonal and
+L, U are the strict lower/upper parts of A with their original values.
+
+The modified diagonal is computed row by row:
+  d_i = a_{ii} - Σ_{j<i, (i,j)∈nz} a_{ij} * d_j⁻¹ * a_{ji}
+"""
+function _dilu_factorize!(inv_diag::Vector{Tv}, diag_idx::Vector{Ti},
+                          A::CSRMatrix{Tv, Ti}) where {Tv, Ti}
+    n = size(A, 1)
+    cv = colvals(A)
+    nzv = nonzeros(A)
+    rp = rowptr(A)
+    ti_one = one(Ti)
+    Ts = _scalar_real_type(Tv)
+
+    # Precompute row norms for safeguards
+    row_norms = Vector{Ts}(undef, n)
+    @inbounds for i in 1:n
+        s = zero(Ts)
+        for nz in rp[i]:(rp[i+ti_one]-ti_one)
+            s += _entry_norm(nzv[nz])
+        end
+        row_norms[i] = s
+    end
+
+    # d stores the modified diagonal values (forward pass, sequential)
+    d = Vector{Tv}(undef, n)
+    @inbounds for i in 1:n
+        d_i = nzv[diag_idx[i]]  # start with a_{ii}
+        # Subtract contributions from lower triangle: a_{ij} * d_j^{-1} * a_{ji}
+        for nz in rp[i]:(diag_idx[i]-ti_one)
+            j = cv[nz]  # j < i
+            a_ij = nzv[nz]
+            # Find a_{ji} in row j (the transpose entry)
+            nz_ji = _find_nz_in_row(cv, rp[j], rp[j+ti_one]-ti_one, Ti(i))
+            if nz_ji > zero(Ti)
+                a_ji = nzv[nz_ji]
+                d_i -= a_ij * inv_diag[j] * a_ji
+            end
+        end
+        # Safeguard against zero/near-zero diagonal
+        safe_thresh = _safe_threshold(Tv, row_norms[i])
+        if _entry_norm(d_i) < safe_thresh
+            d_i = safe_thresh * one(Tv)
+        end
+        d[i] = d_i
+        inv_diag[i] = inv(d_i)
+    end
+    return nothing
+end
+
+"""
+    build_dilu_smoother(A; x_eltype=Tv)
+
+Build a DILU smoother. Computes a modified diagonal on CPU, then copies the
+inverse diagonal and level-scheduling data to the same device as `A`.
+Triangular solves run on-device using KernelAbstractions kernels.
+"""
+function build_dilu_smoother(A::CSRMatrix{Tv, Ti};
+                             x_eltype::Type{Tx}=Tv) where {Tv, Ti, Tx}
+    A_cpu = csr_to_cpu(A)
+    n = size(A_cpu, 1)
+
+    diag_idx = _ilu0_diag_indices(A_cpu)
+
+    # Compute level scheduling (reuse from ILU0 — same dependency structure)
+    fwd_order, fwd_offsets, num_fwd_levels, bwd_order, bwd_offsets, num_bwd_levels =
+        _compute_ilu_levels(A_cpu, diag_idx)
+
+    # DILU factorization (compute modified diagonal on CPU)
+    inv_diag = Vector{Tv}(undef, n)
+    _dilu_factorize!(inv_diag, diag_idx, A_cpu)
+
+    # Copy data to device
+    inv_diag_dev = A.nzval isa Array ? inv_diag : _to_device(A, inv_diag)
+    diag_idx_dev = A.nzval isa Array ? diag_idx : _to_device(A, diag_idx)
+    fwd_order_dev = A.nzval isa Array ? fwd_order : _to_device(A, fwd_order)
+    bwd_order_dev = A.nzval isa Array ? bwd_order : _to_device(A, bwd_order)
+    tmp = _allocate_vector(A, Tx, n)
+
+    combined_offsets = vcat(fwd_offsets, bwd_offsets)
+    return DILUSmoother(inv_diag_dev, diag_idx_dev,
+                        fwd_order_dev, bwd_order_dev,
+                        combined_offsets, num_fwd_levels, tmp, A_cpu)
+end
+
+function update_smoother!(smoother::DILUSmoother{Tv, Ti}, A::CSRMatrix;
+                          backend=_get_backend(nonzeros(A)), block_size::Int=64) where {Tv, Ti}
+    A_cpu = csr_to_cpu(A)
+    copyto!(smoother.A_cpu.nzval, A_cpu.nzval)
+    # Re-factorize on CPU
+    n = size(smoother.A_cpu, 1)
+    inv_diag_cpu = Vector{Tv}(undef, n)
+    diag_idx_cpu = Array(smoother.diag_idx)
+    _dilu_factorize!(inv_diag_cpu, diag_idx_cpu, smoother.A_cpu)
+    # Copy updated diagonal to device
+    copyto!(smoother.inv_diag, inv_diag_cpu)
+    return smoother
+end
+
+# ── KA kernels for DILU triangular solves ─────────────────────────────────────
+
+# Forward solve: (D + L) y = r
+# y_i = inv_diag_i * (r_i - Σ_{j<i} a_{ij} * y_j)
+@kernel function _dilu_fwd_kernel!(tmp, @Const(inv_diag), @Const(nzval), @Const(colval),
+                                   @Const(rp), @Const(diag_idx), @Const(fwd_order), level_offset)
+    idx = @index(Global)
+    @inbounds begin
+        i = fwd_order[level_offset + idx]
+        ti_one = one(eltype(rp))
+        s = zero(eltype(tmp))
+        for nz in rp[i]:(diag_idx[i]-ti_one)
+            j = colval[nz]
+            s += nzval[nz] * tmp[j]
+        end
+        tmp[i] = inv_diag[i] * (tmp[i] - s)
+    end
+end
+
+# Backward solve: (D + U) z = D y  ⟹  z_i = y_i - inv_diag_i * Σ_{j>i} a_{ij} * z_j
+@kernel function _dilu_bwd_kernel!(tmp, @Const(inv_diag), @Const(nzval), @Const(colval),
+                                   @Const(rp), @Const(diag_idx), @Const(bwd_order), level_offset)
+    idx = @index(Global)
+    @inbounds begin
+        i = bwd_order[level_offset + idx]
+        ti_one = one(eltype(rp))
+        s = zero(eltype(tmp))
+        for nz in (diag_idx[i]+ti_one):(rp[i+ti_one]-ti_one)
+            j = colval[nz]
+            s += nzval[nz] * tmp[j]
+        end
+        tmp[i] -= inv_diag[i] * s
+    end
+end
+
+"""
+    smooth!(x, A, b, smoother::DILUSmoother; steps=1)
+
+Apply DILU smoothing: x += M⁻¹ (b - Ax) where M = (D+L)*D⁻¹*(D+U).
+Uses KA kernels with level scheduling. All computation stays on-device.
+"""
+function smooth!(x::AbstractVector, A::CSRMatrix{Tv, Ti}, b::AbstractVector,
+                 smoother::DILUSmoother{Tv, Ti, Tx}; steps::Int=1, reverse::Bool=false,
+                 backend=_get_backend(nonzeros(A)), block_size::Int=A.block_size) where {Tv, Ti, Tx}
+    n = size(A, 1)
+    n == 0 && return x
+    nzv = nonzeros(A)
+    cv = colvals(A)
+    rp = rowptr(A)
+    tmp = smoother.tmp
+
+    inv_diag = smoother.inv_diag
+    diag_idx = smoother.diag_idx
+    fwd_order = smoother.fwd_order
+    bwd_order = smoother.bwd_order
+    num_fwd_levels = smoother.num_fwd_levels
+    combined_offsets = smoother.level_offsets
+    bwd_offset_start = num_fwd_levels + 2
+    num_bwd_levels = length(combined_offsets) - bwd_offset_start
+
+    # Reuse the residual kernel from GPU ILU(0) — same operation
+    res_kernel! = _gpu_ilu0_residual_kernel!(backend, block_size)
+    fwd_kernel! = _dilu_fwd_kernel!(backend, block_size)
+    bwd_kernel! = _dilu_bwd_kernel!(backend, block_size)
+    upd_kernel! = _gpu_ilu0_update_kernel!(backend, block_size)
+
+    for _ in 1:steps
+        # Compute residual: tmp = b - A*x
+        res_kernel!(tmp, b, x, nzv, cv, rp; ndrange=n)
+        _synchronize(backend)
+
+        # Forward substitution: (D+L) y = tmp, level by level
+        for lev in 1:num_fwd_levels
+            lev_start = combined_offsets[lev]
+            lev_end = combined_offsets[lev+1] - 1
+            count = lev_end - lev_start + 1
+            count == 0 && continue
+            fwd_kernel!(tmp, inv_diag, nzv, cv, rp, diag_idx, fwd_order, lev_start - 1; ndrange=count)
+            _synchronize(backend)
+        end
+
+        # Backward substitution: (D+U) z = D*y, level by level
+        for lev in 1:num_bwd_levels
+            lev_start = combined_offsets[bwd_offset_start + lev - 1]
+            lev_end = combined_offsets[bwd_offset_start + lev] - 1
+            count = lev_end - lev_start + 1
+            count == 0 && continue
+            bwd_kernel!(tmp, inv_diag, nzv, cv, rp, diag_idx, bwd_order, lev_start - 1; ndrange=count)
+            _synchronize(backend)
+        end
+
+        # Update: x += dx
+        upd_kernel!(x, tmp; ndrange=n)
+        _synchronize(backend)
+    end
+    return x
+end
+
+function build_smoother(A::CSRMatrix{Tv, Ti}, ::DILUSmootherType, ω::Real; backend=DEFAULT_BACKEND, block_size::Int=64,
+                        x_eltype::Type=Tv) where {Tv, Ti}
+    return build_dilu_smoother(A; x_eltype=x_eltype)
+end
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Standalone smoother API
 # ══════════════════════════════════════════════════════════════════════════════
 

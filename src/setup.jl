@@ -684,7 +684,7 @@ This guards against Julia 1.12 (and later) where `lu()` is stricter about
 raising `SingularException` for rank-deficient coarse-level matrices that
 occasionally arise in degenerate AMG coarsening scenarios.
 """
-function _safe_lu(M::Matrix{Tv}) where Tv
+function _safe_lu(M::AbstractMatrix{Tv}) where Tv
     F = lu(M; check=false)
     if issuccess(F)
         return F

@@ -127,9 +127,10 @@ end
 
 function Draugr.smooth!(x::AbstractVector, A::StaticSparsityMatrixCSR, b::AbstractVector,
                              smoother::Draugr.AbstractSmoother; steps::Int=1,
-                             backend=Draugr.DEFAULT_BACKEND, block_size::Int=64)
+                             backend=Draugr.DEFAULT_BACKEND, block_size::Int=64,
+                             residual::Union{Nothing, AbstractVector}=nothing)
     A_csr = Draugr.csr_from_static(A)
-    return Draugr.smooth!(x, A_csr, b, smoother; steps=steps, backend=backend, block_size=block_size)
+    return Draugr.smooth!(x, A_csr, b, smoother; steps=steps, backend=backend, block_size=block_size, residual=residual)
 end
 
 # ── Shared helpers ────────────────────────────────────────────────────────────
@@ -212,7 +213,7 @@ end
 
 function Jutul.apply!(x, prec::DraugrPreconditionerJutul, y)
     fill!(x, zero(eltype(x)))
-    Draugr.amg_cycle!(x, y, prec.hierarchy, prec.config)
+    Draugr.amg_cycle!(x, y, prec.hierarchy, prec.config; residual=y)
     return x
 end
 
@@ -273,7 +274,7 @@ end
 
 function Jutul.apply!(x, prec::DraugrPreconditionerJutulPartial, y)
     fill!(x, zero(eltype(x)))
-    Draugr.amg_cycle!(x, y, prec.hierarchy, prec.config)
+    Draugr.amg_cycle!(x, y, prec.hierarchy, prec.config; residual=y)
     return x
 end
 

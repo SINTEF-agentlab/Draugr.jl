@@ -434,7 +434,7 @@ struct TransposeMap{Ti<:Integer, Vi<:AbstractVector{Ti}}
 end
 
 """
-    RestrictionMap{Ti, Vi}
+    RestrictionMap{Ti, Vi, Vt}
 
 Maps the Galerkin product triples to coarse matrix nonzero entries for in-place
 computation during resetup. Triples are grouped by their destination coarse NZ
@@ -443,14 +443,13 @@ thread per output entry) without atomics.
 
 - `nz_offsets[k]` to `nz_offsets[k+1]-1` gives the range of triples that
   contribute to coarse NZ entry `k`.
-- Each triple `t` represents the contribution:
-  `P.nzval[triple_pi_idx[t]] * A.nzval[triple_anz_idx[t]] * P.nzval[triple_pj_idx[t]]`
+- Each triple `t` is a 3-tuple `(pi_idx, anz_idx, pj_idx)` representing the
+  contribution:
+  `P.nzval[pi_idx] * A.nzval[anz_idx] * P.nzval[pj_idx]`
 """
-struct RestrictionMap{Ti<:Integer, Vi<:AbstractVector{Ti}}
+struct RestrictionMap{Ti<:Integer, Vi<:AbstractVector{Ti}, Vt<:AbstractVector{NTuple{3,Ti}}}
     nz_offsets::Vi        # offset array: nnz_c + 1 entries
-    triple_pi_idx::Vi     # P.nzval index for p_i weight (sorted by dest NZ)
-    triple_anz_idx::Vi    # A.nzval index for a_ij value (sorted by dest NZ)
-    triple_pj_idx::Vi     # P.nzval index for p_j weight (sorted by dest NZ)
+    triples::Vt           # (pi_idx, anz_idx, pj_idx) tuples sorted by dest NZ
 end
 
 """

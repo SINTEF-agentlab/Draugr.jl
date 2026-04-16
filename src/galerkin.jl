@@ -184,18 +184,12 @@ function compute_coarse_sparsity(A_fine::CSRMatrix{Tv, Ti},
     nz_offsets[Int(nnz_c) + 1] = cumsum_val
     ntriples = Int(cumsum_val) - 1
 
-    # Allocate/reuse triple arrays
-    if old_r_map !== nothing && old_r_map.triple_pi_idx isa Vector
-        map_pi = old_r_map.triple_pi_idx
-        map_ai = old_r_map.triple_anz_idx
-        map_pj = old_r_map.triple_pj_idx
-        resize!(map_pi, ntriples)
-        resize!(map_ai, ntriples)
-        resize!(map_pj, ntriples)
+    # Allocate/reuse triples array
+    if old_r_map !== nothing && old_r_map.triples isa Vector
+        map_triples = old_r_map.triples
+        resize!(map_triples, ntriples)
     else
-        map_pi = Vector{Ti}(undef, ntriples)
-        map_ai = Vector{Ti}(undef, ntriples)
-        map_pj = Vector{Ti}(undef, ntriples)
+        map_triples = Vector{NTuple{3,Ti}}(undef, ntriples)
     end
 
     # Fill position counters (reuse nz_counts or workspace)
@@ -221,16 +215,14 @@ function compute_coarse_sparsity(A_fine::CSRMatrix{Tv, Ti},
                     J = P.colval[pnz_j]
                     nz_idx = _find_nz_in_row(colval_c, csr_start, csr_end, J)
                     p = nz_pos[nz_idx]
-                    map_pi[p] = Ti(pi_nz)
-                    map_ai[p] = Ti(anz)
-                    map_pj[p] = Ti(pnz_j)
+                    map_triples[p] = (Ti(pi_nz), Ti(anz), Ti(pnz_j))
                     nz_pos[nz_idx] += one(Ti)
                 end
             end
         end
     end
 
-    r_map = RestrictionMap(nz_offsets, map_pi, map_ai, map_pj)
+    r_map = RestrictionMap(nz_offsets, map_triples)
     return A_coarse, r_map
 end
 
@@ -254,20 +246,20 @@ function galerkin_product!(A_coarse::CSRMatrix{Tv, Ti},
     if nnz_c > 0
         kernel! = galerkin_nz_kernel!(backend, block_size)
         kernel!(nzv_c, nzv_f, P.nzval,
-                r_map.nz_offsets, r_map.triple_pi_idx,
-                r_map.triple_anz_idx, r_map.triple_pj_idx; ndrange=nnz_c)
+                r_map.nz_offsets, r_map.triples; ndrange=nnz_c)
         _synchronize(backend)
     end
     return A_coarse
 end
 
 @kernel function galerkin_nz_kernel!(nzv_c, @Const(nzv_f), @Const(P_nzval),
-                                     @Const(nz_offsets), @Const(pi), @Const(ai), @Const(pj))
+                                     @Const(nz_offsets), @Const(triples))
     k = @index(Global)
     @inbounds begin
         acc = zero(eltype(nzv_c))
         for t in nz_offsets[k]:(nz_offsets[k+1]-1)
-            acc += P_nzval[pi[t]] * nzv_f[ai[t]] * P_nzval[pj[t]]
+            pi, ai, pj = triples[t]
+            acc += P_nzval[pi] * nzv_f[ai] * P_nzval[pj]
         end
         nzv_c[k] = acc
     end

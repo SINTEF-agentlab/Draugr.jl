@@ -226,10 +226,6 @@ function _build_levels!(levels::Vector{AMGLevel{Tv, Ti}},
         P, n_coarse, P_update_map = _coarsen_with_fallback(A_current, coarsening_alg, config; backend=backend, block_size=block_size, setup_workspace=setup_workspace, build_P_update_map=build_P_update_map)
         n_coarse >= n && break
         n_coarse == 0 && break
-        # Stop if coarsening has stalled (ratio > 0.9 even after fallback).
-        # Continuing with near-identity coarsening adds cost without improving
-        # the preconditioner, and can degrade convergence.
-        n_coarse > 0.9 * n && break
         A_cpu = csr_to_cpu(A_current)
         # Get old A_coarse for array reuse (stored as next level's A, CPU only)
         old_A_coarse = nothing
@@ -384,14 +380,21 @@ function _coarsen_and_build_P(A::CSRMatrix, alg::CoarseningAlgorithm,
                               build_P_update_map::Bool=false)
     if uses_cf_splitting(alg)
         cf, coarse_map, n_coarse = coarsen_cf(A, alg, config; backend=backend, block_size=block_size, setup_workspace=setup_workspace)
-        # Compute the strength graph from the appropriate matrix (weakened if max_row_sum < 1.0)
-        # and pass it to interpolation so the same graph is used for both coarsening and interpolation.
+        # Use the strength graph from the appropriate matrix (weakened if max_row_sum < 1.0)
+        # for interpolation so the same graph is used for both coarsening and interpolation.
         # This matches HYPRE's behavior where a single S matrix is used throughout.
+        # coarsen_cf already computed strength_graph(A_weak, θ) and stored it in
+        # setup_workspace.is_strong — reuse it to avoid a redundant _apply_max_row_sum
+        # and strength_graph call.
         coarsening_is_strong = nothing
         if config.max_row_sum < 1.0
-            A_weak = _apply_max_row_sum(csr_to_cpu(A), config.max_row_sum)
-            is_strong_raw = strength_graph(A_weak, alg.θ, config.strength_type; backend=backend, block_size=block_size)
-            coarsening_is_strong = is_strong_raw isa Array ? is_strong_raw : Array(is_strong_raw)
+            if setup_workspace !== nothing
+                coarsening_is_strong = setup_workspace.is_strong
+            else
+                A_weak = _apply_max_row_sum(csr_to_cpu(A), config.max_row_sum)
+                is_strong_raw = strength_graph(A_weak, alg.θ, config.strength_type; backend=backend, block_size=block_size)
+                coarsening_is_strong = is_strong_raw isa Array ? is_strong_raw : Array(is_strong_raw)
+            end
         end
         P, P_update_map = build_cf_prolongation(A, cf, coarse_map, n_coarse, alg.interpolation, alg.θ; backend=backend, block_size=block_size, setup_workspace=setup_workspace, build_update_map=build_P_update_map, coarsening_is_strong=coarsening_is_strong, strength_type=config.strength_type)
         # Apply interpolation truncation if configured.

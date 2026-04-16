@@ -475,10 +475,14 @@ end
     _serial_l1_gs_compute_invdiag!(invdiag, nzv, cv, rp, n)
 
 Compute inverse l1 row norms for serial L1 GS smoother.
-Matches hypre's option 4 for serial execution: since all entries are processed
-sequentially (no frozen off-processor entries), l1_norm = |a_{i,i}| + 0.5 * Σ_{j≠i} |a_{i,j}|
-with truncation (Remark 6.2, Baker et al. 2011). In serial mode the off-processor sum
-is zero, so this simplifies to l1_norm = |a_{i,i}|.
+Matches hypre's `ComputeL1Norms` option 4 for serial execution:
+
+    l1_norm = |a_{i,i}| + 0.5 * Σ_{j ∈ A_offd} |a_{i,j}|
+
+In serial (single-process) HYPRE the off-diagonal block A_offd is empty,
+so the formula reduces to `l1_norm = |a_{i,i}|`.  This makes serial L1 GS
+equivalent to standard serial GS — the L1 damping only adds extra weight
+for inter-process entries that remain frozen during a parallel sweep.
 """
 function _serial_l1_gs_compute_invdiag!(invdiag::Vector{Tv}, nzv, cv, rp, n::Int) where {Tv}
     Ts = _scalar_real_type(Tv)
@@ -494,8 +498,6 @@ function _serial_l1_gs_compute_invdiag!(invdiag::Vector{Tv}, nzv, cv, rp, n::Int
         # there are no "frozen" off-processor entries. This matches
         # hypre's option 4 for a single-processor run: l1_norm = |a_{i,i}|.
         l1_norm = abs_diag
-        # For block matrices, one(Tv)/l1_norm == (1/l1_norm)*I_B,
-        # so invdiag[i]*r gives (1/l1_norm)*r for any block vector r.
         invdiag[i] = l1_norm > eps(Ts) ? one(Tv) / l1_norm : zero(Tv)
     end
     return invdiag

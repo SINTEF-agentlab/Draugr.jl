@@ -1589,10 +1589,12 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                 if diag_nz_idx[i] > 0
                     push!(extd_d_base_entries_list, diag_nz_idx[i])
                 end
-                # Add weak connections (not strong, not in C-hat)
+                # Add weak connections (not strong, not in C-hat).
+                # C-hat members (P_marker2[j] >= 0) are handled by direct_a_idx
+                # and must NOT be included in d_base to avoid double-counting.
                 for nz in nzrange(A, i)
                     j = cv[nz]
-                    if j != i && !is_strong_copy[nz]
+                    if j != i && !is_strong_copy[nz] && P_marker2[j] < 0
                         push!(extd_d_base_entries_list, Ti(nz))
                     end
                 end

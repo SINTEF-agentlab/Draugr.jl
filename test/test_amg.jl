@@ -1079,3 +1079,72 @@ end
         @test norm(r) / norm(b) < 1e-6
     end
 end
+
+# ══════════════════════════════════════════════════════════════════════════
+# HYPRE comparison tests
+# ══════════════════════════════════════════════════════════════════════════
+
+@testset "HYPRE comparison - hierarchy structure" begin
+    using Krylov, HYPRE
+
+    N = 100
+    A = poisson2d_csr(N, N)
+    n = N * N
+    b = ones(n)
+
+    # Draugr setup matching HYPRE defaults:
+    #   StrongThreshold = 0.25, max_elmts = 4, max_row_sum = 0.9, no trunc_factor
+    coarsen = HMISCoarsening(0.25, ExtendedIInterpolation(0.0, 4, 2, true))
+    config = AMGConfig(coarsening=coarsen,
+        smoother = SerialGaussSeidelType(),
+        verbose = false,
+        max_row_sum = 0.9,
+        strength_type = SignedStrength()
+    )
+    hierarchy = amg_setup(A, config)
+
+    # Level 0 → Level 1 coarsening should be ~0.5 for 2D 5-point Poisson
+    ratio_0 = hierarchy.levels[2].A.nrow / hierarchy.levels[1].A.nrow
+    @test ratio_0 ≈ 0.5 atol=0.05
+
+    # Level 1 → Level 2: the 9-point Galerkin stencil with θ=0.25 makes all 8
+    # neighbors strong, so HMIS produces ~0.25 coarsening ratio (matching HYPRE)
+    if length(hierarchy.levels) >= 3
+        ratio_1 = hierarchy.levels[3].A.nrow / hierarchy.levels[2].A.nrow
+        @test ratio_1 ≈ 0.25 atol=0.05
+    end
+end
+
+@testset "HYPRE comparison - GMRES iteration count" begin
+    using Krylov, HYPRE
+
+    N = 100
+    A = poisson2d_csr(N, N)
+    n = N * N
+    b = ones(n)
+
+    # HYPRE solve
+    prec_hypre = Jutul.BoomerAMGPreconditioner(PrintLevel = 0, AggNumLevels = 0, AggTruncFactor = 0.0)
+    Jutul.update_preconditioner!(prec_hypre, A, b, missing, missing)
+    op_hypre = Jutul.linear_operator(prec_hypre)
+    _, stats_h = gmres(A, b; M = op_hypre, rtol = 1e-8, itmax=100)
+
+    # Draugr solve — parameters matching HYPRE defaults:
+    #   StrongThreshold = 0.25, max_elmts = 4, max_row_sum = 0.9, no trunc_factor
+    coarsen = HMISCoarsening(0.25, ExtendedIInterpolation(0.0, 4, 2, true))
+    config = AMGConfig(coarsening=coarsen,
+        smoother = SerialGaussSeidelType(),
+        verbose = false,
+        max_row_sum = 0.9,
+        strength_type = SignedStrength()
+    )
+    hierarchy = amg_setup(A, config)
+    M = DraugrPreconditioner(config, hierarchy, size(A))
+    _, stats_d = gmres(A, b; M = M, rtol = 1e-8, itmax=100, ldiv = true)
+
+    # Draugr should be within 10% of HYPRE's iteration count
+    @test stats_d.niter <= 1.1 * stats_h.niter
+    # Both should converge
+    @test stats_h.solved
+    @test stats_d.solved
+end

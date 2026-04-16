@@ -22,7 +22,7 @@ function solve_hypre(A, b, ; kwarg...)
     tol = 1e-8
     maxit = 100
 
-    prec_hypre = BoomerAMGPreconditioner(PrintLevel = 1, AggNumLevels = 0; kwarg...)
+    prec_hypre = Jutul.BoomerAMGPreconditioner(PrintLevel = 1, AggNumLevels = 0; kwarg...)
     t_setup_hypre = @elapsed Jutul.update_preconditioner!(prec_hypre, A, b, missing, missing)
     op_hypre = Jutul.linear_operator(prec_hypre)
     t_solve_hypre = @elapsed x, stats = gmres(A, b; M = op_hypre, rtol = tol, itmax=maxit, verbose = 1)
@@ -34,17 +34,38 @@ end
 N = 1000
 A = poisson2d_csr(N, N)
 b = rand(N*N)
-##
-# Example on running hypre as bench
-x_h, stats_h = solve_hypre(A, b, AggTruncFactor = 0.0)#, RelaxType = 0);
-# Similar options for Draugr
-coarsen = HMISCoarsening(0.5, ExtendedIInterpolation(0.0, 4, 2, true))
-s = SerialGaussSeidelType()
+@testset "HMIS + Ext+i" begin
+    # Example on running hypre as bench
+    x_h, stats_h = solve_hypre(A, b, AggTruncFactor = 0.0, StrongThreshold=0.25)
+    # Matching HYPRE defaults: StrongThreshold=0.25, max_elmts=4, no trunc_factor, max_row_sum=0.9
+    coarsen = HMISCoarsening(0.25, ExtendedIInterpolation(0.0, 4, 2, true))
+    s = L1SerialGaussSeidelType()
 
-config = AMGConfig(coarsening=coarsen,
-    smoother = s,
-    verbose = true,
-    max_row_sum = 0.9,
-    strength_type = SignedStrength()
-)
-x, stats = solve_draugr(A, b, config);
+    config = AMGConfig(coarsening=coarsen,
+        smoother = s,
+        verbose = true,
+        max_row_sum = 0.9,
+        strength_type = SignedStrength()
+    )
+    x, stats = solve_draugr(A, b, config);
+
+    @test stats[:nits] <= 1.1 * stats_h[:nits]
+end
+##
+@testset "classical" begin
+    # Example on running hypre as bench
+    x_h, stats_h = solve_hypre(A, b, CoarsenType = 1, InterpType = 0, StrongThreshold=0.25)
+    coarsen = RSCoarsening(0.25)
+    s = L1SerialGaussSeidelType()
+
+    config = AMGConfig(coarsening=coarsen,
+        smoother = s,
+        verbose = true,
+        max_row_sum = 1.0,
+        strength_type = SignedStrength()
+    )
+    x, stats = solve_draugr(A, b, config);
+
+    @test stats[:nits] <= 1.1 * stats_h[:nits]
+end
+

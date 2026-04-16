@@ -876,16 +876,9 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
         end
         
         if isempty(contributions)
-            # Fallback: map to nearest coarse point
-            best_j = _find_nearest_coarse(A, i, cf, coarse_map)
-            push!(I_p, Ti(i)); push!(J_p, Ti(best_j)); push!(V_p, one(Tv))
-            push!(entry_types_list, Ti(0))  # fallback = P=1
-            push!(numer_idx_list, Ti(0))
-            push!(denom_offsets_list, Ti(length(denom_entries_list) + 1))
-            # GPU kernel data: fallback has entry_type=0
-            push!(std_direct_numer_idx_list, Ti(0))
-            push!(std_fine_offsets_list, Ti(length(std_a_ik_list) + 1))
-            push!(std_d_base_offsets_list, Ti(length(std_d_base_entries_list) + 1))
+            # Isolated F-point (no strong C-neighbors): empty P row, matching
+            # hypre's treatment of points weakened by max_row_sum.
+            # No entries added — the row in P is zero.
         else
             # Add entries for all contributing coarse columns
             # Sort by coarse column to ensure COO order matches CSR sorted order
@@ -1188,10 +1181,9 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
 
         n_chat = length(chat_indices)
         if n_chat == 0
-            # No C-hat: fallback to nearest coarse point
-            best_j = _find_nearest_coarse(A, i, cf, coarse_map)
-            push!(I_p, Ti(i)); push!(J_p, Ti(best_j)); push!(V_p, one(Tv))
-            if do_rescale; push!(S_p, one(Tv)); end
+            # Isolated F-point (no strong C-neighbors): empty P row, matching
+            # hypre's treatment of points weakened by max_row_sum.
+            # No entries added — the row in P is zero.
             # Reset markers
             for si in sn_offsets[i]:(sn_offsets[i + 1] - 1)
                 j = sn_data[si]

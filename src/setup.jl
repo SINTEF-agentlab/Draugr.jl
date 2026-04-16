@@ -32,10 +32,8 @@ Copy a RestrictionMap to the same device as `ref`'s arrays.
 """
 function _restriction_map_to_device(ref::CSRMatrix, r_map::RestrictionMap)
     nz_offsets = _to_device(ref, r_map.nz_offsets)
-    triple_pi_idx = _to_device(ref, r_map.triple_pi_idx)
-    triple_anz_idx = _to_device(ref, r_map.triple_anz_idx)
-    triple_pj_idx = _to_device(ref, r_map.triple_pj_idx)
-    return RestrictionMap(nz_offsets, triple_pi_idx, triple_anz_idx, triple_pj_idx)
+    triples = _to_device(ref, r_map.triples)
+    return RestrictionMap(nz_offsets, triples)
 end
 
 """

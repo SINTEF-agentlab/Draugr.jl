@@ -1481,7 +1481,11 @@ function smooth!(x::AbstractVector, A::CSRMatrix{Tv, Ti}, b::AbstractVector,
     for step in 1:steps
         # Compute residual: tmp = b - A*x (on CPU)
         if step == 1 && residual !== nothing
-            copyto!(tmp, residual isa Array ? residual : Array(residual))
+            if is_gpu
+                copyto!(tmp, Array(residual))
+            else
+                copyto!(tmp, residual)
+            end
         else
             @inbounds for i in 1:n
                 Ax_i = zero(Tx)
@@ -1709,7 +1713,11 @@ function smooth!(x::AbstractVector, A::CSRMatrix{Tv, Ti}, b::AbstractVector,
     for step in 1:steps
         # Compute residual: tmp = b - A*x (on CPU)
         if step == 1 && residual !== nothing
-            copyto!(tmp, residual isa Array ? residual : Array(residual))
+            if is_gpu
+                copyto!(tmp, Array(residual))
+            else
+                copyto!(tmp, residual)
+            end
         else
             @inbounds for i in 1:n
                 Ax_i = zero(Tx)

@@ -343,9 +343,10 @@ function coarsen_pmis(A_in::CSRMatrix{Tv, Ti}, θ::Real;
         cf = zeros(Int, n)
     end
     @inbounds for i in 1:n
-        # Matching hypre: nodes with no strong connections at all (no strong
-        # OUT-connections AND no strong IN-connections) become SF_PT, excluded
-        # from coarsening entirely. Gets empty P row in interpolation.
+        # Matching hypre: nodes with nnzrow(S)==0 (no strong OUT-connections)
+        # become SF_PT and are excluded from the coarsening graph. They get
+        # empty P rows in interpolation. Note: in hypre this only checks the
+        # row of S (OUT-connections), NOT column sums (IN-connections).
         has_strong_out = false
         for nz in nzrange(A, i)
             j = cv[nz]
@@ -354,7 +355,7 @@ function coarsen_pmis(A_in::CSRMatrix{Tv, Ti}, θ::Real;
                 break
             end
         end
-        if !has_strong_out && st_count[i] == 0
+        if !has_strong_out
             cf[i] = -1  # SF_PT equivalent → F with empty P row
             measure[i] = 0.0
         end
@@ -564,7 +565,9 @@ function _rs_first_pass!(A::CSRMatrix{Tv, Ti}, is_strong::AbstractVector{Bool};
     else
         cf = zeros(Int, n)
     end
-    # Mark isolated nodes (no strong connections at all)
+    # Mark isolated nodes (no strong connections at all) — matching hypre's
+    # behavior where they get Z_PT (→ F_PT in PMIS init) or F_PT directly.
+    # They must NOT become C-points.
     @inbounds for i in 1:n
         has_strong = false
         for nz in nzrange(A, i)
@@ -575,7 +578,7 @@ function _rs_first_pass!(A::CSRMatrix{Tv, Ti}, is_strong::AbstractVector{Bool};
             end
         end
         if !has_strong && λ[i] == 0
-            cf[i] = 1  # isolated → coarse
+            cf[i] = f_pnt  # isolated → Z_PT (HMIS) or F_PT (RS), NOT C
         end
     end
 

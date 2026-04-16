@@ -24,7 +24,7 @@ This package is not registered in the General registry yet, so you need to insta
 
 ```julia
 using Pkg
-Pkg.add(url="https://github.com/moyner/Draugr.jl")
+Pkg.add(url="https://github.com/SINTEF-agentlab/Draugr.jl")
 ```
 
 A potential future registration in the Julia registry is pending a validation performed by humans.

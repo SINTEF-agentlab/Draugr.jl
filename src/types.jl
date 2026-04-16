@@ -429,7 +429,7 @@ original values. Only the modified diagonal needs to be stored — the off-diago
 entries come directly from the matrix.
 
 The factorization computes a modified diagonal:
-  d_i = a_{ii} - Σ_{j<i, a_{ij}≠0} a_{ij} * d_j⁻¹ * a_{ji}
+  d_i = a_{ii} - Σ_{j<i, (i,j) ∈ sparsity} a_{ij} * d_j⁻¹ * a_{ji}
 
 This is much cheaper and uses less memory than full ILU(0) since only a diagonal
 vector is stored instead of full L and U arrays.

@@ -513,14 +513,23 @@ end
 @testset "DILU diagonal correctness" begin
     # For a tridiagonal matrix A = [-1 2 -1], the DILU modified diagonal
     # should differ from the original since lower neighbors contribute.
+    # d_i = a_{ii} - Σ_{j<i} a_{ij} * d_j^{-1} * a_{ji}
     A = poisson1d_csr(5)
     Ac = to_csr(A)
     smoother = Draugr.build_dilu_smoother(Ac)
     inv_diag = Array(smoother.inv_diag)
-    # First row has no lower neighbors, so d_1 = a_{11} = 2.0
+    # Row 1: no lower neighbors, d_1 = 2.0
     @test inv_diag[1] ≈ 1.0 / 2.0
-    # Second row: d_2 = 2.0 - (-1)*d_1^{-1}*(-1) = 2.0 - 1/2 = 1.5
+    # Row 2: d_2 = 2.0 - (-1)*(1/2)*(-1) = 2.0 - 0.5 = 1.5
     @test inv_diag[2] ≈ 1.0 / 1.5
+    # Row 3: d_3 = 2.0 - (-1)*(1/1.5)*(-1) = 2.0 - 2/3 ≈ 1.333...
+    @test inv_diag[3] ≈ 1.0 / (2.0 - 1.0/1.5)
+    # Row 4: d_4 = 2.0 - (-1)*inv_diag[3]*(-1) = 2.0 - 1/d_3
+    d3 = 2.0 - 1.0/1.5
+    @test inv_diag[4] ≈ 1.0 / (2.0 - 1.0/d3)
+    # Row 5 (last, boundary): only one lower neighbor
+    d4 = 2.0 - 1.0/d3
+    @test inv_diag[5] ≈ 1.0 / (2.0 - 1.0/d4)
 end
 
 # ══════════════════════════════════════════════════════════════════════════

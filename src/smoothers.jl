@@ -1929,6 +1929,8 @@ function _dilu_factorize!(inv_diag::Vector{Tv}, diag_idx::Vector{Ti},
     @inbounds for i in 1:n
         d_i = nzv[diag_idx[i]]  # start with a_{ii}
         # Subtract contributions from lower triangle: a_{ij} * d_j^{-1} * a_{ji}
+        # Safe to read inv_diag[j] here because j < i and the forward loop
+        # processes rows in increasing order, so inv_diag[j] is already computed.
         for nz in rp[i]:(diag_idx[i]-ti_one)
             j = cv[nz]  # j < i
             a_ij = nzv[nz]

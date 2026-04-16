@@ -70,6 +70,41 @@ function anisotropic_csr(nx, ny; kx=1e4, ky=1e-2)
     return static_sparsity_sparse(I, J, V, n, n)
 end
 
+"""
+    reservoir_spe10_like(nx, ny, nz; perm_range=1e6, seed=42)
+
+Build a 3D 7-point stencil matrix with log-normally distributed permeability,
+mimicking the SPE10 benchmark. The `perm_range` controls the range of
+permeability values (ratio of max to min). Larger values (e.g., 1e8) produce
+more challenging matrices with near-singular rows that trigger max_row_sum
+weakening.
+"""
+function reservoir_spe10_like(nx, ny, nz; perm_range=1e6, seed=42)
+    Random.seed!(seed)
+    n = nx * ny * nz
+    logK = randn(nx, ny, nz) .* (log10(perm_range)/2)
+    K = 10 .^ logK
+    I = Int[]; J = Int[]; V = Float64[]
+    for iz in 1:nz, iy in 1:ny, ix in 1:nx
+        idx = (iz-1)*nx*ny + (iy-1)*nx + ix
+        diag = 0.0
+        # 6 neighbors: ±x, ±y, ±z.  z-direction uses 0.01 scale to model
+        # typical reservoir anisotropy (horizontal permeability ≫ vertical).
+        for (dx,dy,dz,scale) in [(-1,0,0,1.0),(1,0,0,1.0),(0,-1,0,1.0),(0,1,0,1.0),(0,0,-1,0.01),(0,0,1,0.01)]
+            jx,jy,jz = ix+dx,iy+dy,iz+dz
+            (jx < 1 || jx > nx || jy < 1 || jy > ny || jz < 1 || jz > nz) && continue
+            j = (jz-1)*nx*ny + (jy-1)*nx + jx
+            T = scale * 2.0 / (1.0/K[ix,iy,iz] + 1.0/K[jx,jy,jz])
+            push!(I, idx); push!(J, j); push!(V, -T)
+            diag += T
+        end
+        c_i = K[ix, iy, iz] * 1e-6
+        diag += c_i
+        push!(I, idx); push!(J, idx); push!(V, diag)
+    end
+    return static_sparsity_sparse(I, J, V, n, n)
+end
+
 # Helper: read a Matrix Market (.mtx) file and return a SparseMatrixCSC
 function read_mtx(path)
     open(path) do f

@@ -343,16 +343,21 @@ function coarsen_pmis(A_in::CSRMatrix{Tv, Ti}, θ::Real;
         cf = zeros(Int, n)
     end
     @inbounds for i in 1:n
-        has_strong = false
+        # Matching hypre: nodes with nnzrow(S)==0 (no strong OUT-connections)
+        # become SF_PT and are excluded from the coarsening graph. They get
+        # empty P rows in interpolation. Note: in hypre this only checks the
+        # row of S (OUT-connections), NOT column sums (IN-connections).
+        has_strong_out = false
         for nz in nzrange(A, i)
             j = cv[nz]
             if j != i && is_strong[nz]
-                has_strong = true
+                has_strong_out = true
                 break
             end
         end
-        if !has_strong && st_count[i] == 0
-            cf[i] = 1  # isolated → coarse
+        if !has_strong_out
+            cf[i] = -1  # SF_PT equivalent → F with empty P row
+            measure[i] = 0.0
         end
     end
     # CF splitting: iterative PMIS (matching hypre's CLJP/PMIS algorithm)
@@ -415,9 +420,8 @@ function coarsen_pmis(A_in::CSRMatrix{Tv, Ti}, θ::Real;
             cf[i] = -1
         end
     end
-    # Ensure every F-point has at least one strong C-neighbor for valid interpolation
-    _ensure_fine_have_coarse_neighbor!(cf, A, is_strong)
-    # Build coarse map
+    # Build coarse map (F-points without strong C-neighbors get empty P rows,
+    # matching hypre's treatment of isolated/weakened points)
     n_coarse = 0
     if setup_workspace !== nothing
         coarse_map = _ws_resize!(setup_workspace.coarse_map, n)
@@ -432,36 +436,6 @@ function coarsen_pmis(A_in::CSRMatrix{Tv, Ti}, θ::Real;
         end
     end
     return cf, coarse_map, n_coarse
-end
-
-"""
-    _ensure_fine_have_coarse_neighbor!(cf, A, is_strong)
-
-Second pass: any F-point that has no strong C-neighbor is promoted to C.
-This guarantees the strong-connection property needed for interpolation.
-"""
-function _ensure_fine_have_coarse_neighbor!(cf::Vector{Int}, A::CSRMatrix, is_strong::AbstractVector{Bool})
-    n = size(A, 1)
-    cv = colvals(A)
-    changed = true
-    while changed
-        changed = false
-        @inbounds for i in 1:n
-            cf[i] != -1 && continue
-            has_strong_C = false
-            for nz in nzrange(A, i)
-                j = cv[nz]
-                if j != i && is_strong[nz] && cf[j] == 1
-                    has_strong_C = true
-                    break
-                end
-            end
-            if !has_strong_C
-                cf[i] = 1  # promote to coarse
-                changed = true
-            end
-        end
-    end
 end
 
 # ── HMIS coarsening ──────────────────────────────────────────────────────────
@@ -549,9 +523,6 @@ function coarsen_hmis(A_in::CSRMatrix{Tv, Ti}, θ::Real;
     # new C-points via the independent set algorithm.
     _pmis_on_undecided!(cf, A, is_strong, pmis_measure; skip_first_is=true)
 
-    # Ensure every F-point has at least one strong C-neighbor for valid interpolation
-    _ensure_fine_have_coarse_neighbor!(cf, A, is_strong)
-
     n_coarse = 0
     if setup_workspace !== nothing
         coarse_map = _ws_resize!(setup_workspace.coarse_map, n)
@@ -594,7 +565,9 @@ function _rs_first_pass!(A::CSRMatrix{Tv, Ti}, is_strong::AbstractVector{Bool};
     else
         cf = zeros(Int, n)
     end
-    # Mark isolated nodes (no strong connections at all)
+    # Mark isolated nodes (no strong connections at all) — matching hypre's
+    # behavior where they get Z_PT (→ F_PT in PMIS init) or F_PT directly.
+    # They must NOT become C-points.
     @inbounds for i in 1:n
         has_strong = false
         for nz in nzrange(A, i)
@@ -605,7 +578,7 @@ function _rs_first_pass!(A::CSRMatrix{Tv, Ti}, is_strong::AbstractVector{Bool};
             end
         end
         if !has_strong && λ[i] == 0
-            cf[i] = 1  # isolated → coarse
+            cf[i] = f_pnt  # isolated → Z_PT (HMIS) or F_PT (RS), NOT C
         end
     end
 
@@ -1018,8 +991,6 @@ function coarsen_rs(A_in::CSRMatrix{Tv, Ti}, θ::Real;
             end
         end
     end
-    # Second pass: ensure every F-point has at least one strong C-neighbor
-    _ensure_fine_have_coarse_neighbor!(cf, A, is_strong)
     # Build coarse map
     n_coarse = 0
     if setup_workspace !== nothing
@@ -1342,9 +1313,6 @@ function coarsen_aggressive_cf(A_in::CSRMatrix{Tv, Ti}, θ::Real, base::Symbol;
             cf_final[c_indices[ci]] = -1  # demote to fine
         end
     end
-
-    # Ensure every F-point has at least one strong C-neighbor
-    _ensure_fine_have_coarse_neighbor!(cf_final, A_eff, is_strong)
 
     # Build coarse map
     n_coarse = 0

@@ -1148,3 +1148,36 @@ end
     @test stats_h.solved
     @test stats_d.solved
 end
+
+# ── Reservoir-like 3D heterogeneous test (SPE10-like coarsening stagnation) ───
+# This test verifies that HMIS + Ext+I with max_row_sum=0.9 does not stagnate
+# at deep hierarchy levels. The 3D heterogeneous permeability field creates
+# matrices where many rows are weakened by max_row_sum, which previously caused
+# isolated F-points to be promoted to C-points, preventing coarsening.
+@testset "HMIS+ExtI coarsening does not stagnate on 3D reservoir-like matrix" begin
+    # 20×20×5 = 2000 DOFs — small enough for fast test, large enough to
+    # produce a non-trivial hierarchy with max_row_sum weakening
+    A = reservoir_spe10_like(20, 20, 5; perm_range=1e8, seed=42)
+    coarsen = HMISCoarsening(0.25, ExtendedIInterpolation(0.0, 4, 2, true))
+    config = AMGConfig(
+        coarsening = coarsen,
+        smoother = L1SerialGaussSeidelType(),
+        verbose = false,
+        max_row_sum = 0.9,
+        strength_type = SignedStrength()
+    )
+    hierarchy = amg_setup(A, config)
+    nlevels = length(hierarchy.levels) + 1  # +1 for coarsest
+    # Hierarchy should not stagnate: each level should reduce the grid size
+    # by at least a factor of 0.95 (very generous — typical ratios are 0.3-0.5)
+    for lvl in 1:length(hierarchy.levels)
+        P = hierarchy.levels[lvl].P
+        @test P.ncol / P.nrow < 0.95
+    end
+    # Should solve in a reasonable number of iterations
+    N = size(A, 1)
+    b = ones(N)
+    x = zeros(N)
+    x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+    @test niter < 200
+end

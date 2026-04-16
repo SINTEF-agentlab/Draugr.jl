@@ -471,6 +471,87 @@ end
 end
 
 # ══════════════════════════════════════════════════════════════════════════
+# Pre-computed residual passing tests
+# ══════════════════════════════════════════════════════════════════════════
+
+@testset "Pre-computed residual - smooth! produces identical results" begin
+    A = poisson2d_csr(8, 8)
+    Ac = to_csr(A)
+    A_sparse = sparse(A.At')
+    b = rand(MersenneTwister(42), 64)
+    x0 = rand(MersenneTwister(43), 64)
+
+    # Smoother types that benefit from pre-computed residual (compute residual internally)
+    residual_types = [
+        JacobiSmootherType(), L1JacobiSmootherType(),
+        SPAI0SmootherType(), SPAI1SmootherType(),
+        ChebyshevSmootherType(), SerialILU0SmootherType(), ILU0SmootherType(),
+    ]
+
+    for stype in residual_types
+        smoother = build_smoother(A, stype)
+
+        # Test with steps=1: residual-based should match normal
+        x_normal = copy(x0)
+        smooth!(x_normal, Ac, b, smoother; steps=1)
+
+        r = b - A_sparse * x0
+        x_resid = copy(x0)
+        smooth!(x_resid, Ac, b, smoother; steps=1, residual=r)
+
+        @test x_normal ≈ x_resid atol=1e-12
+
+        # Test with steps=2: only first iteration uses residual
+        x_normal2 = copy(x0)
+        smooth!(x_normal2, Ac, b, smoother; steps=2)
+
+        x_resid2 = copy(x0)
+        smooth!(x_resid2, Ac, b, smoother; steps=2, residual=r)
+
+        @test x_normal2 ≈ x_resid2 atol=1e-12
+    end
+
+    # GS smoothers: residual kwarg is accepted but ignored (verify no error)
+    gs_types = [
+        ColoredGaussSeidelType(), L1ColoredGaussSeidelType(),
+        SerialGaussSeidelType(), L1SerialGaussSeidelType(),
+    ]
+    for stype in gs_types
+        smoother = build_smoother(A, stype)
+        r = b - A_sparse * x0
+
+        x_normal = copy(x0)
+        smooth!(x_normal, Ac, b, smoother; steps=1)
+
+        x_resid = copy(x0)
+        smooth!(x_resid, Ac, b, smoother; steps=1, residual=r)
+
+        @test x_normal ≈ x_resid atol=1e-12
+    end
+end
+
+@testset "Pre-computed residual - AMG cycle with x=0 residual=b" begin
+    A = poisson2d_csr(16, 16)
+    b = ones(256)
+
+    for stype in [JacobiSmootherType(), SPAI0SmootherType(), L1JacobiSmootherType(),
+                  ChebyshevSmootherType(), L1ColoredGaussSeidelType()]
+        config = AMGConfig(smoother=stype)
+        hierarchy = amg_setup(A, config)
+
+        # Without residual
+        x1 = zeros(256)
+        amg_cycle!(x1, b, hierarchy, config)
+
+        # With residual=b (since x=0, residual = b - A*0 = b)
+        x2 = zeros(256)
+        amg_cycle!(x2, b, hierarchy, config; residual=b)
+
+        @test x1 ≈ x2 atol=1e-12
+    end
+end
+
+# ══════════════════════════════════════════════════════════════════════════
 # Block smoother tests (SMatrix entries, SVector rhs)
 # ══════════════════════════════════════════════════════════════════════════
 

@@ -31,10 +31,7 @@ function solve_hypre(A, b, ; kwarg...)
     return (x, Dict(:t_setup => t_setup_hypre, :t_solve => t_solve_hypre, :nits => stats.niter))
 end
 
-N = 1000
-A = poisson2d_csr(N, N)
-b = rand(N*N)
-@testset "HMIS + Ext+i" begin
+function test_hmis(A, b)
     # Example on running hypre as bench
     x_h, stats_h = solve_hypre(A, b, AggTruncFactor = 0.0, StrongThreshold=0.25)
     # Matching HYPRE defaults: StrongThreshold=0.25, max_elmts=4, no trunc_factor, max_row_sum=0.9
@@ -51,8 +48,8 @@ b = rand(N*N)
 
     @test stats[:nits] <= 1.1 * stats_h[:nits]
 end
-##
-@testset "classical" begin
+
+function test_classical(A, b)
     # Example on running hypre as bench
     x_h, stats_h = solve_hypre(A, b, CoarsenType = 1, InterpType = 0, StrongThreshold=0.25)
     coarsen = RSCoarsening(0.25)
@@ -68,4 +65,31 @@ end
 
     @test stats[:nits] <= 1.1 * stats_h[:nits]
 end
+
+@testset "poisson_2d 1000x1000" begin
+    N = 1000
+    A = poisson2d_csr(N, N)
+    b = rand(N*N)
+
+    @testset "HMIS + Ext+i" begin
+        test_hmis(A, b)
+    end
+    @testset "classical RS" begin
+        test_classical(A, b)
+    end
+end
+
+@testset "anisotropic_csr 1000x1000" begin
+    N = 1000
+    A = anisotropic_csr(N, N)
+    b = rand(N*N)
+
+    @testset "HMIS + Ext+i" begin
+        test_hmis(A, b)
+    end
+    @testset "classical RS" begin
+        test_classical(A, b)
+    end
+end
+
 

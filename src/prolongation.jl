@@ -1752,9 +1752,12 @@ function _apply_trunc_scaling!(P::ProlongationOp;
     ts = P.trunc_scaling
     ts === nothing && return P
     nzv = P.nzval
-    kernel! = _trunc_scaling_kernel!(backend, block_size)
+    # Derive backend from the actual data arrays to avoid passing CPU arrays
+    # to a GPU kernel (e.g. during initial setup when P is still on CPU).
+    be = _get_backend(nzv)
+    kernel! = _trunc_scaling_kernel!(be, block_size)
     kernel!(nzv, ts; ndrange=length(nzv))
-    _synchronize(backend)
+    _synchronize(be)
     return P
 end
 

@@ -414,6 +414,7 @@ mutable struct GPUILU0Smoother{Tv, Ti, Tx,
     level_offsets::Vector{Int}# [fwd_offsets..., bwd_offsets...] concatenated (CPU)
     num_fwd_levels::Int       # number of forward levels
     tmp::Vx                   # workspace on device
+    row_norms::Vnz            # precomputed row norms on device (for safeguarding during factorization)
 end
 
 """
@@ -442,6 +443,7 @@ mutable struct DILUSmoother{Tv, Ti, Tx,
     level_offsets::Vector{Int}# [fwd_offsets..., bwd_offsets...] concatenated (CPU)
     num_fwd_levels::Int       # number of forward levels
     tmp::Vx                   # workspace on device
+    lower_transpose_nz::Vi    # for each lower-triangle nz (i,j), the nz-index of (j,i)
 end
 
 # ── Prolongation info (stored implicitly) ─────────────────────────────────────

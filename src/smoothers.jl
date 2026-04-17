@@ -1834,6 +1834,10 @@ function build_gpu_ilu0_smoother(A::CSRMatrix{Tv, Ti};
 
     combined_offsets = vcat(fwd_offsets, bwd_offsets)
 
+    # Allocate row_norms on device (will be recomputed in update_smoother!)
+    Ts = _scalar_real_type(Tv)
+    row_norms_cpu = Vector{Ts}(undef, n)
+
     # Transfer to device
     L_nzval_dev = _to_device(A, L_nzval_cpu)
     U_nzval_dev = _to_device(A, U_nzval_cpu)
@@ -1841,25 +1845,141 @@ function build_gpu_ilu0_smoother(A::CSRMatrix{Tv, Ti};
     fwd_order_dev = _to_device(A, fwd_order_cpu)
     bwd_order_dev = _to_device(A, bwd_order_cpu)
     tmp = _allocate_vector(A, Tx, n)
+    row_norms_dev = _allocate_vector(A, Ts, n)
 
     return GPUILU0Smoother(L_nzval_dev, U_nzval_dev, diag_idx_dev,
                            fwd_order_dev, bwd_order_dev,
-                           combined_offsets, num_fwd_levels, tmp)
+                           combined_offsets, num_fwd_levels, tmp, row_norms_dev)
 end
 
 function update_smoother!(smoother::GPUILU0Smoother{Tv, Ti}, A::CSRMatrix;
                           backend=_get_backend(nonzeros(A)), block_size::Int=64) where {Tv, Ti}
-    A_cpu = csr_to_cpu(A)
-    diag_idx_cpu = Vector{Ti}(smoother.diag_idx)
-    L_nzval_cpu = zeros(Tv, nnz(A_cpu))
-    U_nzval_cpu = copy(nonzeros(A_cpu))
-    _ilu0_factorize!(L_nzval_cpu, U_nzval_cpu, diag_idx_cpu, A_cpu)
-    copyto!(smoother.L_nzval, L_nzval_cpu)
-    copyto!(smoother.U_nzval, U_nzval_cpu)
+    n = size(A, 1)
+    nnz_A = nnz(A)
+    nzv = nonzeros(A)
+    cv = colvals(A)
+    rp = rowptr(A)
+    combined_offsets = smoother.level_offsets
+    num_fwd_levels = smoother.num_fwd_levels
+    Ts = _scalar_real_type(Tv)
+
+    # Step 1: Initialize U = A.nzval, L = 0, and compute row norms
+    init_kernel! = _gpu_ilu0_init_kernel!(backend, block_size)
+    init_kernel!(smoother.L_nzval, smoother.U_nzval, nzv; ndrange=nnz_A)
+    _synchronize(backend)
+
+    rownorm_kernel! = _gpu_ilu0_rownorm_kernel!(backend, block_size)
+    rownorm_kernel!(smoother.row_norms, nzv, rp, Ts(0); ndrange=n)
+    _synchronize(backend)
+
+    # Step 2: Level-scheduled ILU(0) factorization on device
+    fac_kernel! = _gpu_ilu0_factorize_kernel!(backend, block_size)
+    for lev in 1:num_fwd_levels
+        lev_start = combined_offsets[lev]
+        count = combined_offsets[lev+1] - lev_start
+        count == 0 && continue
+        fac_kernel!(smoother.L_nzval, smoother.U_nzval, nzv, cv, rp,
+                    smoother.diag_idx, smoother.fwd_order, smoother.row_norms,
+                    lev_start - 1, Ts(0); ndrange=count)
+        _synchronize(backend)
+    end
+
+    # Step 3: Diagonal safeguard
+    safeguard_kernel! = _gpu_ilu0_diag_safeguard_kernel!(backend, block_size)
+    safeguard_kernel!(smoother.U_nzval, smoother.diag_idx, smoother.row_norms, Ts(0); ndrange=n)
+    _synchronize(backend)
     return smoother
 end
 
 # ── GPU ILU(0) Kernels ───────────────────────────────────────────────────────
+
+# Factorization kernels (used by update_smoother!)
+
+@kernel function _gpu_ilu0_init_kernel!(L_nzval, U_nzval, @Const(nzval))
+    nz = @index(Global)
+    @inbounds begin
+        U_nzval[nz] = nzval[nz]
+        L_nzval[nz] = zero(eltype(L_nzval))
+    end
+end
+
+@kernel function _gpu_ilu0_rownorm_kernel!(row_norms, @Const(nzval), @Const(rp), ::Ts) where Ts
+    i = @index(Global)
+    @inbounds begin
+        s = zero(Ts)
+        for nz in rp[i]:(rp[i+1]-1)
+            s += abs(nzval[nz])
+        end
+        row_norms[i] = s
+    end
+end
+
+@kernel function _gpu_ilu0_factorize_kernel!(L_nzval, U_nzval, @Const(nzval),
+                                             @Const(colval), @Const(rp),
+                                             @Const(diag_idx), @Const(fwd_order),
+                                             @Const(row_norms), offset, ::Ts) where Ts
+    idx = @index(Global)
+    @inbounds begin
+        i = fwd_order[offset + idx]
+        max_factor = Ts(1e8)
+        # Process lower triangle entries of row i
+        for nz in rp[i]:(diag_idx[i]-1)
+            k = colval[nz]
+            # L[i,k] = U[i,k] / U[k,k]
+            u_kk = U_nzval[diag_idx[k]]
+            safe_thresh_k = eps(Ts) * max(one(Ts), row_norms[k])
+            if abs(u_kk) < safe_thresh_k
+                L_nzval[nz] = zero(eltype(L_nzval))
+                U_nzval[nz] = zero(eltype(U_nzval))
+            else
+                l_ik = U_nzval[nz] / u_kk
+                # Clamp to prevent growth
+                if abs(l_ik) > max_factor
+                    l_ik = l_ik * (max_factor / abs(l_ik))
+                end
+                L_nzval[nz] = l_ik
+                U_nzval[nz] = zero(eltype(U_nzval))  # Clear lower triangle in U
+                # Update row i: for each j in row k with j > k, if (i,j) exists
+                for nz_k in (diag_idx[k]+1):(rp[k+1]-1)
+                    j = colval[nz_k]
+                    # Binary search for (i,j) in row i
+                    lo = diag_idx[i]
+                    hi = rp[i+1] - 1
+                    nz_ij = zero(eltype(diag_idx))
+                    while lo <= hi
+                        mid = (lo + hi) >> 1
+                        c = colval[mid]
+                        if c == j
+                            nz_ij = mid
+                            break
+                        elseif c < j
+                            lo = mid + one(eltype(diag_idx))
+                        else
+                            hi = mid - one(eltype(diag_idx))
+                        end
+                    end
+                    if nz_ij > 0
+                        U_nzval[nz_ij] -= l_ik * U_nzval[nz_k]
+                    end
+                end
+            end
+        end
+    end
+end
+
+@kernel function _gpu_ilu0_diag_safeguard_kernel!(U_nzval, @Const(diag_idx),
+                                                   @Const(row_norms), ::Ts) where Ts
+    i = @index(Global)
+    @inbounds begin
+        u_ii = U_nzval[diag_idx[i]]
+        safe_thresh = eps(Ts) * max(one(Ts), row_norms[i])
+        if abs(u_ii) < safe_thresh
+            U_nzval[diag_idx[i]] = safe_thresh * one(eltype(U_nzval))
+        end
+    end
+end
+
+# Smooth! kernels
 
 @kernel function _gpu_ilu0_residual_kernel!(tmp, @Const(b), @Const(x),
                                             @Const(nzval), @Const(colval), @Const(rp))
@@ -2021,6 +2141,31 @@ function _dilu_factorize!(inv_diag::Vector{Tv}, diag_idx::Vector{Ti},
 end
 
 """
+    _build_lower_transpose_map(A_cpu, diag_idx) -> Vector{Ti}
+
+For each nonzero (i,j) in the strict lower triangle of A (j < i), compute
+the nz-index of (j,i) in A. Returns a vector indexed by nz-position; entries
+corresponding to diagonal or upper-triangle positions are set to zero.
+"""
+function _build_lower_transpose_map(A_cpu::CSRMatrix{Tv, Ti}, diag_idx::Vector{Ti}) where {Tv, Ti}
+    cv = colvals(A_cpu)
+    rp = rowptr(A_cpu)
+    n = size(A_cpu, 1)
+    ti_one = one(Ti)
+    total_nz = nnz(A_cpu)
+    lt_map = zeros(Ti, total_nz)
+    @inbounds for i in 1:n
+        for nz in rp[i]:(diag_idx[i]-ti_one)
+            j = cv[nz]
+            # Find (j,i) in row j
+            nz_ji = _find_nz_in_row(cv, rp[j], rp[j+ti_one]-ti_one, Ti(i))
+            lt_map[nz] = nz_ji  # 0 if not found
+        end
+    end
+    return lt_map
+end
+
+"""
     build_dilu_smoother(A; x_eltype=Tv)
 
 Build a GPU-native DILU smoother. The diagonal factorization and level
@@ -2034,7 +2179,7 @@ function build_dilu_smoother(A::CSRMatrix{Tv, Ti};
 
     diag_idx_cpu = _ilu0_diag_indices(A_cpu)
 
-    # DILU factorization on CPU
+    # DILU factorization on CPU (initial setup)
     inv_diag_cpu = Vector{Tv}(undef, n)
     _dilu_factorize!(inv_diag_cpu, diag_idx_cpu, A_cpu)
 
@@ -2044,29 +2189,74 @@ function build_dilu_smoother(A::CSRMatrix{Tv, Ti};
 
     combined_offsets = vcat(fwd_offsets, bwd_offsets)
 
+    # Precompute lower-triangle transpose map on CPU
+    lt_map_cpu = _build_lower_transpose_map(A_cpu, diag_idx_cpu)
+
     # Transfer to device
     inv_diag_dev = _to_device(A, inv_diag_cpu)
     diag_idx_dev = _to_device(A, diag_idx_cpu)
     fwd_order_dev = _to_device(A, fwd_order_cpu)
     bwd_order_dev = _to_device(A, bwd_order_cpu)
+    lt_map_dev = _to_device(A, lt_map_cpu)
     tmp = _allocate_vector(A, Tx, n)
 
     return DILUSmoother(inv_diag_dev, diag_idx_dev,
                         fwd_order_dev, bwd_order_dev,
-                        combined_offsets, num_fwd_levels, tmp)
+                        combined_offsets, num_fwd_levels, tmp, lt_map_dev)
 end
 
 function update_smoother!(smoother::DILUSmoother{Tv, Ti}, A::CSRMatrix;
                           backend=_get_backend(nonzeros(A)), block_size::Int=64) where {Tv, Ti}
-    A_cpu = csr_to_cpu(A)
-    diag_idx_cpu = Vector{Ti}(smoother.diag_idx)
-    inv_diag_cpu = Vector{Tv}(undef, size(A_cpu, 1))
-    _dilu_factorize!(inv_diag_cpu, diag_idx_cpu, A_cpu)
-    copyto!(smoother.inv_diag, inv_diag_cpu)
+    n = size(A, 1)
+    nzv = nonzeros(A)
+    cv = colvals(A)
+    rp = rowptr(A)
+    combined_offsets = smoother.level_offsets
+    num_fwd_levels = smoother.num_fwd_levels
+    Ts = _scalar_real_type(Tv)
+
+    kernel! = _dilu_factorize_fwd_kernel!(backend, block_size)
+    for lev in 1:num_fwd_levels
+        lev_start = combined_offsets[lev]
+        count = combined_offsets[lev+1] - lev_start
+        count == 0 && continue
+        kernel!(smoother.inv_diag, nzv, cv, rp, smoother.diag_idx,
+                smoother.fwd_order, smoother.lower_transpose_nz,
+                lev_start - 1, Ts(0); ndrange=count)
+        _synchronize(backend)
+    end
     return smoother
 end
 
 # ── DILU Kernels ─────────────────────────────────────────────────────────────
+
+@kernel function _dilu_factorize_fwd_kernel!(inv_diag, @Const(nzval), @Const(colval),
+                                             @Const(rp), @Const(diag_idx),
+                                             @Const(fwd_order), @Const(lt_map),
+                                             offset, ::Ts) where Ts
+    idx = @index(Global)
+    @inbounds begin
+        i = fwd_order[offset + idx]
+        d_i = nzval[diag_idx[i]]  # a_{ii}
+        # Subtract contributions from lower triangle neighbors
+        for nz in rp[i]:(diag_idx[i]-1)
+            nz_ji = lt_map[nz]
+            if nz_ji > 0
+                a_ij = nzval[nz]
+                a_ji = nzval[nz_ji]
+                j = colval[nz]
+                d_i -= a_ij * inv_diag[j] * a_ji
+            end
+        end
+        # Safeguard against zero/tiny diagonal
+        orig_diag_norm = abs(nzval[diag_idx[i]])
+        safe_thresh = eps(Ts) * max(one(Ts), convert(Ts, orig_diag_norm))
+        if abs(d_i) < safe_thresh
+            d_i = safe_thresh * one(eltype(nzval))
+        end
+        inv_diag[i] = one(eltype(nzval)) / d_i
+    end
+end
 
 @kernel function _dilu_residual_kernel!(tmp, @Const(b), @Const(x),
                                         @Const(nzval), @Const(colval), @Const(rp))

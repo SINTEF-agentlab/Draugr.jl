@@ -1837,11 +1837,8 @@ function build_gpu_ilu0_smoother(A::CSRMatrix{Tv, Ti};
 
     combined_offsets = vcat(fwd_offsets, bwd_offsets)
 
-    # Allocate row_norms on device (will be recomputed in update_smoother!)
-    Ts = _scalar_real_type(Tv)
-    row_norms_cpu = Vector{Ts}(undef, n)
-
     # Transfer to device
+    Ts = _scalar_real_type(Tv)
     L_nzval_dev = _to_device(A, L_nzval_cpu)
     U_nzval_dev = _to_device(A, U_nzval_cpu)
     diag_idx_dev = _to_device(A, diag_idx_cpu)

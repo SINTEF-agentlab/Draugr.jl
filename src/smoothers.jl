@@ -2009,7 +2009,9 @@ function _dilu_factorize!(inv_diag::Vector{Tv}, diag_idx::Vector{Ti},
             end
         end
         # Safeguard against zero/tiny diagonal
-        safe_thresh = _safe_threshold(Tv, _entry_norm(nzv[diag_idx[i]]))
+        # Use the original diagonal entry as scale reference (before modification)
+        orig_diag_norm = _entry_norm(nzv[diag_idx[i]])
+        safe_thresh = _safe_threshold(Tv, orig_diag_norm)
         if _entry_norm(d_i) < safe_thresh
             d_i = safe_thresh * one(Tv)
         end

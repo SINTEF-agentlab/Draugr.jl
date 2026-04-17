@@ -85,9 +85,10 @@ end
 
 function Draugr.smooth!(x::AbstractVector, A::SparseMatrixCSR, b::AbstractVector,
                              smoother::Draugr.AbstractSmoother; steps::Int=1,
-                             backend=Draugr.DEFAULT_BACKEND, block_size::Int=64)
+                             backend=Draugr.DEFAULT_BACKEND, block_size::Int=64,
+                             residual::Union{Nothing, AbstractVector}=nothing)
     A_csr = csr_from_sparse_csr(A)
-    return Draugr.smooth!(x, A_csr, b, smoother; steps=steps, backend=backend, block_size=block_size)
+    return Draugr.smooth!(x, A_csr, b, smoother; steps=steps, backend=backend, block_size=block_size, residual=residual)
 end
 
 end # module

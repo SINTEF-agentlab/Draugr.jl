@@ -75,7 +75,8 @@ Apply the AMG preconditioner: solve approximately `A*x = y` using one V-cycle.
 """
 function preconditioner_apply!(x, prec::AbstractDraugrPreconditioner, y)
     fill!(x, zero(eltype(x)))
-    amg_cycle!(x, y, prec.hierarchy, prec.config)
+    # With x=0, the residual is exactly y; pass it to skip the initial SpMV.
+    amg_cycle!(x, y, prec.hierarchy, prec.config; residual=y)
     return x
 end
 

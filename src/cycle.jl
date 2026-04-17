@@ -1,5 +1,5 @@
 """
-    amg_cycle!(x, b, hierarchy, config)
+    amg_cycle!(x, b, hierarchy, config; residual=nothing)
 
 Apply one V-cycle of AMG to improve the solution `x` for the system `Ax = b`.
 
@@ -7,11 +7,15 @@ The V-cycle descends through all levels with pre-smoothing, restriction, and
 then ascends with prolongation and post-smoothing. At the coarsest level a
 direct solver is used.
 
+When `residual` is provided, it should contain `b - A*x` for the current `x`.
+The pre-smoother on the finest level will use it to skip its initial SpMV.
+
 The backend and block_size are taken from the hierarchy (set during `amg_setup`).
 """
 function amg_cycle!(x::AbstractVector{Tv}, b::AbstractVector{Tv},
                     hierarchy::AMGHierarchy{Tv, Ti},
-                    config::AMGConfig=AMGConfig()) where {Tv, Ti}
+                    config::AMGConfig=AMGConfig();
+                    residual::Union{Nothing, AbstractVector}=nothing) where {Tv, Ti}
     backend = hierarchy.backend
     block_size = hierarchy.block_size
     nlevels = length(hierarchy.levels)
@@ -23,7 +27,7 @@ function amg_cycle!(x::AbstractVector{Tv}, b::AbstractVector{Tv},
         return x
     end
     # V-cycle: descend
-    _vcycle_descend!(x, b, hierarchy, config, 1; backend=backend, block_size=block_size)
+    _vcycle_descend!(x, b, hierarchy, config, 1; backend=backend, block_size=block_size, residual=residual)
     return x
 end
 
@@ -63,7 +67,8 @@ end
 function _vcycle_descend!(x::AbstractVector{Tv}, b::AbstractVector{Tv},
                           hierarchy::AMGHierarchy{Tv, Ti},
                           config::AMGConfig, lvl::Int;
-                          backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
+                          backend=DEFAULT_BACKEND, block_size::Int=64,
+                          residual::Union{Nothing, AbstractVector}=nothing) where {Tv, Ti}
     nlevels = length(hierarchy.levels)
     level = hierarchy.levels[lvl]
     A = level.A
@@ -71,8 +76,8 @@ function _vcycle_descend!(x::AbstractVector{Tv}, b::AbstractVector{Tv},
     r = level.r
     xc = level.xc
     bc = level.bc
-    # Pre-smoothing
-    smooth!(x, A, b, level.smoother; steps=config.pre_smoothing_steps, reverse=false, backend=backend, block_size=block_size)
+    # Pre-smoothing (pass pre-computed residual when available to skip redundant SpMV)
+    smooth!(x, A, b, level.smoother; steps=config.pre_smoothing_steps, reverse=false, backend=backend, block_size=block_size, residual=residual)
     # Compute residual: r = b - A*x (parallelized, no allocations)
     compute_residual!(r, A, x, b; backend=backend, block_size=block_size)
     # Restrict residual to coarse grid
@@ -82,8 +87,11 @@ function _vcycle_descend!(x::AbstractVector{Tv}, b::AbstractVector{Tv},
     if lvl < nlevels
         # Recurse (W-cycle: recurse twice, V-cycle: once)
         n_recurse = config.cycle_type == :W ? 2 : 1
-        for _ in 1:n_recurse
-            _vcycle_descend!(xc, bc, hierarchy, config, lvl + 1; backend=backend, block_size=block_size)
+        for recurse_idx in 1:n_recurse
+            # On the first recursion xc is zero, so the residual is exactly bc.
+            # Pass it to avoid the redundant SpMV inside the coarse pre-smoother.
+            coarse_residual = recurse_idx == 1 ? bc : nothing
+            _vcycle_descend!(xc, bc, hierarchy, config, lvl + 1; backend=backend, block_size=block_size, residual=coarse_residual)
         end
     else
         # Direct solve at coarsest level
@@ -132,8 +140,9 @@ function amg_solve!(x::AbstractVector{Tv}, b::AbstractVector{Tv},
     # Use pre-allocated residual buffer (no allocations!)
     r = hierarchy.solve_r
     rnorm = bnorm
+    residual_for_cycle = nothing
     for iter in 1:maxiter
-        amg_cycle!(x, b, hierarchy, config)
+        amg_cycle!(x, b, hierarchy, config; residual=residual_for_cycle)
         # Check convergence using parallelized residual computation
         compute_residual!(r, A, x, b; backend=backend, block_size=block_size)
         rnorm = norm(r)
@@ -150,6 +159,9 @@ function amg_solve!(x::AbstractVector{Tv}, b::AbstractVector{Tv},
             end
             return x, iter
         end
+        # Pass the convergence-check residual to the next cycle's pre-smoother
+        # to avoid recomputing b - A*x at the start of the next iteration.
+        residual_for_cycle = r
     end
     if config.verbose >= 1
         t_solve = time() - t_solve

@@ -111,15 +111,27 @@ end
     end
 end
 
+@kernel function jacobi_residual_kernel!(x_new, @Const(x), @Const(r),
+                                         @Const(invdiag), ω)
+    i = @index(Global)
+    @inbounds begin
+        x_new[i] = x[i] + ω * invdiag[i] * r[i]
+    end
+end
+
 """
-    smooth!(x, A, b, smoother::JacobiSmoother; steps=1)
+    smooth!(x, A, b, smoother::JacobiSmoother; steps=1, residual=nothing)
 
 Apply `steps` iterations of weighted Jacobi smoothing to solve `Ax = b`.
 Uses KernelAbstractions for parallel execution. Alternates read/write buffers
 to avoid an extra copy per step; only copies back on odd step counts.
+
+When `residual` is provided, the first iteration uses the pre-computed residual
+vector `r = b - A*x` instead of recomputing it, saving one SpMV.
 """
 function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
-                 smoother::JacobiSmoother; steps::Int=1, reverse::Bool=false, backend=DEFAULT_BACKEND, block_size::Int=64)
+                 smoother::JacobiSmoother; steps::Int=1, reverse::Bool=false, backend=DEFAULT_BACKEND, block_size::Int=64,
+                 residual::Union{Nothing, AbstractVector}=nothing)
     n = size(A, 1)
     nzv = nonzeros(A)
     cv = colvals(A)
@@ -128,8 +140,13 @@ function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
     src = x
     dst = tmp
     kernel! = jacobi_kernel!(backend, block_size)
-    for _ in 1:steps
-        kernel!(dst, src, b, nzv, cv, rp, smoother.invdiag, smoother.ω; ndrange=n)
+    for step in 1:steps
+        if step == 1 && residual !== nothing
+            rkernel! = jacobi_residual_kernel!(backend, block_size)
+            rkernel!(dst, src, residual, smoother.invdiag, smoother.ω; ndrange=n)
+        else
+            kernel!(dst, src, b, nzv, cv, rp, smoother.invdiag, smoother.ω; ndrange=n)
+        end
         _synchronize(backend)
         src, dst = dst, src
     end
@@ -235,12 +252,16 @@ end
 end
 
 """
-    smooth!(x, A, b, smoother::ColoredGaussSeidelSmoother; steps=1)
+    smooth!(x, A, b, smoother::ColoredGaussSeidelSmoother; steps=1, residual=nothing)
 
 Apply parallel colored Gauss-Seidel smoothing.
+
+The `residual` keyword is accepted for interface consistency but is not used,
+since Gauss-Seidel computes row-wise residuals with the latest x values.
 """
 function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
-                 smoother::ColoredGaussSeidelSmoother; steps::Int=1, reverse::Bool=false, backend=DEFAULT_BACKEND, block_size::Int=64)
+                 smoother::ColoredGaussSeidelSmoother; steps::Int=1, reverse::Bool=false, backend=DEFAULT_BACKEND, block_size::Int=64,
+                 residual::Union{Nothing, AbstractVector}=nothing)
     nzv = nonzeros(A)
     cv = colvals(A)
     rp = rowptr(A)
@@ -309,12 +330,16 @@ function update_smoother!(smoother::L1ColoredGaussSeidelSmoother, A::CSRMatrix;
 end
 
 """
-    smooth!(x, A, b, smoother::L1ColoredGaussSeidelSmoother; steps=1)
+    smooth!(x, A, b, smoother::L1ColoredGaussSeidelSmoother; steps=1, residual=nothing)
 
 Apply L1 colored Gauss-Seidel smoothing. Uses l1 row norms for diagonal scaling.
+
+The `residual` keyword is accepted for interface consistency but is not used,
+since Gauss-Seidel computes row-wise residuals with the latest x values.
 """
 function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
-                 smoother::L1ColoredGaussSeidelSmoother; steps::Int=1, reverse::Bool=false, backend=DEFAULT_BACKEND, block_size::Int=64)
+                 smoother::L1ColoredGaussSeidelSmoother; steps::Int=1, reverse::Bool=false, backend=DEFAULT_BACKEND, block_size::Int=64,
+                 residual::Union{Nothing, AbstractVector}=nothing)
     nzv = nonzeros(A)
     cv = colvals(A)
     rp = rowptr(A)
@@ -423,14 +448,18 @@ function update_smoother!(smoother::SerialGaussSeidelSmoother{Tv, Ti}, A::CSRMat
 end
 
 """
-    smooth!(x, A, b, smoother::SerialGaussSeidelSmoother; steps=1)
+    smooth!(x, A, b, smoother::SerialGaussSeidelSmoother; steps=1, residual=nothing)
 
 Apply serial Gauss-Seidel smoothing. Performs a sequential forward sweep
 over all rows without threading or KernelAbstractions. For GPU arrays,
 copies data to CPU, applies GS, and copies back.
+
+The `residual` keyword is accepted for interface consistency but is not used,
+since Gauss-Seidel computes row-wise residuals with the latest x values.
 """
 function smooth!(x::AbstractVector, A::CSRMatrix{Tv, Ti}, b::AbstractVector,
-                 smoother::SerialGaussSeidelSmoother; steps::Int=1, reverse::Bool=false, backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
+                 smoother::SerialGaussSeidelSmoother; steps::Int=1, reverse::Bool=false, backend=DEFAULT_BACKEND, block_size::Int=64,
+                 residual::Union{Nothing, AbstractVector}=nothing) where {Tv, Ti}
     n = size(A, 1)
     is_gpu = !(x isa Array)
     if is_gpu
@@ -513,14 +542,18 @@ function update_smoother!(smoother::L1SerialGaussSeidelSmoother{Tv, Ti}, A::CSRM
 end
 
 """
-    smooth!(x, A, b, smoother::L1SerialGaussSeidelSmoother; steps=1)
+    smooth!(x, A, b, smoother::L1SerialGaussSeidelSmoother; steps=1, residual=nothing)
 
 Apply serial L1 Gauss-Seidel smoothing. Performs a sequential forward sweep
 over all rows using l1 row norms for diagonal scaling. For GPU arrays,
 copies data to CPU, applies GS, and copies back.
+
+The `residual` keyword is accepted for interface consistency but is not used,
+since Gauss-Seidel computes row-wise residuals with the latest x values.
 """
 function smooth!(x::AbstractVector, A::CSRMatrix{Tv, Ti}, b::AbstractVector,
-                 smoother::L1SerialGaussSeidelSmoother; steps::Int=1, reverse::Bool=false, backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti}
+                 smoother::L1SerialGaussSeidelSmoother; steps::Int=1, reverse::Bool=false, backend=DEFAULT_BACKEND, block_size::Int=64,
+                 residual::Union{Nothing, AbstractVector}=nothing) where {Tv, Ti}
     n = size(A, 1)
     is_gpu = !(x isa Array)
     if is_gpu
@@ -614,13 +647,25 @@ end
     end
 end
 
+@kernel function spai0_residual_kernel!(x_new, @Const(x), @Const(r),
+                                        @Const(m_diag))
+    i = @index(Global)
+    @inbounds begin
+        x_new[i] = x[i] + m_diag[i] * r[i]
+    end
+end
+
 """
-    smooth!(x, A, b, smoother::SPAI0Smoother; steps=1)
+    smooth!(x, A, b, smoother::SPAI0Smoother; steps=1, residual=nothing)
 
 Apply SPAI(0) smoothing iterations. Alternates buffers to avoid extra copies.
+
+When `residual` is provided, the first iteration uses the pre-computed residual
+vector `r = b - A*x` instead of recomputing it, saving one SpMV.
 """
 function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
-                 smoother::SPAI0Smoother; steps::Int=1, reverse::Bool=false, backend=DEFAULT_BACKEND, block_size::Int=64)
+                 smoother::SPAI0Smoother; steps::Int=1, reverse::Bool=false, backend=DEFAULT_BACKEND, block_size::Int=64,
+                 residual::Union{Nothing, AbstractVector}=nothing)
     n = size(A, 1)
     nzv = nonzeros(A)
     cv = colvals(A)
@@ -629,8 +674,13 @@ function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
     src = x
     dst = tmp
     kernel! = spai0_smooth_kernel!(backend, block_size)
-    for _ in 1:steps
-        kernel!(dst, src, b, nzv, cv, rp, smoother.m_diag; ndrange=n)
+    for step in 1:steps
+        if step == 1 && residual !== nothing
+            rkernel! = spai0_residual_kernel!(backend, block_size)
+            rkernel!(dst, src, residual, smoother.m_diag; ndrange=n)
+        else
+            kernel!(dst, src, b, nzv, cv, rp, smoother.m_diag; ndrange=n)
+        end
         _synchronize(backend)
         src, dst = dst, src
     end
@@ -876,13 +926,17 @@ end
 end
 
 """
-    smooth!(x, A, b, smoother::SPAI1Smoother; steps=1)
+    smooth!(x, A, b, smoother::SPAI1Smoother; steps=1, residual=nothing)
 
 Apply SPAI(1) smoothing: x <- x + M*(b - A*x) where M ≈ A⁻¹.
 Two-pass: first compute residual into tmp, then apply M.
+
+When `residual` is provided, the first iteration copies the pre-computed
+residual into tmp instead of computing `b - A*x`, saving one SpMV.
 """
 function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
-                 smoother::SPAI1Smoother; steps::Int=1, reverse::Bool=false, backend=DEFAULT_BACKEND, block_size::Int=64)
+                 smoother::SPAI1Smoother; steps::Int=1, reverse::Bool=false, backend=DEFAULT_BACKEND, block_size::Int=64,
+                 residual::Union{Nothing, AbstractVector}=nothing)
     n = size(A, 1)
     nzv = nonzeros(A)
     cv = colvals(A)
@@ -890,10 +944,14 @@ function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
     tmp = smoother.tmp
     kernel1! = spai1_smooth_kernel!(backend, block_size)
     kernel2! = spai1_apply_kernel!(backend, block_size)
-    for _ in 1:steps
+    for step in 1:steps
         # Pass 1: compute residual r = b - A*x into tmp
-        kernel1!(tmp, x, b, nzv, cv, rp, smoother.nzval; ndrange=n)
-        _synchronize(backend)
+        if step == 1 && residual !== nothing
+            copyto!(tmp, residual)
+        else
+            kernel1!(tmp, x, b, nzv, cv, rp, smoother.nzval; ndrange=n)
+            _synchronize(backend)
+        end
         # Pass 2: x += M * r
         kernel2!(x, tmp, smoother.nzval, cv, rp; ndrange=n)
         _synchronize(backend)
@@ -1032,7 +1090,8 @@ function update_smoother!(smoother::L1JacobiSmoother, A::CSRMatrix;
 end
 
 function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
-                 smoother::L1JacobiSmoother; steps::Int=1, reverse::Bool=false, backend=DEFAULT_BACKEND, block_size::Int=64)
+                 smoother::L1JacobiSmoother; steps::Int=1, reverse::Bool=false, backend=DEFAULT_BACKEND, block_size::Int=64,
+                 residual::Union{Nothing, AbstractVector}=nothing)
     n = size(A, 1)
     nzv = nonzeros(A)
     cv = colvals(A)
@@ -1041,8 +1100,13 @@ function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
     src = x
     dst = tmp
     kernel! = jacobi_kernel!(backend, block_size)
-    for _ in 1:steps
-        kernel!(dst, src, b, nzv, cv, rp, smoother.invdiag, smoother.ω; ndrange=n)
+    for step in 1:steps
+        if step == 1 && residual !== nothing
+            rkernel! = jacobi_residual_kernel!(backend, block_size)
+            rkernel!(dst, src, residual, smoother.invdiag, smoother.ω; ndrange=n)
+        else
+            kernel!(dst, src, b, nzv, cv, rp, smoother.invdiag, smoother.ω; ndrange=n)
+        end
         _synchronize(backend)
         src, dst = dst, src
     end
@@ -1172,14 +1236,18 @@ end
 end
 
 """
-    smooth!(x, A, b, smoother::ChebyshevSmoother; steps=1)
+    smooth!(x, A, b, smoother::ChebyshevSmoother; steps=1, residual=nothing)
 
 Apply Chebyshev polynomial smoothing. Each step applies the full polynomial
 of the configured degree using the standard three-term recurrence.
 Uses KA kernels for GPU compatibility.
+
+When `residual` is provided, the initial residual computation of the first
+step is skipped and the pre-computed vector is used instead, saving one SpMV.
 """
 function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
-                 smoother::ChebyshevSmoother; steps::Int=1, reverse::Bool=false, backend=DEFAULT_BACKEND, block_size::Int=64)
+                 smoother::ChebyshevSmoother; steps::Int=1, reverse::Bool=false, backend=DEFAULT_BACKEND, block_size::Int=64,
+                 residual::Union{Nothing, AbstractVector}=nothing)
     n = size(A, 1)
     # Tλ is always a real scalar type (Float64, etc.), independent of the block structure.
     Tλ = typeof(smoother.λ_max)
@@ -1195,10 +1263,14 @@ function smooth!(x::AbstractVector, A::CSRMatrix, b::AbstractVector,
     rkernel! = residual_kernel_smoother!(backend, block_size)
     init_kernel! = chebyshev_init_kernel!(backend, block_size)
     iter_kernel! = chebyshev_iter_kernel!(backend, block_size)
-    for _ in 1:steps
+    for step in 1:steps
         # Iteration 0: r = b - A*x, d = (1/θ) * D⁻¹ * r, x += d
-        rkernel!(r, b, x, nzv, cv, rp; ndrange=n)
-        _synchronize(backend)
+        if step == 1 && residual !== nothing
+            copyto!(r, residual)
+        else
+            rkernel!(r, b, x, nzv, cv, rp; ndrange=n)
+            _synchronize(backend)
+        end
 
         init_kernel!(d, x, smoother.invdiag, r, one(Tλ) / θ; ndrange=n)
         _synchronize(backend)
@@ -1374,14 +1446,18 @@ function update_smoother!(smoother::SerialILU0Smoother, A::CSRMatrix;
 end
 
 """
-    smooth!(x, A, b, smoother::SerialILU0Smoother; steps=1)
+    smooth!(x, A, b, smoother::SerialILU0Smoother; steps=1, residual=nothing)
 
 Apply serial ILU(0) smoothing: x += (LU)⁻¹ (b - Ax).
 Uses plain sequential forward/backward substitution on CPU.
 For GPU arrays, copies data to CPU, applies ILU, and copies back.
+
+When `residual` is provided, the first iteration copies the pre-computed
+residual into the workspace instead of computing `b - A*x`, saving one SpMV.
 """
 function smooth!(x::AbstractVector, A::CSRMatrix{Tv, Ti}, b::AbstractVector,
-                 smoother::SerialILU0Smoother{Tv, Ti, Tx}; steps::Int=1, reverse::Bool=false, backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti, Tx}
+                 smoother::SerialILU0Smoother{Tv, Ti, Tx}; steps::Int=1, reverse::Bool=false, backend=DEFAULT_BACKEND, block_size::Int=64,
+                 residual::Union{Nothing, AbstractVector}=nothing) where {Tv, Ti, Tx}
     n = size(A, 1)
     ti_one = one(Ti)
 
@@ -1402,15 +1478,23 @@ function smooth!(x::AbstractVector, A::CSRMatrix{Tv, Ti}, b::AbstractVector,
     rp = rowptr(A_cpu)
     tmp = smoother.tmp  # always CPU
 
-    for _ in 1:steps
+    for step in 1:steps
         # Compute residual: tmp = b - A*x (on CPU)
-        @inbounds for i in 1:n
-            Ax_i = zero(Tx)
-            for nz in rp[i]:(rp[i+ti_one]-ti_one)
-                j = cv[nz]
-                Ax_i += nzv[nz] * x_cpu[j]
+        if step == 1 && residual !== nothing
+            if is_gpu
+                copyto!(tmp, Array(residual))
+            else
+                copyto!(tmp, residual)
             end
-            tmp[i] = b_cpu[i] - Ax_i
+        else
+            @inbounds for i in 1:n
+                Ax_i = zero(Tx)
+                for nz in rp[i]:(rp[i+ti_one]-ti_one)
+                    j = cv[nz]
+                    Ax_i += nzv[nz] * x_cpu[j]
+                end
+                tmp[i] = b_cpu[i] - Ax_i
+            end
         end
 
         # Forward substitution: L * z = tmp  (z stored in tmp, natural row order)
@@ -1580,15 +1664,19 @@ function update_smoother!(smoother::ILU0Smoother, A::CSRMatrix;
 end
 
 """
-    smooth!(x, A, b, smoother::ILU0Smoother; steps=1)
+    smooth!(x, A, b, smoother::ILU0Smoother; steps=1, residual=nothing)
 
 Apply parallel ILU(0) smoothing: x += (LU)⁻¹ (b - Ax).
 Uses level scheduling to process independent rows in parallel during
 the forward/backward substitution phases.
 For GPU arrays, copies data to CPU, applies ILU, and copies back.
+
+When `residual` is provided, the first iteration copies the pre-computed
+residual into the workspace instead of computing `b - A*x`, saving one SpMV.
 """
 function smooth!(x::AbstractVector, A::CSRMatrix{Tv, Ti}, b::AbstractVector,
-                 smoother::ILU0Smoother{Tv, Ti, Tx}; steps::Int=1, reverse::Bool=false, backend=DEFAULT_BACKEND, block_size::Int=64) where {Tv, Ti, Tx}
+                 smoother::ILU0Smoother{Tv, Ti, Tx}; steps::Int=1, reverse::Bool=false, backend=DEFAULT_BACKEND, block_size::Int=64,
+                 residual::Union{Nothing, AbstractVector}=nothing) where {Tv, Ti, Tx}
     n = size(A, 1)
     ti_one = one(Ti)
 
@@ -1622,15 +1710,23 @@ function smooth!(x::AbstractVector, A::CSRMatrix{Tv, Ti}, b::AbstractVector,
     U_nzval = smoother.U_nzval
     diag_idx = smoother.diag_idx
 
-    for _ in 1:steps
+    for step in 1:steps
         # Compute residual: tmp = b - A*x (on CPU)
-        @inbounds for i in 1:n
-            Ax_i = zero(Tx)
-            for nz in rp[i]:(rp[i+ti_one]-ti_one)
-                j = cv[nz]
-                Ax_i += nzv[nz] * x_cpu[j]
+        if step == 1 && residual !== nothing
+            if is_gpu
+                copyto!(tmp, Array(residual))
+            else
+                copyto!(tmp, residual)
             end
-            tmp[i] = b_cpu[i] - Ax_i
+        else
+            @inbounds for i in 1:n
+                Ax_i = zero(Tx)
+                for nz in rp[i]:(rp[i+ti_one]-ti_one)
+                    j = cv[nz]
+                    Ax_i += nzv[nz] * x_cpu[j]
+                end
+                tmp[i] = b_cpu[i] - Ax_i
+            end
         end
 
         # Forward substitution: L * z = tmp, using level scheduling.
@@ -1744,13 +1840,14 @@ function update_smoother!(smoother::AbstractSmoother, A::SparseMatrixCSC;
 end
 
 """
-    smooth!(x, A::SparseMatrixCSC, b, smoother; steps=1, backend, block_size)
+    smooth!(x, A::SparseMatrixCSC, b, smoother; steps=1, residual=nothing, backend, block_size)
 
 Apply smoother iterations to solve `Ax = b` using a `SparseMatrixCSC` matrix.
 This is the public API for applying smoothers with `SparseMatrixCSC` matrices.
 """
 function smooth!(x::AbstractVector, A::SparseMatrixCSC, b::AbstractVector,
-                 smoother::AbstractSmoother; steps::Int=1, reverse::Bool=false, backend=DEFAULT_BACKEND, block_size::Int=64)
+                 smoother::AbstractSmoother; steps::Int=1, reverse::Bool=false, backend=DEFAULT_BACKEND, block_size::Int=64,
+                 residual::Union{Nothing, AbstractVector}=nothing)
     A_csr = csr_from_csc(A)
-    return smooth!(x, A_csr, b, smoother; steps=steps, reverse=reverse, backend=backend, block_size=block_size)
+    return smooth!(x, A_csr, b, smoother; steps=steps, reverse=reverse, backend=backend, block_size=block_size, residual=residual)
 end

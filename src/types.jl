@@ -393,16 +393,18 @@ end
 """
     GPUILU0Smoother{Tv, Ti, Tx, Vnz, Vi, Vx}
 
-GPU-native level-scheduled ILU(0) smoother. Initial factorization and level
-scheduling are computed on CPU during setup; all arrays are then transferred
-to the device. Both `smooth!` and `update_smoother!` (resetup) execute
-entirely on device using KernelAbstractions kernels (no CPU↔GPU copies per
-solve or resetup).
+GPU-native ILU(0) smoother.  Initial factorization and level scheduling are
+computed on CPU during setup; all arrays are then transferred to the device.
+Both `smooth!` and `update_smoother!` execute entirely on device (no CPU↔GPU
+copies per solve or resetup).
 
-On CPU the solve uses direct `Threads.@threads` per level (no KernelAbstractions
-dispatch overhead). On GPU the existing level-scheduled kernels are used — GPU
-stream ordering guarantees correctness between level launches without any
-host-blocking synchronization points.
+On CPU the solve uses a plain sequential forward sweep (i = 1..n) followed by
+a backward sweep (i = n..1) with no level-scheduling overhead.
+
+On GPU a syncfree approach is used: all rows are processed in a single kernel
+launch and each thread spin-waits (via atomic fetch-and-add 0) until its
+dependencies have signaled completion in the `done` vector.  This reduces
+kernel launches from O(levels) to O(1) per triangular solve.
 
 `Tv` is the matrix entry type; `Ti` the integer index type; `Tx` the solution
 vector element type. `Vnz`, `Vi`, `Vx` are the concrete vector types that may
@@ -415,12 +417,13 @@ mutable struct GPUILU0Smoother{Tv, Ti, Tx,
     L_nzval::Vnz              # strictly lower triangle values
     U_nzval::Vnz              # upper triangle + diagonal values
     diag_idx::Vi              # index of diagonal in each row's nzrange
-    fwd_order::Vi             # rows sorted by forward level
-    bwd_order::Vi             # rows sorted by backward level
+    fwd_order::Vi             # rows sorted by forward level (kept for compatibility)
+    bwd_order::Vi             # rows sorted by backward level (kept for compatibility)
     level_offsets::Vector{Int}# [fwd_offsets..., bwd_offsets...] concatenated (CPU)
     num_fwd_levels::Int       # number of forward levels
     tmp::Vx                   # workspace on device
     row_norms::Vnz            # precomputed row norms on device (for safeguarding during factorization)
+    done::Vi                  # syncfree completion flags: 0 = not done, 1 = done
 end
 
 """
@@ -430,13 +433,15 @@ GPU-native diagonal ILU (DILU) smoother. Only the modified diagonal is stored
 (not the full L/U factors), making this more memory-efficient than ILU(0).
 Level scheduling and initial diagonal computation happen on CPU during setup;
 all arrays are then transferred to the device. Both `smooth!` and
-`update_smoother!` (resetup) execute entirely on device using
-KernelAbstractions kernels.
+`update_smoother!` (resetup) execute entirely on device.
 
-On CPU the solve uses direct `Threads.@threads` per level (no KernelAbstractions
-dispatch overhead). On GPU the existing level-scheduled kernels are used — GPU
-stream ordering guarantees correctness between level launches without any
-host-blocking synchronization points.
+On CPU the solve uses a plain sequential forward sweep (i = 1..n) followed by
+a backward sweep (i = n..1) with no level-scheduling overhead.
+
+On GPU a syncfree approach is used: all rows are processed in a single kernel
+launch and each thread spin-waits (via atomic fetch-and-add 0) until its
+dependencies have signaled completion in the `done` vector.  This reduces
+kernel launches from O(levels) to O(1) per triangular solve.
 
 The DILU factorization defines:
     d_i = a_{ii} - Σ_{j<i, (i,j)∈S} a_{ij} * d_j⁻¹ * a_{ji}
@@ -450,12 +455,13 @@ mutable struct DILUSmoother{Tv, Ti, Tx,
                              Vx<:AbstractVector{Tx}} <: AbstractSmoother
     inv_diag::Vnz             # d_i⁻¹ (inverted DILU diagonal)
     diag_idx::Vi              # index of diagonal in each row's nzrange
-    fwd_order::Vi             # rows sorted by forward level
-    bwd_order::Vi             # rows sorted by backward level
+    fwd_order::Vi             # rows sorted by forward level (kept for compatibility)
+    bwd_order::Vi             # rows sorted by backward level (kept for compatibility)
     level_offsets::Vector{Int}# [fwd_offsets..., bwd_offsets...] concatenated (CPU)
     num_fwd_levels::Int       # number of forward levels
     tmp::Vx                   # workspace on device
     lower_transpose_nz::Vi    # for each lower-triangle nz (i,j), the nz-index of (j,i); zero for diagonal/upper entries
+    done::Vi                  # syncfree completion flags: 0 = not done, 1 = done
 end
 
 # ── Prolongation info (stored implicitly) ─────────────────────────────────────

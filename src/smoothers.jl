@@ -1846,10 +1846,11 @@ function build_gpu_ilu0_smoother(A::CSRMatrix{Tv, Ti};
     bwd_order_dev = _to_device(A, bwd_order_cpu)
     tmp = _allocate_vector(A, Tx, n)
     row_norms_dev = _allocate_vector(A, Ts, n)
+    done_dev = _allocate_vector(A, Ti, n)
 
     return GPUILU0Smoother(L_nzval_dev, U_nzval_dev, diag_idx_dev,
                            fwd_order_dev, bwd_order_dev,
-                           combined_offsets, num_fwd_levels, tmp, row_norms_dev)
+                           combined_offsets, num_fwd_levels, tmp, row_norms_dev, done_dev)
 end
 
 function update_smoother!(smoother::GPUILU0Smoother{Tv, Ti}, A::CSRMatrix;
@@ -1868,8 +1869,11 @@ function update_smoother!(smoother::GPUILU0Smoother{Tv, Ti}, A::CSRMatrix;
         # (smoother arrays are plain Vectors on CPU backend)
         _ilu0_factorize!(smoother.L_nzval, smoother.U_nzval, smoother.diag_idx, A)
     else
-        # GPU path: level-scheduled kernels.
-        # No _synchronize between levels — stream ordering guarantees correctness on GPU.
+        # GPU path: syncfree factorization — single kernel launch for all rows.
+        # Each thread spin-waits on its lower-triangle dependencies via atomic
+        # fetch-and-add 0, which serves as a GPU-compatible atomic read.
+        # Reduces from O(levels) kernel launches to O(1).
+
         # Step 1: Initialize U = A.nzval, L = 0, and compute row norms
         init_kernel! = _gpu_ilu0_init_kernel!(backend, block_size)
         init_kernel!(smoother.L_nzval, smoother.U_nzval, nzv; ndrange=nnz_A)
@@ -1877,20 +1881,11 @@ function update_smoother!(smoother::GPUILU0Smoother{Tv, Ti}, A::CSRMatrix;
         rownorm_kernel! = _gpu_ilu0_rownorm_kernel!(backend, block_size)
         rownorm_kernel!(smoother.row_norms, nzv, rp, Ts(0); ndrange=n)
 
-        # Step 2: Level-scheduled ILU(0) factorization on device
-        fac_kernel! = _gpu_ilu0_factorize_kernel!(backend, block_size)
-        for lev in 1:num_fwd_levels
-            lev_start = combined_offsets[lev]
-            count = combined_offsets[lev+1] - lev_start
-            count == 0 && continue
-            fac_kernel!(smoother.L_nzval, smoother.U_nzval, nzv, cv, rp,
-                        smoother.diag_idx, smoother.fwd_order, smoother.row_norms,
-                        lev_start - 1, Ts(0); ndrange=count)
-        end
-
-        # Step 3: Diagonal safeguard
-        safeguard_kernel! = _gpu_ilu0_diag_safeguard_kernel!(backend, block_size)
-        safeguard_kernel!(smoother.U_nzval, smoother.diag_idx, smoother.row_norms, Ts(0); ndrange=n)
+        # Step 2: Syncfree ILU(0) factorization — one kernel, spin-wait for deps
+        fill!(smoother.done, Ti(0))
+        sfac_kernel! = _gpu_ilu0_syncfree_factorize!(backend, block_size)
+        sfac_kernel!(smoother.L_nzval, smoother.U_nzval, nzv, cv, rp,
+                     smoother.diag_idx, smoother.row_norms, smoother.done, Ts(0); ndrange=n)
     end
     _synchronize(backend)
     return smoother
@@ -2031,14 +2026,126 @@ end
     end
 end
 
+# ── GPU ILU(0) syncfree kernels ───────────────────────────────────────────────
+# These use a single kernel launch per phase.  Thread i handles row i and
+# spin-waits on done[j] using atomic fetch-and-add 0, which serves as an
+# atomic read that compiles to CUDA's atomicAdd instruction (unlike plain
+# atomic loads with ordering which are not supported by GPUCompiler).
+
+@kernel function _gpu_ilu0_syncfree_factorize!(L_nzval, U_nzval,
+                                               @Const(nzval), @Const(colval), @Const(rp),
+                                               @Const(diag_idx), @Const(row_norms),
+                                               done, ::Ts) where Ts
+    i = @index(Global)
+    @inbounds begin
+        max_factor = Ts(1e8)
+        Ti = eltype(done)
+        done_zero = zero(Ti)
+        done_one  = one(Ti)
+        # Process lower triangle entries of row i
+        for nz in rp[i]:(diag_idx[i]-1)
+            k = colval[nz]
+            # Spin-wait until row k has been fully factorized.
+            # @atomic done[k] += done_zero is a fetch-and-add 0 — returns the
+            # current value of done[k] as an atomic read without modifying it.
+            while (@atomic done[k] += done_zero) != done_one
+            end
+            # L[i,k] = U[i,k] / U[k,k]
+            u_kk = U_nzval[diag_idx[k]]
+            safe_thresh_k = eps(Ts) * max(one(Ts), row_norms[k])
+            if abs(u_kk) < safe_thresh_k
+                L_nzval[nz] = zero(eltype(L_nzval))
+                U_nzval[nz] = zero(eltype(U_nzval))
+            else
+                l_ik = U_nzval[nz] / u_kk
+                if abs(l_ik) > max_factor
+                    l_ik = l_ik * (max_factor / abs(l_ik))
+                end
+                L_nzval[nz] = l_ik
+                U_nzval[nz] = zero(eltype(U_nzval))
+                # Update row i: for each j in row k with j > k, if (i,j) exists
+                for nz_k in (diag_idx[k]+1):(rp[k+1]-1)
+                    j = colval[nz_k]
+                    # Binary search for (i,j) in row i
+                    lo = diag_idx[i]
+                    hi = rp[i+1] - 1
+                    nz_ij = zero(Ti)
+                    while lo <= hi
+                        mid = (lo + hi) >> 1
+                        c = colval[mid]
+                        if c == j
+                            nz_ij = mid
+                            break
+                        elseif c < j
+                            lo = mid + one(Ti)
+                        else
+                            hi = mid - one(Ti)
+                        end
+                    end
+                    if nz_ij > 0
+                        U_nzval[nz_ij] -= l_ik * U_nzval[nz_k]
+                    end
+                end
+            end
+        end
+        # Diagonal safeguard
+        u_ii = U_nzval[diag_idx[i]]
+        safe_thresh = eps(Ts) * max(one(Ts), row_norms[i])
+        if abs(u_ii) < safe_thresh
+            U_nzval[diag_idx[i]] = safe_thresh * one(eltype(U_nzval))
+        end
+        # Signal that row i is fully factorized
+        @atomic done[i] += done_one
+    end
+end
+
+@kernel function _gpu_ilu0_syncfree_fwd!(tmp, @Const(L_nzval), @Const(colval), @Const(rp),
+                                         @Const(diag_idx), done)
+    i = @index(Global)
+    @inbounds begin
+        Ti = eltype(done)
+        done_zero = zero(Ti)
+        done_one  = one(Ti)
+        for nz in rp[i]:(diag_idx[i]-1)
+            j = colval[nz]
+            while (@atomic done[j] += done_zero) != done_one
+            end
+            tmp[i] -= L_nzval[nz] * tmp[j]
+        end
+        @atomic done[i] += done_one
+    end
+end
+
+@kernel function _gpu_ilu0_syncfree_bwd!(tmp, @Const(U_nzval), @Const(colval), @Const(rp),
+                                         @Const(diag_idx), done)
+    i = @index(Global)
+    @inbounds begin
+        Ti = eltype(done)
+        done_zero = zero(Ti)
+        done_one  = one(Ti)
+        for nz in (diag_idx[i]+1):(rp[i+1]-1)
+            j = colval[nz]
+            while (@atomic done[j] += done_zero) != done_one
+            end
+            tmp[i] -= U_nzval[nz] * tmp[j]
+        end
+        tmp[i] = U_nzval[diag_idx[i]] \ tmp[i]
+        @atomic done[i] += done_one
+    end
+end
+
 """
     smooth!(x, A, b, smoother::GPUILU0Smoother; steps=1, residual=nothing)
 
 Apply GPU-native ILU(0) smoothing: x += (LU)⁻¹ (b - Ax).
 
-On CPU uses direct `Threads.@threads` level scheduling (zero KA kernel
-dispatch overhead per level). On GPU uses level-scheduled KA kernels without
-host-blocking synchronization between levels (GPU stream ordering is sufficient).
+On CPU uses a simple sequential forward sweep (i = 1..n) then backward sweep
+(i = n..1) — no level-scheduling overhead, matching the performance of a
+plain serial ILU(0) solve.
+
+On GPU uses syncfree kernels: one kernel launch per triangular solve where
+every thread handles one row and spin-waits on dependencies via atomic
+fetch-and-add 0 (O(1) kernel launches per solve vs O(levels)).
 
 When `residual` is provided, the first iteration copies the pre-computed
 residual into the workspace instead of computing `b - A*x`, saving one SpMV.
@@ -2052,14 +2159,11 @@ function smooth!(x::AbstractVector, A::CSRMatrix{Tv, Ti}, b::AbstractVector,
     rp = rowptr(A)
     tmp = smoother.tmp
 
-    combined_offsets = smoother.level_offsets
-    num_fwd_levels = smoother.num_fwd_levels
-    bwd_offset_start = num_fwd_levels + 2
-    num_bwd_levels = length(combined_offsets) - bwd_offset_start
-
     if backend isa CPU
         # ── CPU path ─────────────────────────────────────────────────────────
-        # Direct Threads.@threads per level — zero KA kernel dispatch overhead.
+        # Simple sequential forward sweep (i = 1..n) then backward sweep
+        # (i = n..1).  No level-scheduling indirection — this matches the
+        # performance of a plain serial ILU(0) solve.
         ti_one = one(Ti)
         for step in 1:steps
             # 1. Residual: tmp = b - A*x
@@ -2075,50 +2179,19 @@ function smooth!(x::AbstractVector, A::CSRMatrix{Tv, Ti}, b::AbstractVector,
                 end
             end
 
-            # 2. Forward substitution: L * z = tmp
-            @inbounds for lev in 1:num_fwd_levels
-                lev_start = combined_offsets[lev]
-                lev_end   = combined_offsets[lev+1] - 1
-                count = lev_end - lev_start + 1
-                if count >= _ILU0_MIN_PARALLEL_ROWS
-                    Threads.@threads for idx in lev_start:lev_end
-                        i = smoother.fwd_order[idx]
-                        for nz in rp[i]:(smoother.diag_idx[i]-ti_one)
-                            tmp[i] -= smoother.L_nzval[nz] * tmp[cv[nz]]
-                        end
-                    end
-                else
-                    for idx in lev_start:lev_end
-                        i = smoother.fwd_order[idx]
-                        for nz in rp[i]:(smoother.diag_idx[i]-ti_one)
-                            tmp[i] -= smoother.L_nzval[nz] * tmp[cv[nz]]
-                        end
-                    end
+            # 2. Forward substitution: L * z = tmp  (sequential, i = 1..n)
+            @inbounds for i in 1:n
+                for nz in rp[i]:(smoother.diag_idx[i]-ti_one)
+                    tmp[i] -= smoother.L_nzval[nz] * tmp[cv[nz]]
                 end
             end
 
-            # 3. Backward substitution: U * dx = z
-            @inbounds for lev in 1:num_bwd_levels
-                lev_start = combined_offsets[bwd_offset_start + lev - 1]
-                lev_end   = combined_offsets[bwd_offset_start + lev] - 1
-                count = lev_end - lev_start + 1
-                if count >= _ILU0_MIN_PARALLEL_ROWS
-                    Threads.@threads for idx in lev_start:lev_end
-                        i = smoother.bwd_order[idx]
-                        for nz in (smoother.diag_idx[i]+ti_one):(rp[i+ti_one]-ti_one)
-                            tmp[i] -= smoother.U_nzval[nz] * tmp[cv[nz]]
-                        end
-                        tmp[i] = smoother.U_nzval[smoother.diag_idx[i]] \ tmp[i]
-                    end
-                else
-                    for idx in lev_start:lev_end
-                        i = smoother.bwd_order[idx]
-                        for nz in (smoother.diag_idx[i]+ti_one):(rp[i+ti_one]-ti_one)
-                            tmp[i] -= smoother.U_nzval[nz] * tmp[cv[nz]]
-                        end
-                        tmp[i] = smoother.U_nzval[smoother.diag_idx[i]] \ tmp[i]
-                    end
+            # 3. Backward substitution: U * dx = z  (sequential, i = n..1)
+            @inbounds for i in n:-1:1
+                for nz in (smoother.diag_idx[i]+ti_one):(rp[i+ti_one]-ti_one)
+                    tmp[i] -= smoother.U_nzval[nz] * tmp[cv[nz]]
                 end
+                tmp[i] = smoother.U_nzval[smoother.diag_idx[i]] \ tmp[i]
             end
 
             # 4. Update: x += dx
@@ -2131,12 +2204,12 @@ function smooth!(x::AbstractVector, A::CSRMatrix{Tv, Ti}, b::AbstractVector,
         end
     else
         # ── GPU path ─────────────────────────────────────────────────────────
-        # Level-scheduled kernels. No _synchronize between level launches —
-        # GPU stream ordering guarantees that each level sees the results of
-        # the previous level without any host-blocking synchronization.
+        # Syncfree kernels — one kernel launch per triangular solve.
+        # Each thread spin-waits on its row dependencies via @atomic += 0
+        # (fetch-and-add 0 = atomic read compiling to CUDA's atomicAdd).
         residual_kernel! = _gpu_ilu0_residual_kernel!(backend, block_size)
-        fwd_kernel! = _gpu_ilu0_fwd_kernel!(backend, block_size)
-        bwd_kernel! = _gpu_ilu0_bwd_kernel!(backend, block_size)
+        sfwd_kernel! = _gpu_ilu0_syncfree_fwd!(backend, block_size)
+        sbwd_kernel! = _gpu_ilu0_syncfree_bwd!(backend, block_size)
         update_kernel! = _gpu_ilu0_update_kernel!(backend, block_size)
 
         for step in 1:steps
@@ -2147,23 +2220,15 @@ function smooth!(x::AbstractVector, A::CSRMatrix{Tv, Ti}, b::AbstractVector,
                 residual_kernel!(tmp, b, x, nzv, cv, rp; ndrange=n)
             end
 
-            # Forward substitution: L * z = tmp, level by level
-            for lev in 1:num_fwd_levels
-                lev_start = combined_offsets[lev]
-                count = combined_offsets[lev+1] - lev_start
-                count == 0 && continue
-                fwd_kernel!(tmp, smoother.L_nzval, cv, rp, smoother.diag_idx,
-                            smoother.fwd_order, lev_start - 1; ndrange=count)
-            end
+            # Forward substitution: L * z = tmp  (one kernel launch)
+            fill!(smoother.done, Ti(0))
+            sfwd_kernel!(tmp, smoother.L_nzval, cv, rp, smoother.diag_idx,
+                         smoother.done; ndrange=n)
 
-            # Backward substitution: U * dx = z, level by level
-            for lev in 1:num_bwd_levels
-                lev_start = combined_offsets[bwd_offset_start + lev - 1]
-                count = combined_offsets[bwd_offset_start + lev] - lev_start
-                count == 0 && continue
-                bwd_kernel!(tmp, smoother.U_nzval, cv, rp, smoother.diag_idx,
-                            smoother.bwd_order, lev_start - 1; ndrange=count)
-            end
+            # Backward substitution: U * dx = z  (one kernel launch)
+            fill!(smoother.done, Ti(0))
+            sbwd_kernel!(tmp, smoother.U_nzval, cv, rp, smoother.diag_idx,
+                         smoother.done; ndrange=n)
 
             # Update: x += dx
             update_kernel!(x, tmp; ndrange=n)
@@ -2284,10 +2349,11 @@ function build_dilu_smoother(A::CSRMatrix{Tv, Ti};
     bwd_order_dev = _to_device(A, bwd_order_cpu)
     lt_map_dev = _to_device(A, lt_map_cpu)
     tmp = _allocate_vector(A, Tx, n)
+    done_dev = _allocate_vector(A, Ti, n)
 
     return DILUSmoother(inv_diag_dev, diag_idx_dev,
                         fwd_order_dev, bwd_order_dev,
-                        combined_offsets, num_fwd_levels, tmp, lt_map_dev)
+                        combined_offsets, num_fwd_levels, tmp, lt_map_dev, done_dev)
 end
 
 function update_smoother!(smoother::DILUSmoother{Tv, Ti}, A::CSRMatrix;
@@ -2305,17 +2371,11 @@ function update_smoother!(smoother::DILUSmoother{Tv, Ti}, A::CSRMatrix;
         # (smoother arrays are plain Vectors on CPU backend)
         _dilu_factorize!(smoother.inv_diag, smoother.diag_idx, A)
     else
-        # GPU path: level-scheduled kernels.
-        # No _synchronize between levels — stream ordering guarantees correctness on GPU.
-        kernel! = _dilu_factorize_fwd_kernel!(backend, block_size)
-        for lev in 1:num_fwd_levels
-            lev_start = combined_offsets[lev]
-            count = combined_offsets[lev+1] - lev_start
-            count == 0 && continue
-            kernel!(smoother.inv_diag, nzv, cv, rp, smoother.diag_idx,
-                    smoother.fwd_order, smoother.lower_transpose_nz,
-                    lev_start - 1, Ts(0); ndrange=count)
-        end
+        # GPU path: syncfree factorization — single kernel launch for all rows.
+        fill!(smoother.done, Ti(0))
+        kernel! = _dilu_syncfree_factorize!(backend, block_size)
+        kernel!(smoother.inv_diag, nzv, cv, rp, smoother.diag_idx,
+                smoother.lower_transpose_nz, smoother.done, Ts(0); ndrange=n)
     end
     _synchronize(backend)
     return smoother
@@ -2402,15 +2462,86 @@ end
     end
 end
 
+# ── DILU syncfree kernels ─────────────────────────────────────────────────────
+
+@kernel function _dilu_syncfree_factorize!(inv_diag, @Const(nzval), @Const(colval),
+                                           @Const(rp), @Const(diag_idx),
+                                           @Const(lt_map), done, ::Ts) where Ts
+    i = @index(Global)
+    @inbounds begin
+        Ti = eltype(done)
+        done_zero = zero(Ti)
+        done_one  = one(Ti)
+        d_i = nzval[diag_idx[i]]  # a_{ii}
+        for nz in rp[i]:(diag_idx[i]-1)
+            j = colval[nz]
+            while (@atomic done[j] += done_zero) != done_one
+            end
+            nz_ji = lt_map[nz]
+            if nz_ji > 0
+                d_i -= nzval[nz] * inv_diag[j] * nzval[nz_ji]
+            end
+        end
+        orig_diag_norm = abs(nzval[diag_idx[i]])
+        safe_thresh = eps(Ts) * max(one(Ts), convert(Ts, orig_diag_norm))
+        if abs(d_i) < safe_thresh
+            d_i = safe_thresh * one(eltype(nzval))
+        end
+        inv_diag[i] = one(eltype(nzval)) / d_i
+        @atomic done[i] += done_one
+    end
+end
+
+@kernel function _dilu_syncfree_fwd!(tmp, @Const(inv_diag), @Const(nzval), @Const(colval),
+                                     @Const(rp), @Const(diag_idx), done)
+    i = @index(Global)
+    @inbounds begin
+        Ti = eltype(done)
+        done_zero = zero(Ti)
+        done_one  = one(Ti)
+        s = zero(eltype(tmp))
+        for nz in rp[i]:(diag_idx[i]-1)
+            j = colval[nz]
+            while (@atomic done[j] += done_zero) != done_one
+            end
+            s += nzval[nz] * tmp[j]
+        end
+        tmp[i] = inv_diag[i] * (tmp[i] - s)
+        @atomic done[i] += done_one
+    end
+end
+
+@kernel function _dilu_syncfree_bwd!(tmp, @Const(inv_diag), @Const(nzval), @Const(colval),
+                                     @Const(rp), @Const(diag_idx), done)
+    i = @index(Global)
+    @inbounds begin
+        Ti = eltype(done)
+        done_zero = zero(Ti)
+        done_one  = one(Ti)
+        s = zero(eltype(tmp))
+        for nz in (diag_idx[i]+1):(rp[i+1]-1)
+            j = colval[nz]
+            while (@atomic done[j] += done_zero) != done_one
+            end
+            s += nzval[nz] * tmp[j]
+        end
+        tmp[i] -= inv_diag[i] * s
+        @atomic done[i] += done_one
+    end
+end
+
 """
     smooth!(x, A, b, smoother::DILUSmoother; steps=1, residual=nothing)
 
 Apply GPU-native DILU smoothing: x += M⁻¹ (b - Ax) where
 M = (D + L) D⁻¹ (D + U).
 
-On CPU uses direct `Threads.@threads` level scheduling (zero KA kernel
-dispatch overhead per level). On GPU uses level-scheduled KA kernels without
-host-blocking synchronization between levels (GPU stream ordering is sufficient).
+On CPU uses a plain sequential forward sweep (i = 1..n) then backward sweep
+(i = n..1) — no level-scheduling overhead.
+
+On GPU uses syncfree kernels: one kernel launch per triangular solve where
+every thread handles one row and spin-waits on dependencies via atomic
+fetch-and-add 0 (O(1) kernel launches per solve vs O(levels)).
 """
 function smooth!(x::AbstractVector, A::CSRMatrix{Tv, Ti}, b::AbstractVector,
                  smoother::DILUSmoother; steps::Int=1, reverse::Bool=false, backend=DEFAULT_BACKEND, block_size::Int=64,
@@ -2421,14 +2552,10 @@ function smooth!(x::AbstractVector, A::CSRMatrix{Tv, Ti}, b::AbstractVector,
     rp = rowptr(A)
     tmp = smoother.tmp
 
-    combined_offsets = smoother.level_offsets
-    num_fwd_levels = smoother.num_fwd_levels
-    bwd_offset_start = num_fwd_levels + 2
-    num_bwd_levels = length(combined_offsets) - bwd_offset_start
-
     if backend isa CPU
         # ── CPU path ─────────────────────────────────────────────────────────
-        # Direct Threads.@threads per level — zero KA kernel dispatch overhead.
+        # Simple sequential forward sweep (i = 1..n) then backward sweep
+        # (i = n..1).  No level-scheduling indirection.
         ti_one = one(Ti)
         for step in 1:steps
             # 1. Residual: tmp = b - A*x
@@ -2445,55 +2572,21 @@ function smooth!(x::AbstractVector, A::CSRMatrix{Tv, Ti}, b::AbstractVector,
             end
 
             # 2. Forward sweep: z_i = inv_diag[i] * (r_i - Σ_{j<i} a_{ij} * z_j)
-            @inbounds for lev in 1:num_fwd_levels
-                lev_start = combined_offsets[lev]
-                lev_end   = combined_offsets[lev+1] - 1
-                count = lev_end - lev_start + 1
-                if count >= _ILU0_MIN_PARALLEL_ROWS
-                    Threads.@threads for idx in lev_start:lev_end
-                        i = smoother.fwd_order[idx]
-                        s = zero(eltype(tmp))
-                        for nz in rp[i]:(smoother.diag_idx[i]-ti_one)
-                            s += nzv[nz] * tmp[cv[nz]]
-                        end
-                        tmp[i] = smoother.inv_diag[i] * (tmp[i] - s)
-                    end
-                else
-                    for idx in lev_start:lev_end
-                        i = smoother.fwd_order[idx]
-                        s = zero(eltype(tmp))
-                        for nz in rp[i]:(smoother.diag_idx[i]-ti_one)
-                            s += nzv[nz] * tmp[cv[nz]]
-                        end
-                        tmp[i] = smoother.inv_diag[i] * (tmp[i] - s)
-                    end
+            @inbounds for i in 1:n
+                s = zero(eltype(tmp))
+                for nz in rp[i]:(smoother.diag_idx[i]-ti_one)
+                    s += nzv[nz] * tmp[cv[nz]]
                 end
+                tmp[i] = smoother.inv_diag[i] * (tmp[i] - s)
             end
 
             # 3. Backward sweep: dx_i = z_i - inv_diag[i] * Σ_{j>i} a_{ij} * dx_j
-            @inbounds for lev in 1:num_bwd_levels
-                lev_start = combined_offsets[bwd_offset_start + lev - 1]
-                lev_end   = combined_offsets[bwd_offset_start + lev] - 1
-                count = lev_end - lev_start + 1
-                if count >= _ILU0_MIN_PARALLEL_ROWS
-                    Threads.@threads for idx in lev_start:lev_end
-                        i = smoother.bwd_order[idx]
-                        s = zero(eltype(tmp))
-                        for nz in (smoother.diag_idx[i]+ti_one):(rp[i+ti_one]-ti_one)
-                            s += nzv[nz] * tmp[cv[nz]]
-                        end
-                        tmp[i] -= smoother.inv_diag[i] * s
-                    end
-                else
-                    for idx in lev_start:lev_end
-                        i = smoother.bwd_order[idx]
-                        s = zero(eltype(tmp))
-                        for nz in (smoother.diag_idx[i]+ti_one):(rp[i+ti_one]-ti_one)
-                            s += nzv[nz] * tmp[cv[nz]]
-                        end
-                        tmp[i] -= smoother.inv_diag[i] * s
-                    end
+            @inbounds for i in n:-1:1
+                s = zero(eltype(tmp))
+                for nz in (smoother.diag_idx[i]+ti_one):(rp[i+ti_one]-ti_one)
+                    s += nzv[nz] * tmp[cv[nz]]
                 end
+                tmp[i] -= smoother.inv_diag[i] * s
             end
 
             # 4. Update: x += dx
@@ -2503,12 +2596,10 @@ function smooth!(x::AbstractVector, A::CSRMatrix{Tv, Ti}, b::AbstractVector,
         end
     else
         # ── GPU path ─────────────────────────────────────────────────────────
-        # Level-scheduled kernels. No _synchronize between level launches —
-        # GPU stream ordering guarantees that each level sees the results of
-        # the previous level without any host-blocking synchronization.
+        # Syncfree kernels — one kernel launch per triangular solve.
         residual_kernel! = _dilu_residual_kernel!(backend, block_size)
-        fwd_kernel! = _dilu_fwd_kernel!(backend, block_size)
-        bwd_kernel! = _dilu_bwd_kernel!(backend, block_size)
+        sfwd_kernel! = _dilu_syncfree_fwd!(backend, block_size)
+        sbwd_kernel! = _dilu_syncfree_bwd!(backend, block_size)
         update_kernel! = _dilu_update_kernel!(backend, block_size)
 
         for step in 1:steps
@@ -2519,24 +2610,15 @@ function smooth!(x::AbstractVector, A::CSRMatrix{Tv, Ti}, b::AbstractVector,
                 residual_kernel!(tmp, b, x, nzv, cv, rp; ndrange=n)
             end
 
-            # Forward sweep: (D + L) D⁻¹ z = r
-            # Rewritten as: z_i = D_i⁻¹ (r_i - Σ_{j<i} L_{ij} z_j)
-            for lev in 1:num_fwd_levels
-                lev_start = combined_offsets[lev]
-                count = combined_offsets[lev+1] - lev_start
-                count == 0 && continue
-                fwd_kernel!(tmp, smoother.inv_diag, nzv, cv, rp, smoother.diag_idx,
-                            smoother.fwd_order, lev_start - 1; ndrange=count)
-            end
+            # Forward sweep: z_i = D_i⁻¹ (r_i - Σ_{j<i} L_{ij} z_j)
+            fill!(smoother.done, Ti(0))
+            sfwd_kernel!(tmp, smoother.inv_diag, nzv, cv, rp, smoother.diag_idx,
+                         smoother.done; ndrange=n)
 
-            # Backward sweep: (D + U) dx = D z  →  dx_i = z_i - D_i⁻¹ Σ_{j>i} U_{ij} dx_j
-            for lev in 1:num_bwd_levels
-                lev_start = combined_offsets[bwd_offset_start + lev - 1]
-                count = combined_offsets[bwd_offset_start + lev] - lev_start
-                count == 0 && continue
-                bwd_kernel!(tmp, smoother.inv_diag, nzv, cv, rp, smoother.diag_idx,
-                            smoother.bwd_order, lev_start - 1; ndrange=count)
-            end
+            # Backward sweep: dx_i = z_i - D_i⁻¹ Σ_{j>i} U_{ij} dx_j
+            fill!(smoother.done, Ti(0))
+            sbwd_kernel!(tmp, smoother.inv_diag, nzv, cv, rp, smoother.diag_idx,
+                         smoother.done; ndrange=n)
 
             # Update: x += dx
             update_kernel!(x, tmp; ndrange=n)

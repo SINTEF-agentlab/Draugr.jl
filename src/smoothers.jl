@@ -1320,6 +1320,9 @@ end
 Compute ILU(0) factorization: A ≈ L*U where L,U have the same sparsity as A.
 L has 1 on the diagonal, L_nzval stores strictly lower triangle.
 U_nzval stores upper triangle + diagonal.
+
+Accepts `AbstractVector` to support both CPU (`Vector`) and GPU device array
+callers; Julia dispatches to the concrete element type at JIT time.
 """
 function _ilu0_factorize!(L_nzval::AbstractVector{Tv}, U_nzval::AbstractVector{Tv},
                           diag_idx::AbstractVector{Ti},
@@ -2279,6 +2282,9 @@ end
 
 Compute the DILU diagonal: d_i = a_{ii} - Σ_{j<i,(i,j)∈S} a_{ij} d_j⁻¹ a_{ji}.
 Stores d_i⁻¹ into `inv_diag`.
+
+Accepts `AbstractVector` to support both CPU (`Vector`) and GPU device array
+callers; Julia dispatches to the concrete element type at JIT time.
 """
 function _dilu_factorize!(inv_diag::AbstractVector{Tv}, diag_idx::AbstractVector{Ti},
                           A_cpu::CSRMatrix{Tv, Ti}) where {Tv, Ti}

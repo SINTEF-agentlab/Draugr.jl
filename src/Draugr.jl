@@ -101,9 +101,11 @@ export JacobiSmoother, ColoredGaussSeidelSmoother, L1ColoredGaussSeidelSmoother,
 export L1SerialGaussSeidelSmoother
 export SPAI0Smoother, SPAI1Smoother
 export L1JacobiSmoother, ChebyshevSmoother, ILU0Smoother, SerialILU0Smoother
+export GPUILU0Smoother, DILUSmoother
 export JacobiSmootherType, ColoredGaussSeidelType, SerialGaussSeidelType
 export SPAI0SmootherType, SPAI1SmootherType
 export L1JacobiSmootherType, L1ColoredGaussSeidelType, L1SerialGaussSeidelType, ChebyshevSmootherType, ILU0SmootherType, SerialILU0SmootherType
+export GPUILU0SmootherType, DILUSmootherType
 export build_smoother, update_smoother!, smooth!
 export AbstractDraugrPreconditioner, DraugrPreconditioner
 export setup_specific_preconditioner

@@ -193,6 +193,8 @@ struct L1SerialGaussSeidelType <: SmootherType end
 struct ChebyshevSmootherType <: SmootherType end
 struct ILU0SmootherType <: SmootherType end
 struct SerialILU0SmootherType <: SmootherType end
+struct GPUILU0SmootherType <: SmootherType end
+struct DILUSmootherType <: SmootherType end
 
 # ── Abstract smoother ─────────────────────────────────────────────────────────
 abstract type AbstractSmoother end
@@ -386,6 +388,60 @@ mutable struct SerialILU0Smoother{Tv, Ti, Tx} <: AbstractSmoother
     diag_idx::Vector{Ti}      # index of diagonal in each row's nzrange
     tmp::Vector{Tx}           # workspace: element type Tx (SVector for block)
     A_cpu::CSRMatrix{Tv, Ti}  # CPU copy of A's structure for sequential triangular solves
+end
+
+"""
+    GPUILU0Smoother{Tv, Ti, Tx, Vnz, Vi, Vx}
+
+GPU-native level-scheduled ILU(0) smoother. Factorization and level scheduling
+are computed on CPU during setup; all arrays are then transferred to the device.
+The `smooth!` step executes entirely on device using KernelAbstractions kernels
+(no CPU↔GPU copies per solve).
+
+`Tv` is the matrix entry type; `Ti` the integer index type; `Tx` the solution
+vector element type. `Vnz`, `Vi`, `Vx` are the concrete vector types that may
+live on GPU.
+"""
+mutable struct GPUILU0Smoother{Tv, Ti, Tx,
+                                Vnz<:AbstractVector{Tv},
+                                Vi<:AbstractVector{Ti},
+                                Vx<:AbstractVector{Tx}} <: AbstractSmoother
+    L_nzval::Vnz              # strictly lower triangle values
+    U_nzval::Vnz              # upper triangle + diagonal values
+    diag_idx::Vi              # index of diagonal in each row's nzrange
+    fwd_order::Vi             # rows sorted by forward level
+    bwd_order::Vi             # rows sorted by backward level
+    level_offsets::Vector{Int}# [fwd_offsets..., bwd_offsets...] concatenated (CPU)
+    num_fwd_levels::Int       # number of forward levels
+    tmp::Vx                   # workspace on device
+end
+
+"""
+    DILUSmoother{Tv, Ti, Tx, Vnz, Vi, Vx}
+
+GPU-native diagonal ILU (DILU) smoother. Only the modified diagonal is stored
+(not the full L/U factors), making this more memory-efficient than ILU(0).
+Level scheduling and diagonal computation happen on CPU during setup; all
+arrays are then transferred to the device. The `smooth!` step executes
+entirely on device using KernelAbstractions kernels.
+
+The DILU factorization defines:
+    d_i = a_{ii} - Σ_{j<i, (i,j)∈S} a_{ij} * d_j⁻¹ * a_{ji}
+
+and the preconditioner is M = (D + L) D⁻¹ (D + U) where D = diag(d_i),
+L is the strict lower triangle of A, and U is the strict upper triangle.
+"""
+mutable struct DILUSmoother{Tv, Ti, Tx,
+                             Vnz<:AbstractVector{Tv},
+                             Vi<:AbstractVector{Ti},
+                             Vx<:AbstractVector{Tx}} <: AbstractSmoother
+    inv_diag::Vnz             # d_i⁻¹ (inverted DILU diagonal)
+    diag_idx::Vi              # index of diagonal in each row's nzrange
+    fwd_order::Vi             # rows sorted by forward level
+    bwd_order::Vi             # rows sorted by backward level
+    level_offsets::Vector{Int}# [fwd_offsets..., bwd_offsets...] concatenated (CPU)
+    num_fwd_levels::Int       # number of forward levels
+    tmp::Vx                   # workspace on device
 end
 
 # ── Prolongation info (stored implicitly) ─────────────────────────────────────

@@ -643,6 +643,8 @@ _smoother_name(::L1JacobiSmoother) = "l1-Jacobi"
 _smoother_name(::ChebyshevSmoother) = "Chebyshev"
 _smoother_name(::ILU0Smoother) = "ILU(0)"
 _smoother_name(::SerialILU0Smoother) = "Serial ILU(0)"
+_smoother_name(::GPUILU0Smoother) = "GPU ILU(0)"
+_smoother_name(::DILUSmoother) = "DILU"
 
 """
     _csr_to_dense!(M, A; backend=DEFAULT_BACKEND)

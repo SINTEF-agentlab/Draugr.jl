@@ -400,8 +400,9 @@ entirely on device using KernelAbstractions kernels (no CPU↔GPU copies per
 solve or resetup).
 
 On CPU the solve uses direct `Threads.@threads` per level (no KernelAbstractions
-dispatch overhead). On GPU a single syncfree kernel (spin-wait via `@atomic`)
-replaces the level-loop, reducing hundreds of kernel launches to four.
+dispatch overhead). On GPU the existing level-scheduled kernels are used — GPU
+stream ordering guarantees correctness between level launches without any
+host-blocking synchronization points.
 
 `Tv` is the matrix entry type; `Ti` the integer index type; `Tx` the solution
 vector element type. `Vnz`, `Vi`, `Vx` are the concrete vector types that may
@@ -420,7 +421,6 @@ mutable struct GPUILU0Smoother{Tv, Ti, Tx,
     num_fwd_levels::Int       # number of forward levels
     tmp::Vx                   # workspace on device
     row_norms::Vnz            # precomputed row norms on device (for safeguarding during factorization)
-    done::Vi                  # per-row completion flags for syncfree GPU solve (0=pending, 1=done)
 end
 
 """
@@ -434,8 +434,9 @@ all arrays are then transferred to the device. Both `smooth!` and
 KernelAbstractions kernels.
 
 On CPU the solve uses direct `Threads.@threads` per level (no KernelAbstractions
-dispatch overhead). On GPU a single syncfree kernel (spin-wait via `@atomic`)
-replaces the level-loop, reducing hundreds of kernel launches to four.
+dispatch overhead). On GPU the existing level-scheduled kernels are used — GPU
+stream ordering guarantees correctness between level launches without any
+host-blocking synchronization points.
 
 The DILU factorization defines:
     d_i = a_{ii} - Σ_{j<i, (i,j)∈S} a_{ij} * d_j⁻¹ * a_{ji}
@@ -455,7 +456,6 @@ mutable struct DILUSmoother{Tv, Ti, Tx,
     num_fwd_levels::Int       # number of forward levels
     tmp::Vx                   # workspace on device
     lower_transpose_nz::Vi    # for each lower-triangle nz (i,j), the nz-index of (j,i); zero for diagonal/upper entries
-    done::Vi                  # per-row completion flags for syncfree GPU solve (0=pending, 1=done)
 end
 
 # ── Prolongation info (stored implicitly) ─────────────────────────────────────

@@ -1866,13 +1866,12 @@ function update_smoother!(smoother::GPUILU0Smoother{Tv, Ti}, A::CSRMatrix;
     # Step 1: Initialize U = A.nzval, L = 0, and compute row norms
     init_kernel! = _gpu_ilu0_init_kernel!(backend, block_size)
     init_kernel!(smoother.L_nzval, smoother.U_nzval, nzv; ndrange=nnz_A)
-    _synchronize(backend)
 
     rownorm_kernel! = _gpu_ilu0_rownorm_kernel!(backend, block_size)
     rownorm_kernel!(smoother.row_norms, nzv, rp, Ts(0); ndrange=n)
-    _synchronize(backend)
 
     # Step 2: Level-scheduled ILU(0) factorization on device
+    # NOTE: No _synchronize between levels — stream ordering guarantees correctness
     fac_kernel! = _gpu_ilu0_factorize_kernel!(backend, block_size)
     for lev in 1:num_fwd_levels
         lev_start = combined_offsets[lev]
@@ -1881,7 +1880,6 @@ function update_smoother!(smoother::GPUILU0Smoother{Tv, Ti}, A::CSRMatrix;
         fac_kernel!(smoother.L_nzval, smoother.U_nzval, nzv, cv, rp,
                     smoother.diag_idx, smoother.fwd_order, smoother.row_norms,
                     lev_start - 1, Ts(0); ndrange=count)
-        _synchronize(backend)
     end
 
     # Step 3: Diagonal safeguard
@@ -2055,13 +2053,16 @@ function smooth!(x::AbstractVector, A::CSRMatrix{Tv, Ti}, b::AbstractVector,
     bwd_kernel! = _gpu_ilu0_bwd_kernel!(backend, block_size)
     update_kernel! = _gpu_ilu0_update_kernel!(backend, block_size)
 
+    # NOTE: No _synchronize between kernel launches — on GPU, kernel launches on
+    # the same stream are automatically ordered by the hardware. On CPU (static=true),
+    # _synchronize is a no-op anyway. Removing the per-level syncs eliminates hundreds
+    # of host-blocking synchronization points per smooth! call.
     for step in 1:steps
         # Compute residual: tmp = b - A*x
         if step == 1 && residual !== nothing
             copyto!(tmp, residual)
         else
             residual_kernel!(tmp, b, x, nzv, cv, rp; ndrange=n)
-            _synchronize(backend)
         end
 
         # Forward substitution: L * z = tmp, level by level
@@ -2071,7 +2072,6 @@ function smooth!(x::AbstractVector, A::CSRMatrix{Tv, Ti}, b::AbstractVector,
             count == 0 && continue
             fwd_kernel!(tmp, smoother.L_nzval, cv, rp, smoother.diag_idx,
                         smoother.fwd_order, lev_start - 1; ndrange=count)
-            _synchronize(backend)
         end
 
         # Backward substitution: U * dx = z, level by level
@@ -2081,13 +2081,12 @@ function smooth!(x::AbstractVector, A::CSRMatrix{Tv, Ti}, b::AbstractVector,
             count == 0 && continue
             bwd_kernel!(tmp, smoother.U_nzval, cv, rp, smoother.diag_idx,
                         smoother.bwd_order, lev_start - 1; ndrange=count)
-            _synchronize(backend)
         end
 
         # Update: x += dx
         update_kernel!(x, tmp; ndrange=n)
-        _synchronize(backend)
     end
+    _synchronize(backend)
     return x
 end
 
@@ -2215,6 +2214,7 @@ function update_smoother!(smoother::DILUSmoother{Tv, Ti}, A::CSRMatrix;
     num_fwd_levels = smoother.num_fwd_levels
     Ts = _scalar_real_type(Tv)
 
+    # NOTE: No _synchronize between levels — stream ordering guarantees correctness
     kernel! = _dilu_factorize_fwd_kernel!(backend, block_size)
     for lev in 1:num_fwd_levels
         lev_start = combined_offsets[lev]
@@ -2223,8 +2223,8 @@ function update_smoother!(smoother::DILUSmoother{Tv, Ti}, A::CSRMatrix;
         kernel!(smoother.inv_diag, nzv, cv, rp, smoother.diag_idx,
                 smoother.fwd_order, smoother.lower_transpose_nz,
                 lev_start - 1, Ts(0); ndrange=count)
-        _synchronize(backend)
     end
+    _synchronize(backend)
     return smoother
 end
 
@@ -2337,13 +2337,16 @@ function smooth!(x::AbstractVector, A::CSRMatrix{Tv, Ti}, b::AbstractVector,
     bwd_kernel! = _dilu_bwd_kernel!(backend, block_size)
     update_kernel! = _dilu_update_kernel!(backend, block_size)
 
+    # NOTE: No _synchronize between kernel launches — on GPU, kernel launches on
+    # the same stream are automatically ordered by the hardware. On CPU (static=true),
+    # _synchronize is a no-op anyway. Removing the per-level syncs eliminates hundreds
+    # of host-blocking synchronization points per smooth! call.
     for step in 1:steps
         # Compute residual: tmp = b - A*x
         if step == 1 && residual !== nothing
             copyto!(tmp, residual)
         else
             residual_kernel!(tmp, b, x, nzv, cv, rp; ndrange=n)
-            _synchronize(backend)
         end
 
         # Forward sweep: (D + L) D⁻¹ z = r
@@ -2354,7 +2357,6 @@ function smooth!(x::AbstractVector, A::CSRMatrix{Tv, Ti}, b::AbstractVector,
             count == 0 && continue
             fwd_kernel!(tmp, smoother.inv_diag, nzv, cv, rp, smoother.diag_idx,
                         smoother.fwd_order, lev_start - 1; ndrange=count)
-            _synchronize(backend)
         end
 
         # Backward sweep: (D + U) dx = D z  →  dx_i = z_i - D_i⁻¹ Σ_{j>i} U_{ij} dx_j
@@ -2364,13 +2366,12 @@ function smooth!(x::AbstractVector, A::CSRMatrix{Tv, Ti}, b::AbstractVector,
             count == 0 && continue
             bwd_kernel!(tmp, smoother.inv_diag, nzv, cv, rp, smoother.diag_idx,
                         smoother.bwd_order, lev_start - 1; ndrange=count)
-            _synchronize(backend)
         end
 
         # Update: x += dx
         update_kernel!(x, tmp; ndrange=n)
-        _synchronize(backend)
     end
+    _synchronize(backend)
     return x
 end
 

@@ -393,10 +393,11 @@ end
 """
     GPUILU0Smoother{Tv, Ti, Tx, Vnz, Vi, Vx}
 
-GPU-native level-scheduled ILU(0) smoother. Factorization and level scheduling
-are computed on CPU during setup; all arrays are then transferred to the device.
-The `smooth!` step executes entirely on device using KernelAbstractions kernels
-(no CPU↔GPU copies per solve).
+GPU-native level-scheduled ILU(0) smoother. Initial factorization and level
+scheduling are computed on CPU during setup; all arrays are then transferred
+to the device. Both `smooth!` and `update_smoother!` (resetup) execute
+entirely on device using KernelAbstractions kernels (no CPU↔GPU copies per
+solve or resetup).
 
 `Tv` is the matrix entry type; `Ti` the integer index type; `Tx` the solution
 vector element type. `Vnz`, `Vi`, `Vx` are the concrete vector types that may
@@ -422,9 +423,10 @@ end
 
 GPU-native diagonal ILU (DILU) smoother. Only the modified diagonal is stored
 (not the full L/U factors), making this more memory-efficient than ILU(0).
-Level scheduling and diagonal computation happen on CPU during setup; all
-arrays are then transferred to the device. The `smooth!` step executes
-entirely on device using KernelAbstractions kernels.
+Level scheduling and initial diagonal computation happen on CPU during setup;
+all arrays are then transferred to the device. Both `smooth!` and
+`update_smoother!` (resetup) execute entirely on device using
+KernelAbstractions kernels.
 
 The DILU factorization defines:
     d_i = a_{ii} - Σ_{j<i, (i,j)∈S} a_{ij} * d_j⁻¹ * a_{ji}
@@ -443,7 +445,7 @@ mutable struct DILUSmoother{Tv, Ti, Tx,
     level_offsets::Vector{Int}# [fwd_offsets..., bwd_offsets...] concatenated (CPU)
     num_fwd_levels::Int       # number of forward levels
     tmp::Vx                   # workspace on device
-    lower_transpose_nz::Vi    # for each lower-triangle nz (i,j), the nz-index of (j,i)
+    lower_transpose_nz::Vi    # for each lower-triangle nz (i,j), the nz-index of (j,i); zero for diagonal/upper entries
 end
 
 # ── Prolongation info (stored implicitly) ─────────────────────────────────────

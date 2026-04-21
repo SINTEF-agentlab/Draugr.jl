@@ -1766,6 +1766,58 @@ end
     @inbounds nzval[k] *= trunc_scaling[k]
 end
 
+"""
+    _recompute_trunc_scaling!(P)
+
+Update `P.trunc_scaling` so that applying it normalises each row of P to sum
+to 1, based on the **current** `P.nzval` base values.
+
+This must be called after the interpolation kernel rewrites `P.nzval` with
+fresh raw values (without rescaling) and **before** `_apply_trunc_scaling!`,
+so that the stored `trunc_scaling` factors remain consistent with the updated
+matrix coefficients.
+
+For the initial setup the pre-truncation row sum is exactly 1 by the AMG
+interpolation formula, so `_recompute_trunc_scaling!` produces the same
+result as the analytically computed `row_sum / sum_kept`. For resetup the old
+stored `row_sum / sum_kept` factors are stale (they were computed from a
+different A), so this function fixes the bug by re-deriving them from the new
+base values.
+
+No-op when `P.trunc_scaling` is `nothing`.
+"""
+function _recompute_trunc_scaling!(P::ProlongationOp)
+    ts = P.trunc_scaling
+    ts === nothing && return P
+
+    # Work on CPU – row-wise reduction is trivial and P.rowptr is always small
+    # compared to the matrix; any device↔host copies here are worth it.
+    rowptr  = P.rowptr  isa Array ? P.rowptr  : Array(P.rowptr)
+    nzval_c = P.nzval   isa Array ? P.nzval   : Array(P.nzval)
+    ts_c    = ts        isa Array ? ts        : Array(ts)
+
+    Tv  = eltype(nzval_c)
+    Tts = eltype(ts_c)
+    ε   = eps(real(Tv))
+
+    @inbounds for i in 1:P.nrow
+        row_sum = zero(real(Tv))
+        for k in Int(rowptr[i]):(Int(rowptr[i+1]) - 1)
+            row_sum += real(nzval_c[k])
+        end
+        scale = abs(row_sum) > ε ? Tts(1) / Tts(row_sum) : one(Tts)
+        for k in Int(rowptr[i]):(Int(rowptr[i+1]) - 1)
+            ts_c[k] = scale
+        end
+    end
+
+    # Copy updated factors back to device if necessary
+    if !(ts isa Array)
+        copyto!(ts, ts_c)
+    end
+    return P
+end
+
 """Scatter COO entries into CSR arrays using counting sort positions."""
 @inline function _scatter_coo_to_csr!(colval, nzval, I_p, J_p, V_p, pos, nnz_p::Int)
     @inbounds for k in 1:nnz_p
@@ -2593,7 +2645,10 @@ function _update_P_extendedi!(P::ProlongationOp{Ti, Tv}, A::CSRMatrix{Tv, Ti},
         success = _extendedi_interp_compute_values!(P.nzval, nonzeros(A), P_update_map;
                                                      backend=backend, block_size=block_size)
         if success
-            # Apply truncation rescaling if present (preserves row sums after truncation)
+            # Update trunc_scaling from the new base values, then apply it.
+            # The stored factors are stale when A changes (resetup), so we
+            # recompute them here so that each P row sums to 1.
+            _recompute_trunc_scaling!(P)
             _apply_trunc_scaling!(P; backend=backend, block_size=block_size)
             return P
         end
@@ -2793,7 +2848,10 @@ function _update_P_extendedi!(P::ProlongationOp{Ti, Tv}, A::CSRMatrix{Tv, Ti},
         copyto!(P.nzval, P_nzval)
     end
     
-    # Apply truncation rescaling if present (preserves row sums after truncation)
+    # Update trunc_scaling from the new base values, then apply it.
+    # The stored factors are stale when A changes (resetup), so we
+    # recompute them here so that each P row sums to 1.
+    _recompute_trunc_scaling!(P)
     _apply_trunc_scaling!(P; backend=backend, block_size=block_size)
     
     return P

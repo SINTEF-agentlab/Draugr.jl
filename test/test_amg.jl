@@ -336,6 +336,44 @@ end
     @test norm(r) / norm(b) < 1e-8
 end
 
+@testset "AMG Resetup - update_P=true with ExtendedIInterpolation rescale=true" begin
+    # Regression test: trunc_scaling factors must be recomputed from the new A
+    # values during resetup, not left as stale setup-time values.
+    n = 10
+    A = poisson2d_csr(n)
+    N = n*n
+    config = AMGConfig(coarsening=HMISCoarsening(0.5,
+                           ExtendedIInterpolation(trunc_factor=0.2, rescale=true)))
+    hierarchy = amg_setup(A, config)
+    @test length(hierarchy.levels) > 0
+    for lvl in hierarchy.levels
+        @test lvl.P_update_map !== nothing
+        @test lvl.P_update_map.interp_type == 3
+        # trunc_scaling should be non-nothing when rescale=true
+        if lvl.P.trunc_scaling !== nothing
+            @test all(isfinite, lvl.P.trunc_scaling)
+        end
+    end
+    nonzeros(A) .*= 2.0
+    amg_resetup!(hierarchy, A, config; partial=true, update_P=true)
+    # Verify each P row sums to approximately 1 (C-property preserved)
+    for lvl in hierarchy.levels
+        if lvl.P.trunc_scaling !== nothing
+            P = lvl.P
+            n_fine = P.nrow
+            for i in 1:n_fine
+                row_sum = sum(P.nzval[P.rowptr[i]:(P.rowptr[i+1]-1)])
+                @test abs(row_sum - 1.0) < 1e-10
+            end
+        end
+    end
+    b = rand(N)
+    x = zeros(N)
+    x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+    r = b - sparse(A.At') * x
+    @test norm(r) / norm(b) < 1e-8
+end
+
 @testset "AMG Resetup - update_P does not impact Aggregation" begin
     n = 10
     A = poisson2d_csr(n)

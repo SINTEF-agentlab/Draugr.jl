@@ -343,7 +343,7 @@ end
     A = poisson2d_csr(n)
     N = n*n
     config = AMGConfig(coarsening=HMISCoarsening(0.5,
-                           ExtendedIInterpolation(trunc_factor=0.2, rescale=true)))
+                           ExtendedIInterpolation(0.2, 0, 1, true)))  # (trunc_factor, max_elements, norm_p, rescale)
     hierarchy = amg_setup(A, config)
     @test length(hierarchy.levels) > 0
     for lvl in hierarchy.levels

@@ -1786,36 +1786,53 @@ base values.
 
 No-op when `P.trunc_scaling` is `nothing`.
 """
-function _recompute_trunc_scaling!(P::ProlongationOp)
+function _recompute_trunc_scaling!(P::ProlongationOp;
+                                   backend=DEFAULT_BACKEND, block_size::Int=64)
     ts = P.trunc_scaling
     ts === nothing && return P
 
-    # Work on CPU – row-wise reduction is trivial and P.rowptr is always small
-    # compared to the matrix; any device↔host copies here are worth it.
-    rowptr  = P.rowptr  isa Array ? P.rowptr  : Array(P.rowptr)
-    nzval_c = P.nzval   isa Array ? P.nzval   : Array(P.nzval)
-    ts_c    = ts        isa Array ? ts        : Array(ts)
+    rowptr = P.rowptr
+    nzval = P.nzval
+    be = _get_backend(nzval)
 
-    Tv  = eltype(nzval_c)
-    Tts = eltype(ts_c)
-    ε   = eps(real(Tv))
-
-    @inbounds for i in 1:P.nrow
-        row_sum = zero(real(Tv))
-        for k in Int(rowptr[i]):(Int(rowptr[i+1]) - 1)
-            row_sum += real(nzval_c[k])
+    if nzval isa Array
+        Tv = eltype(nzval)
+        Tts = eltype(ts)
+        ε = eps(real(Tv))
+        @inbounds for i in 1:P.nrow
+            row_sum = zero(Tv)
+            for k in rowptr[i]:(rowptr[i+1] - 1)
+                row_sum += nzval[k]
+            end
+            scale = abs(row_sum) > ε ? Tts(1) / Tts(row_sum) : one(Tts)
+            for k in rowptr[i]:(rowptr[i+1] - 1)
+                ts[k] = scale
+            end
         end
-        scale = abs(row_sum) > ε ? Tts(1) / Tts(row_sum) : one(Tts)
-        for k in Int(rowptr[i]):(Int(rowptr[i+1]) - 1)
-            ts_c[k] = scale
-        end
-    end
-
-    # Copy updated factors back to device if necessary
-    if !(ts isa Array)
-        copyto!(ts, ts_c)
+    else
+        kernel! = _recompute_trunc_scaling_kernel!(be, block_size)
+        kernel!(ts, nzval, rowptr; ndrange=P.nrow)
+        _synchronize(be)
     end
     return P
+end
+
+@kernel function _recompute_trunc_scaling_kernel!(trunc_scaling, @Const(nzval), @Const(rowptr))
+    i = @index(Global)
+    Tv = eltype(nzval)
+    Tts = eltype(trunc_scaling)
+    ε = eps(real(Tv))
+    row_sum = zero(Tv)
+    @inbounds for k in rowptr[i]:(rowptr[i+1] - 1)
+        row_sum += nzval[k]
+    end
+    scale = one(Tts)
+    if abs(row_sum) > ε
+        scale = Tts(1) / Tts(row_sum)
+    end
+    @inbounds for k in rowptr[i]:(rowptr[i+1] - 1)
+        trunc_scaling[k] = scale
+    end
 end
 
 """Scatter COO entries into CSR arrays using counting sort positions."""
@@ -2648,7 +2665,7 @@ function _update_P_extendedi!(P::ProlongationOp{Ti, Tv}, A::CSRMatrix{Tv, Ti},
             # Update trunc_scaling from the new base values, then apply it.
             # The stored factors are stale when A changes (resetup), so we
             # recompute them here so that each P row sums to 1.
-            _recompute_trunc_scaling!(P)
+            _recompute_trunc_scaling!(P; backend=backend, block_size=block_size)
             _apply_trunc_scaling!(P; backend=backend, block_size=block_size)
             return P
         end
@@ -2851,7 +2868,7 @@ function _update_P_extendedi!(P::ProlongationOp{Ti, Tv}, A::CSRMatrix{Tv, Ti},
     # Update trunc_scaling from the new base values, then apply it.
     # The stored factors are stale when A changes (resetup), so we
     # recompute them here so that each P row sums to 1.
-    _recompute_trunc_scaling!(P)
+    _recompute_trunc_scaling!(P; backend=backend, block_size=block_size)
     _apply_trunc_scaling!(P; backend=backend, block_size=block_size)
     
     return P

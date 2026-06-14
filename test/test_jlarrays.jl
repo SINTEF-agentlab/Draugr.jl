@@ -209,6 +209,42 @@
         @test niter < 100
     end
 
+    @testset "AMG resetup update_P=true ExtendedI rescale=true on JLArrays" begin
+        nx = 10
+        A_jl = poisson2d_jl(nx)
+        n = nx * nx
+        config = AMGConfig(coarsening=HMISCoarsening(0.5, ExtendedIInterpolation(0.2, 0, 1, true)))  # (trunc_factor, max_elements, norm_p, rescale)
+        hierarchy = amg_setup(A_jl, config)
+        @test length(hierarchy.levels) >= 1
+        for lvl in hierarchy.levels
+            @test lvl.P_update_map !== nothing
+            @test lvl.P_update_map.interp_type == 3
+        end
+
+        # Change values but preserve sparsity, then update P in-place.
+        nonzeros(A_jl) .*= 2.0
+        amg_resetup!(hierarchy, A_jl, config; partial=true, update_P=true)
+
+        # Ensure P rows still satisfy the C-property after recompute+rescale.
+        for lvl in hierarchy.levels
+            if lvl.P.trunc_scaling !== nothing
+                P = lvl.P
+                rowptr = Array(P.rowptr)
+                nzval = Array(P.nzval)
+                for i in 1:P.nrow
+                    row_sum = sum(nzval[rowptr[i]:(rowptr[i+1]-1)])
+                    @test abs(row_sum - 1.0) < 1e-10
+                end
+            end
+        end
+
+        b = JLArray(ones(n))
+        x = JLArray(zeros(n))
+        x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=120)
+        @test niter < 120
+        @test jl_residual_norm(A_jl, x, b) < 1e-6
+    end
+
     @testset "Verbosity levels" begin
         A_jl = poisson2d_jl(10)
         n = 100

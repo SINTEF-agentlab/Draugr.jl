@@ -1766,6 +1766,75 @@ end
     @inbounds nzval[k] *= trunc_scaling[k]
 end
 
+"""
+    _recompute_trunc_scaling!(P)
+
+Update `P.trunc_scaling` so that applying it normalises each row of P to sum
+to 1, based on the **current** `P.nzval` base values.
+
+This must be called after the interpolation kernel rewrites `P.nzval` with
+fresh raw values (without rescaling) and **before** `_apply_trunc_scaling!`,
+so that the stored `trunc_scaling` factors remain consistent with the updated
+matrix coefficients.
+
+For the initial setup the pre-truncation row sum is exactly 1 by the AMG
+interpolation formula, so `_recompute_trunc_scaling!` produces the same
+result as the analytically computed `row_sum / sum_kept`. For resetup the old
+stored `row_sum / sum_kept` factors are stale (they were computed from a
+different A), so this function fixes the bug by re-deriving them from the new
+base values.
+
+No-op when `P.trunc_scaling` is `nothing`.
+"""
+function _recompute_trunc_scaling!(P::ProlongationOp;
+                                   backend=DEFAULT_BACKEND, block_size::Int=64)
+    ts = P.trunc_scaling
+    ts === nothing && return P
+
+    rowptr = P.rowptr
+    nzval = P.nzval
+    be = _get_backend(nzval)
+
+    if nzval isa Array
+        Tv = eltype(nzval)
+        Tts = eltype(ts)
+        ε = eps(real(Tv))
+        @inbounds for i in 1:P.nrow
+            row_sum = zero(Tv)
+            for k in rowptr[i]:(rowptr[i+1] - 1)
+                row_sum += nzval[k]
+            end
+            scale = abs(row_sum) > ε ? Tts(1) / Tts(row_sum) : one(Tts)
+            for k in rowptr[i]:(rowptr[i+1] - 1)
+                ts[k] = scale
+            end
+        end
+    else
+        kernel! = _recompute_trunc_scaling_kernel!(be, block_size)
+        kernel!(ts, nzval, rowptr; ndrange=P.nrow)
+        _synchronize(be)
+    end
+    return P
+end
+
+@kernel function _recompute_trunc_scaling_kernel!(trunc_scaling, @Const(nzval), @Const(rowptr))
+    i = @index(Global)
+    Tv = eltype(nzval)
+    Tts = eltype(trunc_scaling)
+    ε = eps(real(Tv))
+    row_sum = zero(Tv)
+    @inbounds for k in rowptr[i]:(rowptr[i+1] - 1)
+        row_sum += nzval[k]
+    end
+    scale = one(Tts)
+    if abs(row_sum) > ε
+        scale = Tts(1) / Tts(row_sum)
+    end
+    @inbounds for k in rowptr[i]:(rowptr[i+1] - 1)
+        trunc_scaling[k] = scale
+    end
+end
+
 """Scatter COO entries into CSR arrays using counting sort positions."""
 @inline function _scatter_coo_to_csr!(colval, nzval, I_p, J_p, V_p, pos, nnz_p::Int)
     @inbounds for k in 1:nnz_p
@@ -2593,7 +2662,10 @@ function _update_P_extendedi!(P::ProlongationOp{Ti, Tv}, A::CSRMatrix{Tv, Ti},
         success = _extendedi_interp_compute_values!(P.nzval, nonzeros(A), P_update_map;
                                                      backend=backend, block_size=block_size)
         if success
-            # Apply truncation rescaling if present (preserves row sums after truncation)
+            # Update trunc_scaling from the new base values, then apply it.
+            # The stored factors are stale when A changes (resetup), so we
+            # recompute them here so that each P row sums to 1.
+            _recompute_trunc_scaling!(P; backend=backend, block_size=block_size)
             _apply_trunc_scaling!(P; backend=backend, block_size=block_size)
             return P
         end
@@ -2793,7 +2865,10 @@ function _update_P_extendedi!(P::ProlongationOp{Ti, Tv}, A::CSRMatrix{Tv, Ti},
         copyto!(P.nzval, P_nzval)
     end
     
-    # Apply truncation rescaling if present (preserves row sums after truncation)
+    # Update trunc_scaling from the new base values, then apply it.
+    # The stored factors are stale when A changes (resetup), so we
+    # recompute them here so that each P row sums to 1.
+    _recompute_trunc_scaling!(P; backend=backend, block_size=block_size)
     _apply_trunc_scaling!(P; backend=backend, block_size=block_size)
     
     return P

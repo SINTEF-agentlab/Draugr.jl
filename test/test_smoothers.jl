@@ -394,6 +394,145 @@ end
 end
 
 # ══════════════════════════════════════════════════════════════════════════
+# GPU ILU(0) Smoother
+# ══════════════════════════════════════════════════════════════════════════
+
+@testset "GPU ILU(0) Smoother - Build" begin
+    A = poisson1d_csr(10)
+    Ac = to_csr(A)
+    smoother = Draugr.build_gpu_ilu0_smoother(Ac)
+    @test smoother isa GPUILU0Smoother
+    @test length(smoother.L_nzval) == nnz(A)
+    @test length(smoother.U_nzval) == nnz(A)
+    @test length(smoother.diag_idx) == 10
+    @test smoother.num_fwd_levels >= 2
+end
+
+@testset "GPU ILU(0) Smoother - Smoothing" begin
+    A = poisson1d_csr(10)
+    Ac = to_csr(A)
+    smoother = Draugr.build_gpu_ilu0_smoother(Ac)
+    test_smoother_smoothing(smoother, Ac, A; steps=3)
+end
+
+@testset "GPU ILU(0) Smoother - AMG Solve" begin
+    test_amg_convergence(AMGConfig(smoother=GPUILU0SmootherType()))
+end
+
+@testset "GPU ILU(0) Smoother - Resetup" begin
+    test_smoother_resetup(AMGConfig(smoother=GPUILU0SmootherType()))
+end
+
+@testset "GPU ILU(0) - Anisotropic" begin
+    A = anisotropic_csr(8, 8)
+    N = 64
+    b = rand(N)
+    x = zeros(N)
+    config = AMGConfig(smoother=GPUILU0SmootherType())
+    hierarchy = amg_setup(A, config)
+    x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+    r = b - sparse(A.At') * x
+    @test norm(r) / norm(b) < 1e-8
+end
+
+@testset "GPU ILU(0) matches CPU ILU(0) factorization" begin
+    A = poisson2d_csr(6)
+    Ac = to_csr(A)
+    s_gpu = Draugr.build_gpu_ilu0_smoother(Ac)
+    s_cpu = Draugr.build_ilu0_smoother(Ac)
+    @test Array(s_gpu.L_nzval) ≈ s_cpu.L_nzval
+    @test Array(s_gpu.U_nzval) ≈ s_cpu.U_nzval
+    @test Array(s_gpu.diag_idx) == s_cpu.diag_idx
+end
+
+@testset "GPU ILU(0) build_smoother dispatch" begin
+    A = poisson1d_csr(10)
+    s = build_smoother(A, GPUILU0SmootherType())
+    @test s isa GPUILU0Smoother
+end
+
+# ══════════════════════════════════════════════════════════════════════════
+# DILU Smoother
+# ══════════════════════════════════════════════════════════════════════════
+
+@testset "DILU Smoother - Build" begin
+    A = poisson1d_csr(10)
+    Ac = to_csr(A)
+    smoother = Draugr.build_dilu_smoother(Ac)
+    @test smoother isa DILUSmoother
+    @test length(smoother.inv_diag) == 10
+    @test length(smoother.diag_idx) == 10
+    @test smoother.num_fwd_levels >= 2
+end
+
+@testset "DILU Smoother - Smoothing" begin
+    A = poisson1d_csr(10)
+    Ac = to_csr(A)
+    smoother = Draugr.build_dilu_smoother(Ac)
+    test_smoother_smoothing(smoother, Ac, A; steps=3)
+end
+
+@testset "DILU Smoother - AMG Solve" begin
+    test_amg_convergence(AMGConfig(smoother=DILUSmootherType()))
+end
+
+@testset "DILU Smoother - Resetup" begin
+    test_smoother_resetup(AMGConfig(smoother=DILUSmootherType()))
+end
+
+@testset "DILU - Anisotropic" begin
+    A = anisotropic_csr(8, 8)
+    N = 64
+    b = rand(N)
+    x = zeros(N)
+    config = AMGConfig(smoother=DILUSmootherType())
+    hierarchy = amg_setup(A, config)
+    x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+    r = b - sparse(A.At') * x
+    @test norm(r) / norm(b) < 1e-8
+end
+
+@testset "DILU - Reservoir-like" begin
+    A = reservoir_like_csr(50)
+    N = 50
+    b = rand(N)
+    x = zeros(N)
+    config = AMGConfig(smoother=DILUSmootherType())
+    hierarchy = amg_setup(A, config)
+    x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
+    r = b - sparse(A.At') * x
+    @test norm(r) / norm(b) < 1e-8
+end
+
+@testset "DILU build_smoother dispatch" begin
+    A = poisson1d_csr(10)
+    s = build_smoother(A, DILUSmootherType())
+    @test s isa DILUSmoother
+end
+
+@testset "DILU diagonal correctness" begin
+    # For a tridiagonal matrix A = [-1 2 -1], the DILU modified diagonal
+    # should differ from the original since lower neighbors contribute.
+    # d_i = a_{ii} - Σ_{j<i} a_{ij} * d_j^{-1} * a_{ji}
+    A = poisson1d_csr(5)
+    Ac = to_csr(A)
+    smoother = Draugr.build_dilu_smoother(Ac)
+    inv_diag = Array(smoother.inv_diag)
+    # Row 1: no lower neighbors, d_1 = 2.0
+    @test inv_diag[1] ≈ 1.0 / 2.0
+    # Row 2: d_2 = 2.0 - (-1)*(1/2)*(-1) = 2.0 - 0.5 = 1.5
+    @test inv_diag[2] ≈ 1.0 / 1.5
+    # Row 3: d_3 = 2.0 - (-1)*(1/1.5)*(-1) = 2.0 - 2/3 ≈ 1.333...
+    @test inv_diag[3] ≈ 1.0 / (2.0 - 1.0/1.5)
+    # Row 4: d_4 = 2.0 - (-1)*inv_diag[3]*(-1) = 2.0 - 1/d_3
+    d3 = 2.0 - 1.0/1.5
+    @test inv_diag[4] ≈ 1.0 / (2.0 - 1.0/d3)
+    # Row 5 (last, boundary): only one lower neighbor
+    d4 = 2.0 - 1.0/d3
+    @test inv_diag[5] ≈ 1.0 / (2.0 - 1.0/d4)
+end
+
+# ══════════════════════════════════════════════════════════════════════════
 # Standalone Smoother API
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -434,6 +573,12 @@ end
     # L1 Serial GS
     s10 = build_smoother(A, L1SerialGaussSeidelType())
     @test s10 isa L1SerialGaussSeidelSmoother
+    # GPU ILU0
+    s11 = build_smoother(A, GPUILU0SmootherType())
+    @test s11 isa GPUILU0Smoother
+    # DILU
+    s12 = build_smoother(A, DILUSmootherType())
+    @test s12 isa DILUSmoother
 end
 
 @testset "Standalone Smoother API - smooth! with StaticCSR" begin
@@ -461,7 +606,8 @@ end
     b = ones(10)
     for stype in [JacobiSmootherType(), SPAI0SmootherType(), L1JacobiSmootherType(),
                   ColoredGaussSeidelType(), L1ColoredGaussSeidelType(), ILU0SmootherType(), ChebyshevSmootherType(),
-                  SPAI1SmootherType(), SerialGaussSeidelType(), SerialILU0SmootherType(), L1SerialGaussSeidelType()]
+                  SPAI1SmootherType(), SerialGaussSeidelType(), SerialILU0SmootherType(), L1SerialGaussSeidelType(),
+                  GPUILU0SmootherType(), DILUSmootherType()]
         smoother = build_smoother(A, stype)
         x = zeros(10)
         smooth!(x, A, b, smoother; steps=10)

@@ -193,6 +193,8 @@ struct L1SerialGaussSeidelType <: SmootherType end
 struct ChebyshevSmootherType <: SmootherType end
 struct ILU0SmootherType <: SmootherType end
 struct SerialILU0SmootherType <: SmootherType end
+struct GPUILU0SmootherType <: SmootherType end
+struct DILUSmootherType <: SmootherType end
 
 # ── Abstract smoother ─────────────────────────────────────────────────────────
 abstract type AbstractSmoother end
@@ -386,6 +388,71 @@ mutable struct SerialILU0Smoother{Tv, Ti, Tx} <: AbstractSmoother
     diag_idx::Vector{Ti}      # index of diagonal in each row's nzrange
     tmp::Vector{Tx}           # workspace: element type Tx (SVector for block)
     A_cpu::CSRMatrix{Tv, Ti}  # CPU copy of A's structure for sequential triangular solves
+end
+
+"""
+    GPUILU0Smoother{Tv, Ti, Tx, Vnz, Vi, Vx}
+
+GPU-native ILU(0) smoother. Like the CPU `ILU0Smoother`, it computes an
+incomplete LU factorization with the same sparsity pattern as A, but the
+triangular solves are executed as KernelAbstractions kernels using level
+scheduling for parallelism, avoiding CPU↔GPU data copies during smoothing.
+
+`Tv` is the matrix/factorization entry type; `Ti` is the index type; `Tx` is
+the solution-vector element type. `Vnz`, `Vi`, and `Vx` are the matching
+`AbstractVector` subtypes (device-aware: can be CuVector, ROCArray, etc.).
+
+The factorization itself is always performed on CPU (sequential) and the
+resulting L/U values and level-scheduling data are then copied to the device.
+"""
+mutable struct GPUILU0Smoother{Tv, Ti, Tx,
+                                Vnz<:AbstractVector{Tv},
+                                Vi<:AbstractVector{Ti},
+                                Vx<:AbstractVector{Tx}} <: AbstractSmoother
+    L_nzval::Vnz              # strictly lower triangle values (device)
+    U_nzval::Vnz              # upper triangle + diagonal values (device)
+    diag_idx::Vi              # index of diagonal in each row's nzrange (device)
+    fwd_order::Vi             # rows sorted by forward level (device)
+    bwd_order::Vi             # rows sorted by backward level (device)
+    level_offsets::Vector{Int} # [fwd_offsets..., bwd_offsets...] concatenated (CPU, for loop control)
+    num_fwd_levels::Int       # number of forward levels
+    tmp::Vx                   # workspace: element type Tx (device)
+    A_cpu::CSRMatrix{Tv, Ti}  # CPU copy of A's structure for re-factorization
+end
+
+"""
+    DILUSmoother{Tv, Ti, Tx, Vnz, Vi, Vx}
+
+Diagonal Incomplete LU (DILU) smoother. Approximates A ≈ (D+L)*D⁻¹*(D+U) where
+D is a modified diagonal, and L, U are the strict lower/upper parts of A with
+original values. Only the modified diagonal needs to be stored — the off-diagonal
+entries come directly from the matrix.
+
+The factorization computes a modified diagonal:
+  d_i = a_{ii} - Σ_{j<i, (i,j) ∈ sparsity} a_{ij} * d_j⁻¹ * a_{ji}
+
+This is much cheaper and uses less memory than full ILU(0) since only a diagonal
+vector is stored instead of full L and U arrays.
+
+Triangular solves are executed as KernelAbstractions kernels using level
+scheduling for parallelism.
+
+`Tv` is the matrix entry type; `Ti` is the index type; `Tx` is the
+solution-vector element type. `Vnz`, `Vi`, and `Vx` are device-aware
+AbstractVector subtypes.
+"""
+mutable struct DILUSmoother{Tv, Ti, Tx,
+                             Vnz<:AbstractVector{Tv},
+                             Vi<:AbstractVector{Ti},
+                             Vx<:AbstractVector{Tx}} <: AbstractSmoother
+    inv_diag::Vnz             # inverse of modified diagonal d⁻¹ (device, n entries)
+    diag_idx::Vi              # index of diagonal in each row's nzrange (device)
+    fwd_order::Vi             # rows sorted by forward level (device)
+    bwd_order::Vi             # rows sorted by backward level (device)
+    level_offsets::Vector{Int} # [fwd_offsets..., bwd_offsets...] concatenated (CPU, for loop control)
+    num_fwd_levels::Int       # number of forward levels
+    tmp::Vx                   # workspace: element type Tx (device)
+    A_cpu::CSRMatrix{Tv, Ti}  # CPU copy of A's structure for re-factorization
 end
 
 # ── Prolongation info (stored implicitly) ─────────────────────────────────────

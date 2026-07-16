@@ -2380,16 +2380,22 @@ The formula is: P[k] = -numerator / d_i where:
             numerator = zero(eltype(A_nzval))
             target_col = target_p_col[k]  # The coarse column this P entry interpolates to
             
-            # Direct contribution: A[i,J] if J is a direct strong coarse neighbor
-            direct_idx = extd_direct_a_idx[k]
-            if direct_idx > 0
-                numerator += A_nzval[direct_idx]
-            end
-            
-            # Compute base denominator (diagonal + weak connections)
+            # Compute base denominator (diagonal + weak connections) first so that
+            # its sign is available for filtering the direct contribution below.
             d_i = zero(eltype(A_nzval))
             for j in extd_d_base_offsets[k]:(extd_d_base_offsets[k+1]-1)
                 d_i += A_nzval[extd_d_base_entries[j]]
+            end
+            
+            # Direct contribution: only include when the sign is opposite to d_i.
+            # A sign flip relative to initial setup means the connection is no longer
+            # a valid coarse interpolant; skip it to avoid corrupting P.
+            direct_idx = extd_direct_a_idx[k]
+            if direct_idx > 0
+                a_direct = A_nzval[direct_idx]
+                if real(d_i) * real(a_direct) < zero(real(eltype(A_nzval)))
+                    numerator += a_direct
+                end
             end
             
             # Indirect contributions through fine neighbors
@@ -2682,6 +2688,7 @@ function _update_P_extendedi!(P::ProlongationOp{Ti, Tv}, A::CSRMatrix{Tv, Ti},
     coarse_map = P_update_map.coarse_map
     sn_offsets = P_update_map.strong_nbrs_offsets
     sn_data = P_update_map.strong_nbrs_cols
+    diag_nz_idx = P_update_map.diag_nz_idx
     
     n_fine = length(cf)
     cv = colvals(A_cpu)
@@ -2763,6 +2770,9 @@ function _update_P_extendedi!(P::ProlongationOp{Ti, Tv}, A::CSRMatrix{Tv, Ti},
             P_data_buf[idx] = zero(Tv)
         end
         diagonal = zero(Tv)
+        # Diagonal value for sign-checking direct C-hat contributions.
+        diag_idx_i = Int(diag_nz_idx[i])
+        diag_i = diag_idx_i > 0 ? nzv[diag_idx_i] : zero(Tv)
         
         for nz in nzrange(A_cpu, i)
             j = cv[nz]
@@ -2775,7 +2785,10 @@ function _update_P_extendedi!(P::ProlongationOp{Ti, Tv}, A::CSRMatrix{Tv, Ti},
             
             p_idx = P_marker[j]
             if p_idx >= 0
-                P_data_buf[p_idx + 1] += a_ij
+                # Only add if sign is opposite to diagonal (skip sign-flipped contributions).
+                if iszero(diag_i) || real(diag_i) * real(a_ij) < 0
+                    P_data_buf[p_idx + 1] += a_ij
+                end
             elseif p_idx == strong_f_marker
                 diag_j = zero(Tv)
                 for nz3 in nzrange(A_cpu, j)

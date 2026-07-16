@@ -1069,9 +1069,16 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
     # ══════════════════════════════════════════════════════════════════════════
 
     # Build strength-based CSR structure for determining C-hat.
-    sn_offsets = Vector{Int}(undef, n_fine + 1)
-    sn_data = Int[]
-    sizehint!(sn_data, nnz(A); shrink=false)
+    if setup_workspace !== nothing
+        sn_offsets = _ws_resize!(setup_workspace.strong_nbrs_offsets, n_fine + 1)
+        sn_data = setup_workspace.strong_nbrs_data
+        empty!(sn_data)
+        sizehint!(sn_data, nnz(A); shrink=false)
+    else
+        sn_offsets = Vector{Int}(undef, n_fine + 1)
+        sn_data = Int[]
+        sizehint!(sn_data, nnz(A); shrink=false)
+    end
     
     # Count strong neighbors per row
     @inbounds begin
@@ -1131,23 +1138,34 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
         sizehint!(S_p, nnz_hint; shrink=false)
     end
 
+    old_extd_pmap = setup_workspace !== nothing ? setup_workspace.old_P_update_map : nothing
+    reuse_extd_workspace = old_extd_pmap !== nothing && old_extd_pmap.interp_type == 3
+
     # Pre-allocate workspace for C-hat indices (avoid per-row allocations)
-    # Estimate max C-hat size from max strong neighbors * 2 (distance-2)
-    max_chat_est = 0
-    for i in 1:n_fine
-        if cf[i] == -1
-            count = Int(sn_offsets[i + 1] - sn_offsets[i]) * 2
-            max_chat_est = max(max_chat_est, count)
+    # Reuse the previous Extended+i buffers on full resetup when available.
+    if reuse_extd_workspace
+        max_chat_est = max(length(old_extd_pmap.chat_indices), 1)
+        chat_indices = resize!(old_extd_pmap.chat_indices, 0)
+    else
+        max_chat_est = 0
+        for i in 1:n_fine
+            if cf[i] == -1
+                count = Int(sn_offsets[i + 1] - sn_offsets[i]) * 2
+                max_chat_est = max(max_chat_est, count)
+            end
         end
+        max_chat_est = max(max_chat_est, 1)
+        chat_indices = Int[]
     end
-    max_chat_est = max(max_chat_est, 1)
-    chat_indices = Int[]
     sizehint!(chat_indices, max_chat_est; shrink=false)
 
     # Pre-allocate workspace arrays for weight computation (avoid per-row allocations)
-    P_data_ws = zeros(Tv, max_chat_est)
+    if reuse_extd_workspace
+        P_data_ws = resize!(old_extd_pmap.P_data, max_chat_est)
+    else
+        P_data_ws = Vector{Tv}(undef, max_chat_est)
+    end
     keep_ws = Vector{Int}(undef, max_chat_est)
-    kept_flags = Vector{Bool}(undef, max_chat_est)
 
     # Build sparsity pattern and compute initial values
     @inbounds for i in 1:n_fine
@@ -1203,7 +1221,6 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
         if n_chat > length(P_data_ws)
             resize!(P_data_ws, n_chat)
             resize!(keep_ws, n_chat)
-            resize!(kept_flags, n_chat)
         end
         for idx in 1:n_chat
             P_data_ws[idx] = zero(Tv)
@@ -1679,8 +1696,8 @@ function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
             strong_nbrs_cols,
             strong_nbrs_nz,
             fill(-1, n_fine),              # P_marker
-            Vector{Int}(undef, max_chat),  # chat_indices buffer
-            Vector{Tv}(undef, max_chat),   # P_data buffer
+            resize!(chat_indices, max_chat),  # chat_indices buffer
+            resize!(P_data_ws, max_chat),     # P_data buffer
             # GPU kernel data for Standard (10 fields, empty for Extended+i)
             Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[], Ti[],
             # GPU kernel data for Extended+i (13 fields) — reused arrays, no copy needed

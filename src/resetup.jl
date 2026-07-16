@@ -38,6 +38,7 @@ function amg_resetup!(hierarchy::AMGHierarchy{Tv, Ti},
             return hierarchy
         end
         level1 = hierarchy.levels[1]
+        _validate_partial_resetup(hierarchy, A_new)
         _copy_nzvals!(level1.A, A_new; backend=backend, block_size=block_size)
         
         if update_P
@@ -102,6 +103,20 @@ function amg_resetup!(hierarchy::AMGHierarchy{Tv, Ti},
                       update_P::Bool=false) where {Tv, Ti}
     A_csr = csr_from_csc(A_new)
     return amg_resetup!(hierarchy, A_csr, config; partial=partial, update_P=update_P)
+end
+
+function _validate_partial_resetup(hierarchy::AMGHierarchy, A_new::CSRMatrix)
+    levels = hierarchy.levels
+    isempty(levels) && return hierarchy
+    if !has_same_sparsity_pattern(levels[1].A, A_new)
+        throw(ArgumentError("partial resetup requires the new matrix to have the same CSR sparsity pattern as the finest AMG level; use partial=false for a full rebuild"))
+    end
+    for lvl in 1:(length(levels) - 1)
+        if levels[lvl].R_map === nothing
+            throw(ArgumentError("partial resetup requires precomputed restriction maps on every non-coarsest level; rebuild with allow_partial_resetup=true or use partial=false"))
+        end
+    end
+    return hierarchy
 end
 
 """

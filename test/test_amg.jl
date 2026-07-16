@@ -125,6 +125,13 @@ end
     end
 end
 
+@testset "AMG Resetup Rejects Pattern Changes" begin
+    A = poisson2d_csr(8)
+    hierarchy = amg_setup(A, AMGConfig(coarsening=AggregationCoarsening()))
+    A_new = poisson2d_csr(9)
+    @test_throws ArgumentError amg_resetup!(hierarchy, A_new)
+end
+
 @testset "AMG Setup - allow_partial_resetup=false" begin
     n = 10
     A = poisson2d_csr(n)
@@ -372,6 +379,24 @@ end
     x, niter = amg_solve!(x, b, hierarchy, config; tol=1e-8, maxiter=200)
     r = b - sparse(A.At') * x
     @test norm(r) / norm(b) < 1e-8
+end
+
+@testset "AMG Resetup - full resetup reuses ExtendedI buffers" begin
+    A = poisson2d_csr(10)
+    config = AMGConfig(coarsening=HMISCoarsening(0.5, ExtendedIInterpolation()))
+    hierarchy = amg_setup(A, config)
+    extd_levels = [lvl for lvl in hierarchy.levels if lvl.P_update_map !== nothing && lvl.P_update_map.interp_type == 3]
+    if !isempty(extd_levels)
+        old_chat = extd_levels[1].P_update_map.chat_indices
+        old_pdata = extd_levels[1].P_update_map.P_data
+        nonzeros(A) .*= 1.5
+        amg_resetup!(hierarchy, A, config; partial=false)
+
+        new_extd_levels = [lvl for lvl in hierarchy.levels if lvl.P_update_map !== nothing && lvl.P_update_map.interp_type == 3]
+        @test !isempty(new_extd_levels)
+        @test new_extd_levels[1].P_update_map.chat_indices === old_chat
+        @test new_extd_levels[1].P_update_map.P_data === old_pdata
+    end
 end
 
 @testset "AMG Resetup - update_P does not impact Aggregation" begin

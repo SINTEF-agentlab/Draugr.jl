@@ -53,6 +53,23 @@ colvals(A::CSRMatrix) = A.colval
 rowptr(A::CSRMatrix) = A.rowptr
 
 """
+    has_same_sparsity_pattern(A, B)
+
+Return `true` when two CSR matrices have the same dimensions and identical CSR
+structure (`rowptr` and `colval`), ignoring the numerical values.
+"""
+function has_same_sparsity_pattern(A::CSRMatrix, B::CSRMatrix)
+    size(A) == size(B) || return false
+    length(A.rowptr) == length(B.rowptr) || return false
+    length(A.colval) == length(B.colval) || return false
+    rp_a = A.rowptr isa Array ? A.rowptr : Array(A.rowptr)
+    rp_b = B.rowptr isa Array ? B.rowptr : Array(B.rowptr)
+    cv_a = A.colval isa Array ? A.colval : Array(A.colval)
+    cv_b = B.colval isa Array ? B.colval : Array(B.colval)
+    return rp_a == rp_b && cv_a == cv_b
+end
+
+"""
     csr_to_cpu(A::CSRMatrix) -> CSRMatrix
 
 Convert a CSRMatrix with GPU arrays to a CSRMatrix with CPU arrays.

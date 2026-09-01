@@ -4,6 +4,7 @@ using SparseArrays
 using LinearAlgebra
 using Random
 using KernelAbstractions
+using KernelAbstractions: @atomic
 using Printf
 
 # Default backend for KernelAbstractions

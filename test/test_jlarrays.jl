@@ -70,6 +70,21 @@
         @test A_csr.nzval isa JLArray
     end
 
+    @testset "PMIS graph analysis stays on the device" begin
+        A_jl = poisson2d_jl(10)
+        A_csr = csr_from_gpu(A_jl)
+        # This exercises the KA PMIS path.  It returns the final O(n) C/F
+        # classification to the host for the current symbolic P builder, but
+        # leaves the fine CSR matrix resident on the JLArrays backend.
+        cf, coarse_map, n_coarse = Draugr.coarsen_pmis(
+            A_csr, 0.25; backend=JLBackend(), strength_type=SignedStrength())
+        @test length(cf) == size(A_csr, 1)
+        @test n_coarse == count(==(1), cf)
+        @test all(i -> cf[i] == 1 ? coarse_map[i] > 0 : coarse_map[i] == 0,
+                  eachindex(cf))
+        @test A_csr.nzval isa JLArray
+    end
+
     @testset "AMG setup with JLSparseMatrixCSR" begin
         A_jl = poisson1d_jl(100)
         config = AMGConfig()

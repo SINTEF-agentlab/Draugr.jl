@@ -295,6 +295,164 @@ function _compute_strong_transpose_count(A::CSRMatrix{Tv, Ti}, is_strong::Abstra
     return st_count
 end
 
+# ── Device PMIS coarsening ──────────────────────────────────────────────────
+#
+# The reference PMIS implementation below mirrors HYPRE's host algorithm.  Its
+# linked-list graph traversal is deliberately serial, however, and used to
+# force a complete device-to-host copy during setup.  The kernels here implement
+# the same *maximal independent set* invariant without that host traversal:
+# every iteration selects independent local maxima, promotes them to C points,
+# and marks their strong neighbours F.  The only host synchronisation is a
+# single scalar convergence check per MIS round.  This makes the expensive
+# graph passes (and the input CSR data) device resident.
+
+@kernel function _pmis_transpose_count_kernel!(st_count, @Const(is_strong),
+                                                @Const(colval), @Const(rowptr))
+    i = @index(Global)
+    @inbounds for nz in rowptr[i]:(rowptr[i + 1] - 1)
+        j = colval[nz]
+        if j != i && is_strong[nz]
+            @atomic st_count[j] += one(eltype(st_count))
+        end
+    end
+end
+
+@kernel function _pmis_initialize_kernel!(cf, priority, @Const(st_count),
+                                           @Const(is_strong), @Const(colval),
+                                           @Const(rowptr), n)
+    i = @index(Global)
+    @inbounds begin
+        has_strong_out = false
+        for nz in rowptr[i]:(rowptr[i + 1] - 1)
+            has_strong_out |= colval[nz] != i && is_strong[nz]
+        end
+        # A unique, deterministic fractional tie-breaker avoids a global RNG
+        # and guarantees progress for every connected component.
+        priority[i] = eltype(priority)(st_count[i]) +
+                      (eltype(priority)(n - i + 1) / eltype(priority)(n + 1))
+        cf[i] = has_strong_out ? zero(eltype(cf)) : -one(eltype(cf))
+    end
+end
+
+@kernel function _pmis_select_kernel!(selected, @Const(cf), @Const(priority),
+                                       @Const(is_strong), @Const(colval),
+                                       @Const(rowptr))
+    i = @index(Global)
+    @inbounds begin
+        if cf[i] != 0
+            selected[i] = false
+        else
+            mine = priority[i]
+            is_max = true
+            for nz in rowptr[i]:(rowptr[i + 1] - 1)
+                j = colval[nz]
+                if j != i && is_strong[nz] && cf[j] == 0 && priority[j] > mine
+                    is_max = false
+                    break
+                end
+            end
+            selected[i] = is_max
+        end
+    end
+end
+
+@kernel function _pmis_finalize_kernel!(cf, @Const(selected))
+    i = @index(Global)
+    @inbounds selected[i] && (cf[i] = one(eltype(cf)))
+end
+
+@kernel function _pmis_mark_fine_kernel!(cf, @Const(is_strong), @Const(colval),
+                                          @Const(rowptr))
+    i = @index(Global)
+    @inbounds begin
+        if cf[i] == 0
+            for nz in rowptr[i]:(rowptr[i + 1] - 1)
+                j = colval[nz]
+                if j != i && is_strong[nz] && cf[j] == 1
+                    cf[i] = -one(eltype(cf))
+                    break
+                end
+            end
+        end
+    end
+end
+
+@kernel function _pmis_count_undecided_kernel!(count, @Const(cf))
+    i = @index(Global)
+    @inbounds if cf[i] == 0
+        @atomic count[1] += one(eltype(count))
+    end
+end
+
+@kernel function _pmis_force_fine_kernel!(cf)
+    i = @index(Global)
+    @inbounds cf[i] == 0 && (cf[i] = -one(eltype(cf)))
+end
+
+"""
+    _coarsen_pmis_device(A, θ, strength_type) -> (cf, coarse_map, n_coarse, is_strong)
+
+Portable KernelAbstractions PMIS analysis for device-backed CSR matrices.  The
+returned C/F split and coarse map are copied to host only because the current
+symbolic interpolation builder still owns variable-length CSR construction on
+the host.  In particular, `A.rowptr`, `A.colval`, and `A.nzval` are never copied
+to host by this routine.
+"""
+function _coarsen_pmis_device(A::CSRMatrix{Tv, Ti}, θ::Real,
+                              strength_type::StrengthType;
+                              backend=_get_backend(nonzeros(A)),
+                              block_size::Int=64) where {Tv, Ti}
+    n = size(A, 1)
+    is_strong = strength_graph(A, θ, strength_type; backend=backend, block_size=block_size)
+    st_count = KernelAbstractions.zeros(backend, Int, n)
+    cf_dev = KernelAbstractions.zeros(backend, Int, n)
+    priority = KernelAbstractions.allocate(backend, Float64, n)
+    selected = KernelAbstractions.zeros(backend, Bool, n)
+
+    count_kernel! = _pmis_transpose_count_kernel!(backend, block_size)
+    count_kernel!(st_count, is_strong, colvals(A), rowptr(A); ndrange=n)
+    _synchronize(backend)
+
+    init_kernel! = _pmis_initialize_kernel!(backend, block_size)
+    init_kernel!(cf_dev, priority, st_count, is_strong, colvals(A), rowptr(A), n;
+                 ndrange=n)
+    _synchronize(backend)
+
+    select_kernel! = _pmis_select_kernel!(backend, block_size)
+    finalize_kernel! = _pmis_finalize_kernel!(backend, block_size)
+    mark_fine_kernel! = _pmis_mark_fine_kernel!(backend, block_size)
+    count_undecided_kernel! = _pmis_count_undecided_kernel!(backend, block_size)
+    pending = KernelAbstractions.zeros(backend, Int, 1)
+
+    # A maximal independent-set round decides at least one point in every
+    # nonempty component.  The n bound is a safety net for malformed graphs.
+    for _ in 1:n
+        select_kernel!(selected, cf_dev, priority, is_strong, colvals(A), rowptr(A); ndrange=n)
+        finalize_kernel!(cf_dev, selected; ndrange=n)
+        mark_fine_kernel!(cf_dev, is_strong, colvals(A), rowptr(A); ndrange=n)
+        fill!(pending, 0)
+        count_undecided_kernel!(pending, cf_dev; ndrange=n)
+        _synchronize(backend)
+        Array(pending)[1] == 0 && break
+    end
+    force_fine_kernel! = _pmis_force_fine_kernel!(backend, block_size)
+    force_fine_kernel!(cf_dev; ndrange=n)
+    _synchronize(backend)
+
+    # The remaining setup code uses dynamically-sized CSR structures.  Keep
+    # this boundary explicit and transfer only O(n) classification data.
+    cf = Array(cf_dev)
+    coarse_map = zeros(Int, n)
+    n_coarse = 0
+    @inbounds for i in 1:n
+        if cf[i] == 1
+            n_coarse += 1
+            coarse_map[i] = n_coarse
+        end
+    end
+    return cf, coarse_map, n_coarse, is_strong
+end
+
 """
     coarsen_pmis(A, θ; rng=Random.default_rng())
 
@@ -314,6 +472,20 @@ function coarsen_pmis(A_in::CSRMatrix{Tv, Ti}, θ::Real;
     n = size(A_in, 1)
     if n <= 1
         return ones(Int, n), collect(1:n), n
+    end
+    # Keep the graph analysis on the input device.  The following interpolation
+    # stage still has a host-only symbolic CSR builder, but this avoids copying
+    # the fine matrix merely to perform PMIS.
+    if !(nonzeros(A_in) isa Array)
+        cf, coarse_map, n_coarse, is_strong_dev = _coarsen_pmis_device(
+            A_in, θ, strength_type; backend=backend, block_size=block_size)
+        if setup_workspace !== nothing
+            nnz_A = nnz(A_in)
+            is_strong = Array(is_strong_dev)
+            _ws_resize!(setup_workspace.is_strong, nnz_A)
+            copyto!(setup_workspace.is_strong, 1, is_strong, 1, nnz_A)
+        end
+        return cf, coarse_map, n_coarse
     end
     # Compute strength on GPU if available, then convert to CPU for graph algorithms
     is_strong_raw = strength_graph(A_in, θ, strength_type; backend=backend, block_size=block_size,

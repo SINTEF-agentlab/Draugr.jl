@@ -37,15 +37,15 @@ end
 """
     amg_resetup!(hierarchy, A_new::JLSparseMatrixCSR, config; partial=true, update_P=false)
 
-AMG resetup accepting a JLArrays sparse CSR matrix. Converts to a CPU
-`CSRMatrix` and forwards to the main `CSRMatrix`-based resetup.
+AMG resetup accepting a JLArrays sparse CSR matrix. Keeps the CSR arrays on
+the device and forwards to the main `CSRMatrix`-based resetup.
 """
 function Draugr.amg_resetup!(hierarchy::AMGHierarchy{Tv, Ti},
                                   A_new::JLSparseMatrixCSR{Tv, Ti},
                                   config::AMGConfig=AMGConfig();
                                   partial::Bool=true,
                                   update_P::Bool=false) where {Tv, Ti}
-    A_csr = Draugr.csr_to_cpu(Draugr.csr_from_gpu(A_new))
+    A_csr = Draugr.csr_from_gpu(A_new)
     return Draugr.amg_resetup!(hierarchy, A_csr, config; partial=partial, update_P=update_P)
 end
 

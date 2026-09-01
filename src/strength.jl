@@ -30,7 +30,10 @@ function strength_graph(A::CSRMatrix{Tv, Ti}, θ::Real, ::AbsoluteStrength;
     cv = colvals(A)
     rp = rowptr(A)
     be = _get_backend(nzv)
-    if is_strong === nothing
+    # Host setup workspaces cannot be captured by a device kernel.  Reuse an
+    # explicitly supplied buffer only when it lives on the same side of the
+    # host/device boundary as A; otherwise allocate a backend-native mask.
+    if is_strong === nothing || ((nzv isa Array) != (is_strong isa Array))
         is_strong_buf = KernelAbstractions.zeros(be, Bool, nnz(A))
     else
         _ws_resize!(is_strong, nnz(A))
@@ -91,7 +94,8 @@ function strength_graph(A::CSRMatrix{Tv, Ti}, θ::Real, ::SignedStrength;
     cv = colvals(A)
     rp = rowptr(A)
     be = _get_backend(nzv)
-    if is_strong === nothing
+    # See the corresponding AbsoluteStrength implementation above.
+    if is_strong === nothing || ((nzv isa Array) != (is_strong isa Array))
         is_strong_buf = KernelAbstractions.zeros(be, Bool, nnz(A))
     else
         _ws_resize!(is_strong, nnz(A))
@@ -196,10 +200,43 @@ matrix used in the solve.
 
 Returns a new matrix with the same sparsity pattern but modified coefficients.
 """
+@kernel function _apply_max_row_sum_kernel!(nzval_new, @Const(nzval_old),
+                                             @Const(colval), @Const(rowptr),
+                                             threshold)
+    i = @index(Global)
+    @inbounds begin
+        diagonal = zero(eltype(nzval_old))
+        row_sum = zero(eltype(nzval_old))
+        for nz in rowptr[i]:(rowptr[i + 1] - 1)
+            value = nzval_old[nz]
+            row_sum += value
+            if colval[nz] == i
+                diagonal = value
+            end
+        end
+        weaken = abs(diagonal) >= eps(real(eltype(nzval_old))) &&
+                 abs(row_sum) > abs(diagonal) * threshold && threshold < one(threshold)
+        for nz in rowptr[i]:(rowptr[i + 1] - 1)
+            nzval_new[nz] = weaken && colval[nz] != i ? zero(eltype(nzval_new)) : nzval_old[nz]
+        end
+    end
+end
+
 function _apply_max_row_sum(A::CSRMatrix{Tv, Ti}, threshold::Real) where {Tv, Ti}
     n = size(A, 1)
     cv = colvals(A)
     nzv_old = nonzeros(A)
+    # Avoid scalar indexing and a full host copy during device setup.  Only the
+    # numerical values change, so rowptr and colval can be shared safely.
+    if !(nzv_old isa Array)
+        backend = _get_backend(nzv_old)
+        nzv_new = KernelAbstractions.allocate(backend, Tv, length(nzv_old))
+        kernel! = _apply_max_row_sum_kernel!(backend, A.block_size)
+        kernel!(nzv_new, nzv_old, cv, rowptr(A), real(Tv)(threshold); ndrange=n)
+        _synchronize(backend)
+        return CSRMatrix(A.rowptr, A.colval, nzv_new, A.nrow, A.ncol;
+                         block_size=A.block_size, backend=A.backend)
+    end
     nzv_new = copy(nzv_old)
     rp = rowptr(A)
     @inbounds for i in 1:n

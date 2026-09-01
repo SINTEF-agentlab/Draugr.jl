@@ -31,6 +31,73 @@ O(ntriples)).
 The RestrictionMap groups triples by their destination coarse NZ index so that
 `galerkin_product!` can parallelize over coarse NZ entries without atomics.
 """
+@kernel function _device_dense_csr_pattern_kernel!(rowptr_c, colval_c, n_coarse)
+    I = @index(Global)
+    @inbounds begin
+        rowptr_c[I] = (I - 1) * n_coarse + one(eltype(rowptr_c))
+        I == n_coarse && (rowptr_c[I + 1] = I * n_coarse + one(eltype(rowptr_c)))
+        base = (I - 1) * n_coarse
+        for J in 1:n_coarse
+            colval_c[base + J] = J
+        end
+    end
+end
+
+@kernel function _device_galerkin_dense_kernel!(nzval_c, @Const(a_rowptr),
+                                                 @Const(a_colval), @Const(a_nzval),
+                                                 @Const(p_rowptr), @Const(p_colval),
+                                                 @Const(p_nzval), @Const(pt_offsets),
+                                                 @Const(pt_rows), @Const(pt_nz_idx),
+                                                 n_coarse)
+    I = @index(Global)
+    @inbounds begin
+        base = (I - 1) * n_coarse
+        for J in 1:n_coarse
+            nzval_c[base + J] = zero(eltype(nzval_c))
+        end
+        for ptr in pt_offsets[I]:(pt_offsets[I + 1] - 1)
+            i = pt_rows[ptr]
+            pi = p_nzval[pt_nz_idx[ptr]]
+            for anz in a_rowptr[i]:(a_rowptr[i + 1] - 1)
+                j = a_colval[anz]
+                aij = a_nzval[anz]
+                for pnz in p_rowptr[j]:(p_rowptr[j + 1] - 1)
+                    J = p_colval[pnz]
+                    nzval_c[base + J] += pi * aij * p_nzval[pnz]
+                end
+            end
+        end
+    end
+end
+
+"""
+    _compute_coarse_sparsity_device(A_fine, P, Pt_map, n_coarse)
+
+Backend-neutral device Galerkin fallback. It builds a dense CSR pattern and
+forms each coarse row in a KA kernel, keeping all arrays on the selected
+backend. Native sparse backends (CUDA cuSPARSE) specialize the public method
+with a compact SpGEMM result instead. This fallback is primarily for portable
+KA backends and correctness testing, not the preferred large-problem format.
+"""
+function _compute_coarse_sparsity_device(A_fine::CSRMatrix{Tv, Ti},
+                                          P::ProlongationOp{Ti, Tv},
+                                          Pt_map::TransposeMap,
+                                          n_coarse::Int;
+                                          backend=_get_backend(nonzeros(A_fine)),
+                                          block_size::Int=64) where {Tv, Ti}
+    nnz_c = n_coarse * n_coarse
+    rowptr_c = KernelAbstractions.allocate(backend, Ti, n_coarse + 1)
+    colval_c = KernelAbstractions.allocate(backend, Ti, nnz_c)
+    nzval_c = KernelAbstractions.allocate(backend, Tv, nnz_c)
+    _device_dense_csr_pattern_kernel!(backend, block_size)(rowptr_c, colval_c, n_coarse;
+        ndrange=n_coarse)
+    _device_galerkin_dense_kernel!(backend, block_size)(nzval_c, rowptr(A_fine), colvals(A_fine),
+        nonzeros(A_fine), P.rowptr, P.colval, P.nzval, Pt_map.offsets,
+        Pt_map.fine_rows, Pt_map.p_nz_idx, n_coarse; ndrange=n_coarse)
+    _synchronize(backend)
+    return CSRMatrix(rowptr_c, colval_c, nzval_c, n_coarse, n_coarse), nothing
+end
+
 function compute_coarse_sparsity(A_fine::CSRMatrix{Tv, Ti},
                                  P::ProlongationOp{Ti, Tv},
                                  Pt_map::TransposeMap,
@@ -39,6 +106,10 @@ function compute_coarse_sparsity(A_fine::CSRMatrix{Tv, Ti},
                                  workspace::Union{Nothing, GalerkinWorkspace{Tv, Ti}}=nothing,
                                  old_A_coarse::Union{Nothing, CSRMatrix}=nothing,
                                  old_r_map::Union{Nothing, RestrictionMap}=nothing) where {Tv, Ti}
+    if !(P.nzval isa Array)
+        return _compute_coarse_sparsity_device(A_fine, P, Pt_map, n_coarse;
+            backend=_get_backend(nonzeros(A_fine)), block_size=A_fine.block_size)
+    end
     n_fine = size(A_fine, 1)
     cv_a = colvals(A_fine)
     nzv_a = nonzeros(A_fine)

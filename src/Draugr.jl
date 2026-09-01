@@ -55,6 +55,17 @@ This is a generic function extended by GPU backend extensions (CUDA, Metal).
 function csr_from_gpu end
 
 """
+    _device_cf_prolongation(A, alg, config; kwargs...) -> Union{Nothing, Tuple}
+
+Optional backend hook for building a CF-splitting prolongation entirely on a
+device. Backends with a native sparse implementation extend this function and
+return `(P, n_coarse, P_update_map)`; the default keeps the portable symbolic
+builder as the fallback.
+"""
+function _device_cf_prolongation end
+_device_cf_prolongation(A, alg, config; kwargs...) = nothing
+
+"""
     csr_from_static(A)
 
 Convert a `StaticSparsityMatrixCSR` (Jutul) to the internal `CSRMatrix`.

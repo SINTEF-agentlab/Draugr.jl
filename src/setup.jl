@@ -226,7 +226,6 @@ function _build_levels!(levels::Vector{AMGLevel{Tv, Ti}},
         P, n_coarse, P_update_map = _coarsen_with_fallback(A_current, coarsening_alg, config; backend=backend, block_size=block_size, setup_workspace=setup_workspace, build_P_update_map=build_P_update_map)
         n_coarse >= n && break
         n_coarse == 0 && break
-        A_cpu = csr_to_cpu(A_current)
         # Get old A_coarse for array reuse (stored as next level's A, CPU only)
         old_A_coarse = nothing
         old_r_map = nothing
@@ -243,13 +242,23 @@ function _build_levels!(levels::Vector{AMGLevel{Tv, Ti}},
         end
         # Build transpose map first — needed by compute_coarse_sparsity to
         # iterate by coarse row (P^T structure)
-        Pt_map = build_transpose_map(P)
-        A_coarse, r_map = compute_coarse_sparsity(A_cpu, P, Pt_map, n_coarse; build_restriction_map=allow_partial_resetup, workspace=galerkin_workspace, old_A_coarse=old_A_coarse, old_r_map=old_r_map)
+        device_symbolic = is_gpu && !(P.nzval isa Array)
+        if device_symbolic
+            Pt_map = build_transpose_map(P)
+            A_coarse, r_map = compute_coarse_sparsity(A_current, P, Pt_map, n_coarse;
+                build_restriction_map=false, workspace=nothing)
+        else
+            A_cpu = csr_to_cpu(A_current)
+            Pt_map = build_transpose_map(P)
+            A_coarse, r_map = compute_coarse_sparsity(A_cpu, P, Pt_map, n_coarse;
+                build_restriction_map=allow_partial_resetup, workspace=galerkin_workspace,
+                old_A_coarse=old_A_coarse, old_r_map=old_r_map)
+        end
         # P_update_map is now returned directly from _coarsen_with_fallback
         if is_gpu
-            A_dev = _csr_to_device(A_ref, A_cpu)
-            P_dev = _prolongation_to_device(A_ref, P)
-            Pt_map_dev = _transpose_map_to_device(A_ref, Pt_map)
+            A_dev = device_symbolic ? A_current : _csr_to_device(A_ref, A_cpu)
+            P_dev = device_symbolic ? P : _prolongation_to_device(A_ref, P)
+            Pt_map_dev = device_symbolic ? Pt_map : _transpose_map_to_device(A_ref, Pt_map)
             r_map_dev = r_map === nothing ? nothing : _restriction_map_to_device(A_ref, r_map)
             P_update_map_dev = P_update_map === nothing ? nothing : _prolongation_update_map_to_device(A_ref, P_update_map)
             smoother = build_smoother(A_dev, config.smoother, config.jacobi_omega; backend=backend, block_size=block_size)
@@ -285,16 +294,15 @@ function _build_coarse_solver(A_current::CSRMatrix{Tv}, A_ref::CSRMatrix,
     is_gpu = !(A_ref.nzval isa Array)
     n_coarse = size(A_current, 1)
     if is_gpu
-        A_cpu = csr_to_cpu(A_current)
-        coarse_cpu = Matrix{Tv}(undef, n_coarse, n_coarse)
-        _csr_to_dense!(coarse_cpu, A_cpu)
         if config.coarse_solve_on_cpu
-            coarse_dense = coarse_cpu
+            A_cpu = csr_to_cpu(A_current)
+            coarse_dense = Matrix{Tv}(undef, n_coarse, n_coarse)
+            _csr_to_dense!(coarse_dense, A_cpu)
             coarse_factor = _safe_lu(coarse_dense)
         else
-            coarse_dev = _allocate_dense_matrix(A_ref, Tv, n_coarse, n_coarse)
-            copyto!(coarse_dev, coarse_cpu)
-            coarse_dense, coarse_factor = _build_coarse_lu(coarse_dev)
+            coarse_dense = _allocate_dense_matrix(A_ref, Tv, n_coarse, n_coarse)
+            _csr_to_dense!(coarse_dense, A_current; backend=backend, block_size=block_size)
+            coarse_dense, coarse_factor = _build_coarse_lu(coarse_dense)
         end
         coarse_x = similar(coarse_dense, Tv, n_coarse)
         fill!(coarse_x, zero(Tv))
@@ -379,6 +387,14 @@ function _coarsen_and_build_P(A::CSRMatrix, alg::CoarseningAlgorithm,
                               setup_workspace=nothing,
                               build_P_update_map::Bool=false)
     if uses_cf_splitting(alg)
+        # CUDA extends this hook for PMIS + DirectInterpolation. It builds
+        # C/F maps and the variable-length interpolation CSR directly on the
+        # device, avoiding any fine-grid CSR materialization on the CPU.
+        device_result = _device_cf_prolongation(A, alg, config;
+            backend=backend, block_size=block_size,
+            setup_workspace=setup_workspace,
+            build_update_map=build_P_update_map)
+        device_result === nothing || return device_result
         cf, coarse_map, n_coarse = coarsen_cf(A, alg, config; backend=backend, block_size=block_size, setup_workspace=setup_workspace)
         # Use the strength graph from the appropriate matrix (weakened if max_row_sum < 1.0)
         # for interpolation so the same graph is used for both coarsening and interpolation.

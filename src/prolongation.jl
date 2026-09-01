@@ -229,6 +229,182 @@ Uses a **two-phase approach** when `build_update_map=true`:
 
 This ensures that initial setup and `update_P=true` resetup produce **identical** results.
 """
+# Device-native PMIS + direct interpolation ----------------------------------
+#
+# This is intentionally expressed only in KernelAbstractions. Backends provide
+# their own vector type through `allocate`; no CUDA type or sparse API appears
+# here. A scalar final prefix value is read on the host solely to size the next
+# device allocation.
+@kernel function _device_mark_coarse_kernel!(coarse_map, @Const(cf))
+    i = @index(Global)
+    @inbounds coarse_map[i] = cf[i] == 1 ? one(eltype(coarse_map)) : zero(eltype(coarse_map))
+end
+
+@kernel function _device_clear_fine_map_kernel!(coarse_map, @Const(cf))
+    i = @index(Global)
+    @inbounds cf[i] != 1 && (coarse_map[i] = zero(eltype(coarse_map)))
+end
+
+@kernel function _device_scan_step_kernel!(dest, @Const(src), offset)
+    i = @index(Global)
+    @inbounds dest[i] = i > offset ? src[i] + src[i - offset] : src[i]
+end
+
+"""Inclusive prefix sum using only backend-allocated vectors and KA kernels."""
+function _device_cumsum!(values::AbstractVector{T}; backend=_get_backend(values),
+                        block_size::Int=64) where T
+    n = length(values)
+    n <= 1 && return values
+    scratch = KernelAbstractions.allocate(backend, T, n)
+    src, dest = values, scratch
+    offset = 1
+    kernel! = _device_scan_step_kernel!(backend, block_size)
+    while offset < n
+        kernel!(dest, src, offset; ndrange=n)
+        src, dest = dest, src
+        offset <<= 1
+    end
+    src === values || copyto!(values, src)
+    _synchronize(backend)
+    return values
+end
+
+@kernel function _device_direct_count_kernel!(counts, @Const(cf), @Const(is_strong),
+                                               @Const(colval), @Const(rowptr))
+    i = @index(Global)
+    @inbounds begin
+        if cf[i] == 1
+            counts[i] = one(eltype(counts))
+        else
+            count = zero(eltype(counts))
+            for nz in rowptr[i]:(rowptr[i + 1] - 1)
+                j = colval[nz]
+                if j != i && is_strong[nz] && cf[j] == 1
+                    count += one(eltype(counts))
+                end
+            end
+            counts[i] = count == 0 ? one(eltype(counts)) : count
+        end
+    end
+end
+
+@kernel function _device_direct_rowptr_kernel!(rowptr_p, @Const(counts))
+    i = @index(Global)
+    @inbounds begin
+        i == 1 && (rowptr_p[1] = one(eltype(rowptr_p)))
+        rowptr_p[i + 1] = counts[i]
+    end
+end
+
+@kernel function _device_direct_fill_kernel!(p_colval, p_nzval, @Const(p_rowptr),
+                                              @Const(cf), @Const(coarse_map),
+                                              @Const(is_strong), @Const(a_colval),
+                                              @Const(a_rowptr), @Const(a_nzval))
+    i = @index(Global)
+    @inbounds begin
+        first_p = p_rowptr[i]
+        if cf[i] == 1
+            p_colval[first_p] = coarse_map[i]
+            p_nzval[first_p] = one(eltype(p_nzval))
+        else
+            nstrong = 0
+            for nz in a_rowptr[i]:(a_rowptr[i + 1] - 1)
+                j = a_colval[nz]
+                nstrong += j != i && is_strong[nz] && cf[j] == 1
+            end
+            if nstrong == 0
+                best_col = one(eltype(p_colval))
+                best_abs = zero(real(eltype(a_nzval)))
+                for nz in a_rowptr[i]:(a_rowptr[i + 1] - 1)
+                    j = a_colval[nz]
+                    if j != i && cf[j] == 1
+                        value_abs = abs(a_nzval[nz])
+                        if value_abs > best_abs
+                            best_abs = value_abs
+                            best_col = coarse_map[j]
+                        end
+                    end
+                end
+                p_colval[first_p] = best_col
+                p_nzval[first_p] = one(eltype(p_nzval))
+            else
+                diagonal = zero(eltype(a_nzval))
+                sum_n_neg = zero(real(eltype(a_nzval)))
+                sum_n_pos = zero(real(eltype(a_nzval)))
+                sum_p_neg = zero(real(eltype(a_nzval)))
+                sum_p_pos = zero(real(eltype(a_nzval)))
+                for nz in a_rowptr[i]:(a_rowptr[i + 1] - 1)
+                    j = a_colval[nz]
+                    value = a_nzval[nz]
+                    if j == i
+                        diagonal = value
+                    elseif real(value) > 0
+                        sum_n_pos += real(value)
+                        is_strong[nz] && cf[j] == 1 && (sum_p_pos += real(value))
+                    else
+                        sum_n_neg += real(value)
+                        is_strong[nz] && cf[j] == 1 && (sum_p_neg += real(value))
+                    end
+                end
+                diagonal_real = real(diagonal)
+                alfa = sum_p_neg == 0 ? one(diagonal_real) : sum_n_neg / sum_p_neg / diagonal_real
+                beta = sum_p_pos == 0 ? one(diagonal_real) : sum_n_pos / sum_p_pos / diagonal_real
+                p = first_p
+                for nz in a_rowptr[i]:(a_rowptr[i + 1] - 1)
+                    j = a_colval[nz]
+                    if j != i && is_strong[nz] && cf[j] == 1
+                        value = a_nzval[nz]
+                        p_colval[p] = coarse_map[j]
+                        p_nzval[p] = real(value) > 0 ? -beta * value : -alfa * value
+                        p += one(eltype(p))
+                    end
+                end
+            end
+        end
+    end
+end
+
+function _device_direct_prolongation(A::CSRMatrix{Tv, Ti}, cf, coarse_map,
+                                     n_coarse::Int, is_strong;
+                                     backend=_get_backend(nonzeros(A)),
+                                     block_size::Int=64) where {Tv, Ti}
+    n = size(A, 1)
+    counts = KernelAbstractions.allocate(backend, Ti, n)
+    _device_direct_count_kernel!(backend, block_size)(counts, cf, is_strong,
+        colvals(A), rowptr(A); ndrange=n)
+    rowptr_p = KernelAbstractions.allocate(backend, Ti, n + 1)
+    _device_direct_rowptr_kernel!(backend, block_size)(rowptr_p, counts; ndrange=n)
+    _device_cumsum!(rowptr_p; backend=backend, block_size=block_size)
+    nnz_p = Int(Array(view(rowptr_p, n + 1:n + 1))[1] - one(Ti))
+    colval_p = KernelAbstractions.allocate(backend, Ti, nnz_p)
+    nzval_p = KernelAbstractions.allocate(backend, Tv, nnz_p)
+    _device_direct_fill_kernel!(backend, block_size)(colval_p, nzval_p, rowptr_p,
+        cf, coarse_map, is_strong, colvals(A), rowptr(A), nonzeros(A); ndrange=n)
+    _synchronize(backend)
+    return ProlongationOp(rowptr_p, colval_p, nzval_p, n, n_coarse, nothing)
+end
+
+function _device_cf_prolongation(A::CSRMatrix{Tv, Ti}, alg::PMISCoarsening,
+                                 config::AMGConfig;
+                                 backend=_get_backend(nonzeros(A)), block_size::Int=64,
+                                 kwargs...) where {Tv, Ti}
+    nonzeros(A) isa Array && return nothing
+    alg.interpolation isa DirectInterpolation || return nothing
+    alg.interpolation.trunc_factor == 0 || return nothing
+    A_strength = config.max_row_sum < 1 ? _apply_max_row_sum(A, config.max_row_sum) : A
+    cf, is_strong = _coarsen_pmis_device(A_strength, alg.θ, config.strength_type;
+        backend=backend, block_size=block_size, device_only=true)
+    n = size(A, 1)
+    coarse_map = KernelAbstractions.allocate(backend, Ti, n)
+    _device_mark_coarse_kernel!(backend, block_size)(coarse_map, cf; ndrange=n)
+    _device_cumsum!(coarse_map; backend=backend, block_size=block_size)
+    n_coarse = Int(Array(view(coarse_map, n:n))[1])
+    _device_clear_fine_map_kernel!(backend, block_size)(coarse_map, cf; ndrange=n)
+    _synchronize(backend)
+    return _device_direct_prolongation(A, cf, coarse_map, n_coarse, is_strong;
+        backend=backend, block_size=block_size), n_coarse, nothing
+end
+
 function _build_interpolation(A_in::CSRMatrix{Tv, Ti}, cf::Vector{Int},
                               coarse_map::Vector{Int}, n_coarse::Int,
                               ::DirectInterpolation, θ::Real=0.25;
@@ -2017,7 +2193,62 @@ end
 Build a transpose structure for prolongation operator P, mapping each coarse
 column J to its contributing fine rows. Enables atomic-free restriction.
 """
+@kernel function _transpose_count_kernel!(counts, @Const(p_colval), @Const(p_rowptr))
+    i = @index(Global)
+    @inbounds for nz in p_rowptr[i]:(p_rowptr[i + 1] - 1)
+        @atomic counts[p_colval[nz]] += one(eltype(counts))
+    end
+end
+
+@kernel function _transpose_offsets_kernel!(offsets, @Const(counts))
+    i = @index(Global)
+    @inbounds begin
+        i == 1 && (offsets[1] = one(eltype(offsets)))
+        offsets[i + 1] = counts[i]
+    end
+end
+
+@kernel function _transpose_positions_kernel!(positions, @Const(offsets))
+    i = @index(Global)
+    @inbounds positions[i] = offsets[i]
+end
+
+@kernel function _transpose_scatter_kernel!(fine_rows, p_nz_idx, positions,
+                                             @Const(p_colval), @Const(p_rowptr))
+    i = @index(Global)
+    @inbounds for nz in p_rowptr[i]:(p_rowptr[i + 1] - 1)
+        J = p_colval[nz]
+        # KernelAbstractions returns the value after the atomic increment.
+        slot = (@atomic positions[J] += one(eltype(positions))) - one(eltype(positions))
+        fine_rows[slot] = i
+        p_nz_idx[slot] = nz
+    end
+end
+
+function _build_transpose_map_device(P::ProlongationOp{Ti};
+                                     backend=_get_backend(P.nzval),
+                                     block_size::Int=64) where Ti
+    n_fine, n_coarse = P.nrow, P.ncol
+    counts = KernelAbstractions.zeros(backend, Ti, n_coarse)
+    _transpose_count_kernel!(backend, block_size)(counts, P.colval, P.rowptr; ndrange=n_fine)
+    offsets = KernelAbstractions.allocate(backend, Ti, n_coarse + 1)
+    _transpose_offsets_kernel!(backend, block_size)(offsets, counts; ndrange=n_coarse)
+    _device_cumsum!(offsets; backend=backend, block_size=block_size)
+    nnz_p = Int(Array(view(offsets, n_coarse + 1:n_coarse + 1))[1] - one(Ti))
+    fine_rows = KernelAbstractions.allocate(backend, Ti, nnz_p)
+    p_nz_idx = KernelAbstractions.allocate(backend, Ti, nnz_p)
+    positions = KernelAbstractions.allocate(backend, Ti, n_coarse)
+    _transpose_positions_kernel!(backend, block_size)(positions, offsets; ndrange=n_coarse)
+    _transpose_scatter_kernel!(backend, block_size)(fine_rows, p_nz_idx, positions,
+        P.colval, P.rowptr; ndrange=n_fine)
+    _synchronize(backend)
+    return TransposeMap(offsets, fine_rows, p_nz_idx)
+end
+
 function build_transpose_map(P::ProlongationOp{Ti, Tv}) where {Ti, Tv}
+    if !(P.nzval isa Array)
+        return _build_transpose_map_device(P; backend=_get_backend(P.nzval))
+    end
     n_fine = P.nrow
     n_coarse = P.ncol
     # Count entries per coarse column

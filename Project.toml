@@ -48,6 +48,7 @@ StaticArrays = "1"
 julia = "1.10"
 
 [extras]
+CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
 HYPRE = "b5ffcf37-a2bd-41ab-a3da-4bd9bc8ad771"
 JLArrays = "27aeb0d3-9eb9-45fb-866b-73c2ecf80fcb"
 Jutul = "2b460a1a-8a2b-45b2-b125-b5c536396eb9"
@@ -58,4 +59,4 @@ StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["Test", "JLArrays", "Jutul", "SparseMatricesCSR", "LinearSolve", "StaticArrays", "Krylov", "HYPRE"]
+test = ["Test", "CUDA", "JLArrays", "Jutul", "SparseMatricesCSR", "LinearSolve", "StaticArrays", "Krylov", "HYPRE"]

@@ -401,7 +401,8 @@ to host by this routine.
 function _coarsen_pmis_device(A::CSRMatrix{Tv, Ti}, θ::Real,
                               strength_type::StrengthType;
                               backend=_get_backend(nonzeros(A)),
-                              block_size::Int=64) where {Tv, Ti}
+                              block_size::Int=64,
+                              device_only::Bool=false) where {Tv, Ti}
     n = size(A, 1)
     is_strong = strength_graph(A, θ, strength_type; backend=backend, block_size=block_size)
     st_count = KernelAbstractions.zeros(backend, Int, n)
@@ -438,6 +439,11 @@ function _coarsen_pmis_device(A::CSRMatrix{Tv, Ti}, θ::Real,
     force_fine_kernel! = _pmis_force_fine_kernel!(backend, block_size)
     force_fine_kernel!(cf_dev; ndrange=n)
     _synchronize(backend)
+
+    # CUDA's native setup path performs its prefix sum directly on `cf_dev`.
+    # Keep this result resident for it; the portable fallback below still
+    # materializes the classification for its host symbolic builder.
+    device_only && return cf_dev, is_strong
 
     # The remaining setup code uses dynamically-sized CSR structures.  Keep
     # this boundary explicit and transfer only O(n) classification data.

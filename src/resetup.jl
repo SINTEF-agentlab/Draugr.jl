@@ -33,6 +33,12 @@ function amg_resetup!(hierarchy::AMGHierarchy{Tv, Ti},
     block_size = hierarchy.block_size
     if partial
         nlevels = length(hierarchy.levels)
+        # Native GPU Galerkin setup uses sparse SpGEMM rather than the
+        # host-built triple map. Rebuild such hierarchies on device instead of
+        # falling through to a CPU restriction-map calculation.
+        if any(level -> level.R_map === nothing, hierarchy.levels)
+            return amg_resetup!(hierarchy, A_new, config; partial=false, update_P=update_P)
+        end
         if nlevels == 0
             _update_coarse_solver!(hierarchy, A_new; backend=backend, block_size=block_size)
             return hierarchy
